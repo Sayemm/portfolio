@@ -1,6 +1,5 @@
 import { useState } from "react";
-import { Link } from "react-router-dom"; // Optional: If using React Router for navigation
-import { Menu, X } from "lucide-react"; // Optional: Icons for mobile menu
+import { Menu, X } from "lucide-react";
 import { navLinks } from "../data/navLinks";
 
 const Header = () => {
@@ -14,13 +13,13 @@ const Header = () => {
         {/* Desktop Nav Link */}
         <nav className="hidden md:flex space-x-6">
           {navLinks.map((item) => (
-            <Link
+            <a
               key={item}
-              to={`#${item.toLowerCase()}`}
+              href={`#${item.toLowerCase()}`}
               className="hover:text-yellow-400 transition duration-300"
             >
               {item}
-            </Link>
+            </a>
           ))}
         </nav>
 
@@ -34,14 +33,14 @@ const Header = () => {
       {isOpen && (
         <nav className="md:hidden bg-gray-800 p-4 space-y-4">
           {navLinks.map((item) => (
-            <Link
+            <a
               key={item}
-              to={`#${item.toLowerCase()}`}
+              href={`#${item.toLowerCase()}`}
               className="block text-center text-white hover:text-yellow-400"
               onClick={() => setIsOpen(false)}
             >
               {item}
-            </Link>
+            </a>
           ))}
         </nav>
       )}
