@@ -15,14 +15,29 @@ const plexMono = IBM_Plex_Mono({
   weight: ["400", "600"],
 });
 
+const DESCRIPTION =
+  "Backend developer in Regina, SK. A public notebook of notes on C#, .NET, Docker, SQL, networking and system design.";
+
 export const metadata: Metadata = {
   metadataBase: new URL("https://mofakh.com"),
   title: {
     default: "Mofakh Islam — notes & work",
     template: "%s — mofakh.com",
   },
-  description:
-    "Backend developer in Regina, SK. A public notebook of notes on C#, .NET, Docker, SQL, networking and system design.",
+  description: DESCRIPTION,
+  // The card LinkedIn, Slack and iMessage render. The image itself comes from
+  // app/opengraph-image.tsx, which Next wires up automatically.
+  // Deliberately no title/description here: omitting them lets each page's own
+  // title and description fall through, so sharing a note shows that note.
+  openGraph: {
+    type: "website",
+    siteName: "mofakh.com",
+    url: "https://mofakh.com",
+    locale: "en_CA",
+  },
+  twitter: {
+    card: "summary_large_image",
+  },
 };
 
 export default function RootLayout({
