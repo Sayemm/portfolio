@@ -1,0 +1,40 @@
+---
+title: "Why I start with a modular monolith"
+date: 2026-06-27
+status: written
+minutes: 8
+order: 1
+lead: "Microservices buy independent deployment and pay for it with a network between every call. Modules give you the boundaries first, for free."
+---
+
+## The boundary is the valuable part
+
+Most of the benefit people attribute to microservices comes from having explicit module boundaries — one owner per aggregate, no shared tables, communication through a published contract. All of that is achievable in a single deployable.
+
+## What a module means in practice
+
+- One schema or table prefix per module; no cross-module joins.
+- A public contract in the module root; everything else internal.
+- Cross-module writes go through an event or a command handler, never a direct repository call.
+- Integration tests run per module against the real database.
+
+## Then extraction is mechanical
+
+When one module genuinely needs its own scale or release cadence, the in-process handler becomes a queue consumer. The calling code already goes through the contract, so extraction is a transport swap rather than a rewrite.
+
+```go
+type Matcher interface {
+    Match(ctx context.Context, resumeID string) ([]Job, error)
+}
+// in-process today, HTTP or queue tomorrow — callers do not change
+```
+
+## The costs you take on distribution day
+
+- No transactions across services: you own consistency, so consumers must be idempotent.
+- Partial failure becomes normal: retries, timeouts, dead letters, backoff.
+- Debugging needs correlation ids and distributed tracing to stay possible.
+
+<NoteToSelf>
+Split for an organizational or scaling reason you can name. "Cleaner architecture" is not one.
+</NoteToSelf>

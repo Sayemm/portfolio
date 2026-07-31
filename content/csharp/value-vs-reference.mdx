@@ -1,0 +1,55 @@
+---
+title: "Value types vs reference types"
+date: 2026-07-18
+status: written
+minutes: 8
+order: 1
+lead: 'The difference is not "stack vs heap". It is what gets copied when you assign, pass, or capture a variable.'
+---
+
+## What actually gets copied
+
+A value type variable holds the data itself. A reference type variable holds an address; the data lives elsewhere. Assignment always copies the variable — for a struct that means every field, for a class that means the address only.
+
+```csharp
+struct Point { public int X; public int Y; }
+class Box { public int X; }
+
+var a = new Point { X = 1 };
+var b = a;        // full copy of the fields
+b.X = 9;          // a.X is still 1
+
+var p = new Box { X = 1 };
+var q = p;        // copy of the reference
+q.X = 9;          // p.X is now 9
+```
+
+## Where they live is a consequence, not a rule
+
+A local struct usually sits on the stack, but a struct field inside a class lives on the heap with its owner, and a struct captured by a lambda is lifted into a compiler-generated class. "Value type" is about copy semantics; storage is an implementation detail the runtime picks.
+
+## Boxing
+
+Assigning a value type to object or to an interface allocates a heap box and copies the value into it. Unboxing copies it back out. In hot paths this is the quiet allocation that shows up as GC pressure — usually from a non-generic collection, a params object[], or an interface constraint the JIT cannot devirtualize.
+
+```csharp
+object o = 42;            // box: heap allocation + copy
+int back = (int)o;        // unbox: copy out
+
+// generic constraint keeps it unboxed
+static bool Eq<T>(T x, T y) where T : IEquatable<T> => x.Equals(y);
+```
+
+## Equality defaults differ
+
+- struct: field-by-field equality, but the default implementation uses reflection unless you override Equals/GetHashCode.
+- class: reference equality unless you override it.
+- record struct and record: value equality generated for you — the reason records are the default for DTOs.
+
+## When it actually matters
+
+Prefer a struct when the thing is small (roughly 16 bytes or less), immutable, and short-lived — an id, a money amount, a coordinate. Prefer a class for anything with identity or mutable state. A large mutable struct passed around by value is the worst of both: copies everywhere and surprising writes that go nowhere.
+
+<NoteToSelf>
+readonly struct + in parameters remove the defensive copies the compiler otherwise inserts. Measure before reaching for them.
+</NoteToSelf>

@@ -1,0 +1,43 @@
+---
+title: "DI lifetimes, and the captive dependency trap"
+date: 2026-07-21
+status: written
+minutes: 7
+order: 1
+lead: "Three lifetimes, one rule: a service can only depend on something that lives at least as long as it does."
+---
+
+## The three lifetimes
+
+- Singleton — one instance for the app. Must be thread-safe.
+- Scoped — one instance per request (per scope). DbContext belongs here.
+- Transient — a new instance every resolve. Cheap, stateless helpers.
+
+## The captive dependency
+
+Inject a scoped service into a singleton and the singleton captures the first scope forever. With EF Core that means one DbContext shared across every request: stale change tracking, concurrency exceptions, and eventually a corrupted unit of work. The container catches this at startup only when validation is on.
+
+```csharp
+builder.Services.AddDbContext<AppDb>(o => o.UseSqlServer(cs));  // scoped
+builder.Services.AddSingleton<ScheduleCache>();                 // singleton
+
+// wrong: ScheduleCache(AppDb db)
+// right: resolve a scope per unit of work
+public class ScheduleCache(IServiceScopeFactory scopes)
+{
+    public async Task WarmAsync()
+    {
+        using var scope = scopes.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDb>();
+        // ...
+    }
+}
+```
+
+## Background services are singletons
+
+BackgroundService and Azure Functions with singleton hosts hit the same trap. Create a scope per message or per timer tick — that scope boundary is also the natural transaction boundary.
+
+<NoteToSelf>
+Turn on ValidateScopes and ValidateOnBuild in every environment, not just Development. The error at startup is cheaper than the bug in production.
+</NoteToSelf>

@@ -1,0 +1,53 @@
+---
+title: "Layer caching and why build order matters"
+date: 2026-07-15
+status: written
+minutes: 6
+order: 1
+lead: "Every instruction is a layer. Change one and everything after it rebuilds — so the order of your Dockerfile is a performance decision."
+---
+
+## The cache key
+
+For most instructions the cache key is the instruction text plus the parent layer. For COPY and ADD it also includes a checksum of the copied files. Copy your source in early and every code change invalidates dependency restore.
+
+```dockerfile
+# slow: any code change re-runs restore
+COPY . .
+RUN dotnet restore
+
+# fast: restore layer only changes when the csproj changes
+COPY *.sln .
+COPY src/Api/Api.csproj src/Api/
+RUN dotnet restore
+COPY . .
+RUN dotnet publish -c Release -o /app
+```
+
+## Multi-stage keeps the SDK out of production
+
+Build in the SDK image, copy only the publish output into the runtime image. The result is a fraction of the size and carries no compilers or source.
+
+```dockerfile
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY *.csproj .
+RUN dotnet restore
+COPY . .
+RUN dotnet publish -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
+WORKDIR /app
+COPY --from=build /app .
+ENTRYPOINT ["dotnet", "Api.dll"]
+```
+
+## What still bites
+
+- .dockerignore missing: bin/, obj/ and .git go into the context and change the COPY checksum constantly.
+- apt-get update in its own layer — pair it with install or you cache a stale package index.
+- Latest tags: the base layer silently changes and invalidates everything below.
+
+<NoteToSelf>
+docker build --progress=plain shows CACHED per step. It is the fastest way to find which instruction is breaking the chain.
+</NoteToSelf>

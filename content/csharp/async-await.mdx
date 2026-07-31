@@ -1,0 +1,46 @@
+---
+title: "How async/await actually works"
+date: 2026-07-11
+status: written
+minutes: 9
+order: 2
+lead: "await does not create a thread. It splits your method into a state machine and hands the continuation to a scheduler."
+---
+
+## The state machine
+
+The compiler rewrites an async method into a struct implementing IAsyncStateMachine. Each await becomes a suspension point: the state machine stores which step it was on and registers a continuation with the awaited task. The calling thread returns immediately once the first incomplete await is reached.
+
+```csharp
+async Task<int> GetTotalAsync(int shiftId)
+{
+    var shift = await _db.Shifts.FindAsync(shiftId);   // suspension point
+    var rate = await _rates.GetAsync(shift.RoleId);    // suspension point
+    return shift.Hours * rate;
+}
+```
+
+## Nothing is free until it is incomplete
+
+If the awaited task is already complete, execution continues synchronously with no allocation and no scheduling. That is why a well-cached async method costs almost nothing. The allocation appears only when the method genuinely suspends.
+
+## ConfigureAwait and the context
+
+By default the continuation is posted back to the captured SynchronizationContext. ASP.NET Core has no such context, so ConfigureAwait(false) is noise in application code — but it still matters in libraries that might run inside a UI or legacy ASP.NET app.
+
+## The mistakes worth remembering
+
+- async void: exceptions cannot be caught by the caller; only use it for event handlers.
+- Task.Result / .Wait(): deadlocks under a context, and always burns a thread.
+- Sequential awaits in a loop when the calls are independent — use Task.WhenAll.
+- Forgetting cancellation: pass CancellationToken all the way down, do not swallow it.
+
+```csharp
+// independent work: run together
+var tasks = shiftIds.Select(id => GetTotalAsync(id));
+var totals = await Task.WhenAll(tasks);
+```
+
+## Async is about throughput, not speed
+
+One request does not get faster. The thread pool stops holding threads hostage during I/O, so the same machine serves far more concurrent requests. If the work is CPU-bound, async buys you nothing — that is what Task.Run and parallelism are for.

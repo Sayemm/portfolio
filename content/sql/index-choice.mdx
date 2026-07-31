@@ -1,0 +1,43 @@
+---
+title: "How the optimizer picks an index"
+date: 2026-07-08
+status: written
+minutes: 8
+order: 1
+lead: "An index helps only if the predicate is sargable, the leading column matches, and the estimated row count is small enough to beat a scan."
+---
+
+## Leading column first
+
+A composite index on (TenantId, ShiftDate) can seek on TenantId alone, or on both. It cannot seek on ShiftDate alone — the rows for a given date are scattered across every tenant. Column order is the design decision; equality predicates go first, ranges last.
+
+```sql
+CREATE NONCLUSTERED INDEX IX_Shifts_Tenant_Date
+  ON Shifts (TenantId, ShiftDate)
+  INCLUDE (EmployeeId, Hours);
+
+-- seeks
+SELECT EmployeeId, Hours FROM Shifts
+WHERE TenantId = 7 AND ShiftDate >= '2026-07-01';
+
+-- scans: no leading column
+SELECT * FROM Shifts WHERE ShiftDate = '2026-07-01';
+```
+
+## Sargability
+
+Wrapping a column in a function or a conversion hides it from the index. YEAR(ShiftDate) = 2026 scans; a date range does not. An implicit conversion from nvarchar to varchar does the same damage and is easy to miss because the query still returns correct rows.
+
+## Covering and the tipping point
+
+INCLUDE puts extra columns in the leaf pages so the query never touches the base table. Without it, each matched row needs a key lookup — and past roughly a few percent of the table the optimizer decides a full scan is cheaper and abandons your index entirely.
+
+## Reading the evidence
+
+- Estimated vs actual rows far apart: stale statistics or parameter sniffing.
+- Key Lookup with a high row count: add the columns to INCLUDE.
+- Scan where you expected a seek: check for functions, conversions, or OR across columns.
+
+<NoteToSelf>
+Every index costs writes and storage. Before adding one, check whether an existing index can be extended instead.
+</NoteToSelf>
