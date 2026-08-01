@@ -1,0 +1,82 @@
+---
+title: "Why .NET exists"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 2
+lead: 'C# is a language, and a language is only grammar — it cannot allocate memory, open a file, or turn itself into machine code. .NET is everything that must exist for the grammar to actually run.'
+---
+
+## A language is grammar, and grammar cannot run
+
+C# is a set of rules for writing text. By itself it does nothing. It cannot reserve a byte of memory, cannot read a file, cannot send a packet, and — the point order 1 ended on — cannot turn itself into the machine code a CPU consumes. Every one of those abilities has to come from somewhere outside the language.
+
+That "somewhere" is .NET. And the machine-code translation, though it is where order 1 left off, is the smallest part of what is missing.
+
+## Without a platform: one language, many machines
+
+Order 1 established that native code is pinned to a CPU-plus-OS pair. Spell that matrix out and the problem becomes obvious:
+
+```
+Windows  x64        Linux  x64        macOS  Intel
+Windows  ARM64      Linux  ARM64      macOS  Apple Silicon
+                    ... and every future architecture
+```
+
+If C# compiled straight to native code, shipping one program would mean building and maintaining a separate native output for every cell in that grid — and every new chip family would break everything already shipped. That does not scale, and it never gets easier.
+
+The escape hatch is the intermediate language from order 1. C# compiles **once** to IL, which is CPU-neutral and belongs to no cell in the grid. The grid problem does not disappear — it moves from the *language* to the *runtime*. And the runtime is the one piece Microsoft ships for each platform, so it is solved once, centrally, instead of by every program.
+
+## Compile once to IL, finish on the machine
+
+```
+        C# source
+            │
+            ▼
+     Roslyn compiler        (happens once)
+            │
+            ▼
+           IL                (CPU-neutral)
+            │
+   ┌────────┼────────┐
+   ▼        ▼        ▼
+ Windows  Linux    macOS
+ runtime  runtime  runtime  (each finishes IL → native)
+   │        │        │
+   ▼        ▼        ▼
+ native   native   native
+```
+
+One `MyApp.dll` full of IL runs on all three operating systems because each platform ships a .NET runtime that performs the final IL-to-native step for its own CPU. This is what "build once, run everywhere" actually means — not magic in the DLL, but a runtime already present on the far end.
+
+## Translation is the least of it — programs need services
+
+Suppose portability were the only problem. A bare language would still leave every program to reinvent the same hard, universal machinery from scratch. .NET supplies it once, for every program and every .NET language:
+
+- **Memory management.** A garbage collector reclaims unused memory automatically. No manual allocate-and-free, and with it, whole categories of leaks and memory corruption simply cannot happen.
+- **A standard library (the BCL).** Strings, collections, dates, file access, HTTP, JSON, cryptography — already written, tested, and consistent across platforms.
+- **A shared type system.** Integers, strings, classes, and interfaces are defined at the runtime level, not per language. That is why a class written in F# is usable from C# without translation: both compile to the same IL and share the same types.
+- **Cross-cutting runtime services.** Exception handling, threading, security checks, and assembly loading are provided by the runtime rather than reimplemented by each program.
+
+None of these are *language* features. They belong to the platform. C# borrows all of them from .NET, which is why the language definition can stay small.
+
+## "Managed" is the name for this bargain
+
+.NET is a **managed** platform: while a program runs, the runtime actively manages its memory and execution, rather than leaving the program to manage them itself. The trade is explicit — surrender manual control in exchange for safety, portability, and speed of development.
+
+This is the opposite of an unmanaged language like C or C++, where the program takes direct control of memory and pays for it with direct responsibility. Managed execution is the reason later topics keep returning to three components — the CLR, the JIT, and the GC. They are the machinery that does the managing.
+
+## Language versus platform
+
+The confusion behind "if C# already exists, why is .NET needed?" is a category error. The two answer different questions:
+
+- **C#** is *how* code is written — the grammar.
+- **.NET** is *what makes written code buildable, runnable, portable, and useful* — the world the grammar lives in.
+
+Grammar with no world to run in accomplishes nothing; a world with no grammar has nothing to say. C# and .NET are two halves of one usable whole.
+
+Which raises the next confusion. If .NET is this whole bundle — runtime, libraries, type system, tools — then what *is* it, exactly? People call it a language, a framework, a runtime, an SDK, and a platform, sometimes in the same sentence. Order 3 settles which of those is true.
+
+<NoteToSelf>
+"Run everywhere" has a quiet asterisk: it means "run everywhere a runtime has already been ported." IL does not conjure execution on a platform that has no .NET runtime built for it — the portability of the language is only ever as wide as the availability of the runtime. The genius is that porting the runtime once unlocks every existing .NET program at once, but that first port is still real work someone has to do.
+</NoteToSelf>
