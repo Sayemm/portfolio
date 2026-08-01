@@ -129,6 +129,33 @@ function SocialLinks() {
   );
 }
 
+/** The topics band draws its grid with per-cell borders, so a part-full last
+ *  row would leave the bottom rule stopping short. These empty cells carry the
+ *  same rules to close it. Column count differs per breakpoint, so each filler
+ *  only shows at the widths that actually need it. */
+function GridFillers({ count }: { count: number }) {
+  const needAt = (cols: number) => (cols - (count % cols)) % cols;
+  const two = needAt(2);
+  const three = needAt(3);
+  const fillers = Math.max(two, three);
+
+  return (
+    <>
+      {Array.from({ length: fillers }, (_, i) => (
+        <div
+          key={i}
+          aria-hidden="true"
+          className={[
+            "hidden border-b border-l border-rule-invert-soft",
+            i < two ? "mid:block" : "mid:hidden",
+            i < three ? "rail:block" : "rail:hidden",
+          ].join(" ")}
+        />
+      ))}
+    </>
+  );
+}
+
 function Bullets({ items }: { items: string[] }) {
   return (
     <ul className="m-0 flex list-none flex-col gap-2 p-0">
@@ -392,7 +419,7 @@ export default function Home() {
               Pick a topic, read left to right
             </span>
           </div>
-          <div className="grid grid-cols-1 border-t-2 border-r border-t-rule-invert border-r-rule-invert-soft sm:grid-cols-2 rail:grid-cols-3">
+          <div className="grid grid-cols-1 border-t-2 border-r border-t-rule-invert border-r-rule-invert-soft mid:grid-cols-2 rail:grid-cols-3">
             {topics.map((topic) => {
               const counts = topicCounts(topic.id);
               const first = notesForTopic(topic.id)[0];
@@ -419,6 +446,7 @@ export default function Home() {
                 </Link>
               );
             })}
+            <GridFillers count={topics.length} />
           </div>
           <div className="pt-10 pb-14 text-[15px] text-ground-70">
             {topicsBandNote}

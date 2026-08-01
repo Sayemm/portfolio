@@ -1,3 +1,5 @@
+import { topics } from "@/content/topics";
+
 export const hero = {
   kicker: "Backend developer · Regina, SK · Canada",
   firstName: "Mofakh",
@@ -28,14 +30,16 @@ export const languages = [
   { label: "SQL", bg: "#f7ecdb", fg: "#8a5400" },
 ];
 
-export const writingAbout = [
-  { label: "C#", bg: "#ede4f2", fg: "#5a1c6b", topicId: "csharp" },
-  { label: ".NET", bg: "#e6e3f6", fg: "#3f2199", topicId: "dotnet" },
-  { label: "Docker", bg: "#e2e9f7", fg: "#14479e", topicId: "docker" },
-  { label: "SQL", bg: "#f7ecdb", fg: "#8a5400", topicId: "sql" },
-  { label: "Networking", bg: "#e0efeb", fg: "#0b5a4e", topicId: "networking" },
-  { label: "System design", bg: "#f6e6e4", fg: "#8d3230", topicId: "system-design" },
-];
+/** Derived from topics.ts, never hand-listed — adding a topic adds its chip. */
+export const writingAbout = topics
+  .slice()
+  .sort((a, b) => a.order - b.order)
+  .map((t) => ({
+    label: t.name,
+    bg: t.chip.bg,
+    fg: t.chip.fg,
+    topicId: t.id,
+  }));
 
 export type Social = {
   label: string;

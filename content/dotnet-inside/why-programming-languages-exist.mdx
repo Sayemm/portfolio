@@ -1,0 +1,79 @@
+---
+title: "Why computers need programming languages"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 1
+lead: 'A CPU cannot read C#. It cannot read any language you have heard of — it reads numbers. That one fact is the reason every programming language, and eventually .NET, has to exist.'
+---
+
+## The CPU runs one language, and you have never written it
+
+Start with the machine. A CPU is a chip that does one thing in a loop: fetch an instruction, execute it, repeat — billions of times a second. An instruction is not a word. It is a number: a specific pattern of bits that the chip's circuitry is physically wired to react to.
+
+There is no part of the CPU that reads `Console.WriteLine`. There is no wire in it that knows the letter `C`. When people say the CPU "understands" machine code, they mean something almost mechanical — certain bit patterns cause certain circuits to switch on. That is the only language it has, and it is made of numbers.
+
+So the text you type — C#, Python, Java, all of it — is for you. The CPU never sees it.
+
+## What one line of C# actually asks for
+
+Take the most boring line you can write:
+
+```csharp
+int result = 2 + 3;
+```
+
+To you that is one idea. To the CPU it is not even close to one instruction, because the CPU has no "add two numbers and call the answer `result`" operation. It works in much smaller pieces. Roughly, it has to be told:
+
+- put the number 2 somewhere it can work with,
+- put the number 3 somewhere too,
+- add those two places together,
+- store the answer somewhere it can find later.
+
+Those "somewheres" are **registers** — a handful of tiny, extremely fast storage slots inside the CPU itself — and **memory**, the much larger, slower storage outside it. Written in the CPU's own terms, your one line becomes something like:
+
+```
+mov  eax, 2          ; put 2 in a register called eax
+mov  ebx, 3          ; put 3 in a register called ebx
+add  eax, ebx        ; add them; the result is now in eax
+mov  [result], eax   ; copy that into memory
+```
+
+That is closer to the truth. One readable line of C# is several primitive steps — and even those steps are still just a friendlier spelling of numbers.
+
+## Machine code is numbers; assembly is those numbers made readable
+
+The block above is **assembly language**. Each line (`mov`, `add`) is a mnemonic — a human-readable name — for a single machine instruction. A small tool called an *assembler* turns each mnemonic into the actual bytes the CPU consumes. `mov eax, 2` might become a few bytes like `B8 02 00 00 00`. The CPU sees only the bytes. The words are a courtesy for us.
+
+So why not just write assembly and skip high-level languages? Two reasons. It is punishingly tedious — you manage registers and memory by hand for every trivial operation. And, more importantly, it does not travel.
+
+## The same program, two machines, two different instruction sets
+
+Here is the catch that shapes everything. `mov`, `add`, and the exact bytes behind them belong to one **instruction set** — one CPU family's private vocabulary. The two most common today are **x64** (most desktops and servers) and **ARM64** (phones, Apple Silicon Macs, many newer laptops). They have different instructions, different registers, different byte encodings.
+
+Machine code built for x64 is meaningless on ARM64. Not "slower" — meaningless, like handing an English sentence to someone who only reads Japanese. So "just compile C# straight to machine code" immediately raises the question: *machine code for which machine?* Every architecture would need its own separate build.
+
+And the CPU is only half of it. The **operating system** matters too. Windows, Linux, and macOS wrap the same CPU in different executable file formats and different ways of asking for services like "open a file" or "send data over the network." A finished native program is therefore pinned not just to a CPU but to a CPU-plus-OS pair: x64 Windows, ARM64 macOS, x64 Linux, and so on.
+
+## A language is a human contract; a translator produces the machine code
+
+This is what a programming language is *for*. It lets you state what you want once, in a form built for humans — readable, portable, free of registers — and hands the ugly, machine-specific translation to a tool. You write the intent; something else produces the instructions for the target.
+
+There are two classic ways to do that translation:
+
+- **Compilation** — a compiler translates your whole program into machine code ahead of time, producing a native executable. This is how C, C++, Rust, and Go work. It runs fast, because the CPU-ready code already exists. The cost is that you compile separately for each CPU-and-OS target.
+- **Interpretation** — an interpreter is itself a program that reads your code and carries out each step directly, at the moment the program runs, instead of producing a standalone native file. This is the classic model for a language like Python. It travels easily — anywhere the interpreter runs, your code runs — but it is generally slower, because the translating happens live, over and over.
+
+Compile-ahead is fast but tied to a target. Interpret-live is portable but slower. Each buys one property at the other's expense.
+
+## Where C# sits — and why that needs a whole platform
+
+C# refuses to pick. It does not compile straight to machine code, and it is not interpreted line by line either. It compiles to an **intermediate language** — a portable, CPU-neutral instruction set that is tied to neither x64 nor ARM64 — and then, on the actual machine, a second stage turns that intermediate form into real native code just before it runs.
+
+That design chases both prizes at once: write and build once into a portable form, then get near-native speed by translating to the specific CPU at the last moment. But it only works if every machine that runs your program ships the second-stage translator, plus the memory manager, the loader, and the libraries that make it all happen.
+
+That bundle of machinery is exactly what .NET is. Which is the next question: if C# is already a perfectly good language, why do we need .NET at all?
+
+<NoteToSelf>
+"Machine code" is itself a tidy lie. On a modern chip, an instruction like `add` is not the bottom — the CPU breaks each instruction into smaller internal micro-operations, reorders them, and runs several at once. The instruction set is a *stable public contract* over a much messier reality, held fixed so that decades of already-compiled programs keep working while the hardware underneath changes completely. The abstractions go down further than this article needs — just know that the floor you can see is not the real floor.
+</NoteToSelf>

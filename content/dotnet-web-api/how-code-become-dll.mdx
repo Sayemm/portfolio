@@ -1,0 +1,103 @@
+---
+title: "The .csproj file: how your code becomes a DLL"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 1
+lead: 'Your project file is fifteen lines long because the SDK writes the build logic for you. Read what that one line imports and you understand why you never reference ASP.NET Core by hand.'
+---
+
+## The whole file, and what is missing from it
+
+A working web project file is almost empty:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
+```
+
+Notice what is *not* here. No reference to `Microsoft.AspNetCore.*`. No list of `.cs` files. No compiler flags. No build steps. You use `WebApplication`, controllers, middleware, DI, logging, and Kestrel — and none of them appear in the file. All of it arrives through the first line.
+
+## `Sdk="Microsoft.NET.Sdk.Web"` is an import, not a runtime
+
+An MSBuild SDK is not a runtime and not a NuGet package. It is a bundle of pre-written build logic — MSBuild targets, tasks, and default properties — that tells .NET how to compile, publish, and configure a project.
+
+The `Sdk="..."` attribute is shorthand. MSBuild expands it into two hidden imports wrapped around your file: `Sdk.props` at the very top and `Sdk.targets` at the very bottom. Your `PropertyGroup` sits in the middle of someone else's build script.
+
+The plain `Microsoft.NET.Sdk` means one thing: *compile every `.cs` file in this folder, output a DLL.* The `.Web` variant adds the web-specific defaults on top of that:
+
+- a **framework reference** to the entire `Microsoft.AspNetCore.App` shared framework,
+- `wwwroot` handling,
+- `appsettings.json` copied to output,
+- `launchSettings.json` support.
+
+That framework reference is the answer to "where is ASP.NET Core?" A **package reference** is downloaded from NuGet into your build. A **framework reference** is resolved from the runtime already installed on the machine. ASP.NET Core is the second kind — which is why it is nowhere in your file and never in your `bin` folder.
+
+## What you get for free
+
+### ImplicitUsings is a generated file, not compiler magic
+
+Turn it on and the SDK writes a real file into your build output:
+
+```
+obj/Debug/net8.0/MyApi.GlobalUsings.g.cs
+```
+
+Open it. It is ordinary code:
+
+```csharp
+global using System;
+global using Microsoft.AspNetCore.Builder;
+global using Microsoft.Extensions.DependencyInjection;
+// ...
+```
+
+There is no compiler trick here. The build generates a file full of `global using` directives and compiles it alongside yours. That is the whole feature.
+
+### Nullable is a compile-time contract
+
+`Nullable` turns on null-state static analysis. `string` now means "should not be null"; `string?` means "might be." The compiler tracks the flow and warns you when the two disagree.
+
+It is compile-time only. Nothing changes at runtime — a `null` still fits in a `string` field once the program is running. You are not enabling a runtime check; you are enabling a warning you can act on before shipping.
+
+## What "build" actually does
+
+MSBuild is the **orchestrator**, not the compiler. The .NET CLI hands the build command to MSBuild. MSBuild reads the `.csproj`, loads the SDK's targets, and — among many steps — invokes **Roslyn**, the C# compiler, to turn your source into IL.
+
+Roslyn compiles *only your `.cs` files*. It does not recompile ASP.NET Core or the base class library, because those are already compiled and installed on the machine. And it doesn't even open the real framework DLLs to do its work: at compile time it references **reference assemblies** — versions that carry the API surface (types and method signatures) but no method bodies. Your build compiles against the *shape* of the framework, not its implementation.
+
+The output is a handful of files:
+
+```
+                 dotnet build
+                      │
+         MSBuild reads MyApi.csproj
+                      │
+       loads Microsoft.NET.Sdk.Web
+   (build rules · defaults · framework ref)
+                      │
+        Roslyn compiles ONLY your .cs
+                  C#  →  IL
+                      │
+                  produces
+      ────────────────────────────────
+        MyApi.dll         (your IL)
+        MyApi.pdb    (debug symbols)
+        MyApi.deps.json  (dep graph)
+        MyApi.runtimeconfig.json    
+           (what runtime to load)
+      ────────────────────────────────
+```
+
+None of these run yet. `MyApi.dll` is IL, not machine code, and `runtimeconfig.json` is just a note to whoever starts the process later. Turning this pile of files into a listening web server is the runtime's job — the next file.
+
+<NoteToSelf>
+`Sdk.props` is imported before your `PropertyGroup`, `Sdk.targets` after it. So a *property* you set can override an SDK default, but a *target* the SDK defines can override yours. When a build setting "won't take," this ordering is almost always why. `dotnet build -bl` writes a binlog — open it in the MSBuild Structured Log Viewer and you can see exactly which import won.
+</NoteToSelf>

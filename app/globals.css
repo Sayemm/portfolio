@@ -26,8 +26,15 @@
   --color-ground-60: rgba(243, 242, 242, 0.6);
   --color-accent-wash: rgba(236, 48, 19, 0.16);
 
-  /* The two breakpoints the design calls for: below `wide` the outline rail
-     goes, below `rail` the sidebar becomes a drawer and grids collapse. */
+  /* The breakpoints the design calls for: below `wide` the outline rail goes,
+     below `rail` the sidebar becomes a drawer and grids collapse, and `mid` is
+     the 1→2 column step.
+     `mid` exists rather than reusing Tailwind's built-in `sm` because v4 emits
+     custom breakpoints ahead of the defaults regardless of their px value — so
+     `sm:` would land *after* `rail:` in the cascade and silently win on any
+     property both variants set. Keeping every responsive step custom keeps
+     them sorting by value. */
+  --breakpoint-mid: 640px;
   --breakpoint-rail: 820px;
   --breakpoint-wide: 1100px;
 

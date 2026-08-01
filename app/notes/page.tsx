@@ -28,14 +28,14 @@ export default function NotesIndex() {
         </span>
       </div>
 
-      <div className="grid grid-cols-1 border-t-2 border-rule sm:grid-cols-2 rail:grid-cols-3">
+      <div className="grid grid-cols-1 border-t-2 border-rule mid:grid-cols-2 rail:grid-cols-3">
         {topics.map((topic, i) => {
           const counts = topicCounts(topic.id);
           return (
             <Link
               key={topic.id}
               href={`/notes/${topic.id}`}
-              className="block border-b border-rule-soft pt-[26px] pr-6 pb-[30px] text-ink hover:bg-surface hover:text-ink sm:border-r"
+              className="block border-b border-rule-soft pt-[26px] pr-6 pb-[30px] text-ink hover:bg-surface hover:text-ink mid:border-r"
             >
               <div className="flex items-baseline justify-between">
                 <span className="font-mono text-[11px] text-accent-700">

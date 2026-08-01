@@ -1,0 +1,104 @@
+---
+title: "How a .NET app actually runs"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 2
+lead: '`dotnet MyApi.dll` does not run your DLL. A host reads a JSON file, finds shared frameworks already on the machine, and starts a runtime that turns your IL into native code as it executes.'
+---
+
+## Your DLL is not an executable
+
+`MyApi.dll` is Intermediate Language, not machine code. Nothing in it can run on the CPU directly. So `dotnet MyApi.dll` does not execute your DLL — it starts the **dotnet host**, and the host runs your assembly for you. (`dotnet run` is the same thing with a build in front of it.)
+
+The host is the first thing that happens, and it happens before a single line of your code.
+
+## The host reads two files before touching your code
+
+The host has to answer one question first: *which runtime, and which frameworks, does this app need?* It answers from the two config files the build produced:
+
+- **`MyApi.runtimeconfig.json`** — the target framework, the required framework name and version, and the roll-forward policy (what to do if the exact version is not installed).
+- **`MyApi.deps.json`** — the full dependency graph and where each assembly is expected to live.
+
+From these the host decides exactly which shared frameworks and versions to load, then locates them on the machine.
+
+## Shared frameworks: compiled once, shared by every app
+
+A shared framework is a versioned folder of precompiled assemblies (DLLs) that ships with the .NET install and is shared across every app on the machine. Two of them matter:
+
+- **`Microsoft.NETCore.App`** — the core base class library: `System.Text.Json`, `System.Linq`, `System.Console`, `System.Private.CoreLib`, and the rest.
+- **`Microsoft.AspNetCore.App`** — the web stack: MVC, `Microsoft.Extensions.Logging`, DI, the middleware machinery, and Kestrel.
+
+This is the runtime half of the framework-reference point from the last file. Your app never carries these DLLs in a normal build — it loads the machine's copies. That is why your published output is small.
+
+## CoreCLR: the actual runtime
+
+Once the frameworks are located, the host starts **CoreCLR**, the real .NET runtime. CoreCLR:
+
+- loads your assembly *and* the framework assemblies into one process,
+- resolves the references between them,
+- **JIT-compiles** IL to native machine code — method by method, the first time each one runs. Modern .NET does this in tiers: a fast, unoptimized **Tier 0** pass to start quickly, then a re-JIT to optimized **Tier 1** for methods that turn out to be hot,
+- manages memory through the **Garbage Collector**,
+- and calls your entry point — `Program.Main`, or the compiler-generated `Main` when you use top-level statements.
+
+## Then ASP.NET Core takes over
+
+Your entry point runs, and now it is application code building the application:
+
+- builds the **dependency injection** container,
+- loads **configuration**,
+- assembles the **middleware pipeline** and **routing**,
+- starts the **Kestrel** web server, which binds to a port and begins accepting connections.
+
+End to end, from your keystroke to a listening server:
+
+```
+   dotnet MyApi.dll
+        │
+        ▼
+   dotnet HOST starts
+   ├─ reads MyApi.runtimeconfig.json
+   ├─ determines required framework versions
+   ├─ finds Microsoft.NETCore.App
+   └─ finds Microsoft.AspNetCore.App
+        │
+        ▼
+   starts CoreCLR  (the runtime)
+        │
+        ▼
+   loads assemblies into one process
+   MyApi.dll · System.Text.Json.dll ·
+   Microsoft.AspNetCore.*.dll · ...
+        │
+        ▼
+   resolves refs → JIT (IL → native)
+   → runs Program.Main()
+        │
+        ▼
+   ASP.NET Core initializes
+   DI · config · middleware · routing
+        │
+        ▼
+   Kestrel starts
+        │
+        ▼
+   listening on http://localhost:5000
+```
+
+## Two ways to ship: who carries the runtime
+
+The same build runs two different ways depending on who is expected to supply the frameworks.
+
+- **Framework-dependent** — publish only your app. The target machine (an Azure App Service, a server with .NET installed) already has the shared frameworks. It loads *its own* local copies of `Microsoft.NETCore.App` and `Microsoft.AspNetCore.App` and never touches your development machine's. Output is small; the right runtime must be present.
+- **Self-contained** — publish your app *plus* the runtime and every framework assembly it needs. It runs on a box where .NET is not installed at all. Output is large; it depends on nothing outside itself.
+
+So the four moving parts, in one line each:
+
+- `Microsoft.NET.Sdk.Web` builds the app.
+- Shared frameworks provide the precompiled libraries.
+- The dotnet host initializes the process and finds those frameworks.
+- CoreCLR loads the assemblies and executes the app.
+
+<NoteToSelf>
+JIT costs you cold-start time. `PublishReadyToRun` precompiles IL to native at publish so most methods skip the first JIT pass. **Native AOT** goes further and drops the JIT entirely — smallest, fastest start — but gives up most reflection and runtime code-gen, which a lot of ASP.NET Core still leans on. Default framework-dependent + JIT is the right call until an actual cold-start number says otherwise.
+</NoteToSelf>
