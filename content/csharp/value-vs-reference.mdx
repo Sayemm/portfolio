@@ -1,55 +1,117 @@
 ---
-title: "Value types vs reference types"
+title: "The C# memory model: values, references, and boxing"
 date: 2026-07-18
 status: written
-minutes: 8
+minutes: 7
 order: 1
-lead: 'The difference is not "stack vs heap". It is what gets copied when you assign, pass, or capture a variable.'
+lead: 'Value type or reference type is not really "stack vs heap". It is what gets copied when you assign — and almost everything else (storage, nullability, boxing) follows from that one fact.'
 ---
 
-## What actually gets copied
+## Value types vs reference types
 
-A value type variable holds the data itself. A reference type variable holds an address; the data lives elsewhere. Assignment always copies the variable — for a struct that means every field, for a class that means the address only.
+- `value type:` int, double, bool, DateTime, any struct, any enum, Guid
+    - A value-type variable holds the data itself. Assignment copies the data.
+- `reference type:` any class, string, arrays, delegates, interface, record class
+    - A reference-type variable holds a reference (think: address) to an object that lives on the heap.
+    - Assignment copies the reference — both variables now point at the same object.
+    - The reference sits where the variable lives; the object it points to lives on the heap.
+
+The whole model is one rule: **assignment copies the variable**. For a struct that means every field. For a class that means the address only — which is why two class variables can quietly share one object.
+
+## Stack and heap are a consequence, not the definition
+
+- The `stack` is fast, small (~1MB per thread), and automatic.
+    - Each method call gets a stack frame holding its local variables and parameters.
+    - When the method returns, the frame is popped — cleanup is free and instant.
+- The `heap` is large and managed by the garbage collector (GC).
+    - Every new-ed class instance lives here.
+    - Objects survive after the method that created them returns — that is the point of the heap — but the GC must periodically find and reclaim dead ones, which costs CPU time.
+
+A value type is **not** "always on the stack" — that is the tempting oversimplification. Value types live wherever their container lives:
+
+- Local value type → stack
+- Value type as a field inside a class → heap, with its owner
+- Value type captured by a lambda / used in `async` or an iterator → lifted onto the heap in a compiler-generated class
+
+"Value type" describes copy semantics. Where it is stored is an implementation detail the runtime picks.
+
+## Struct vs. class: how a developer actually chooses
+
+- Default to `class`.
+- Reach for a `struct` when the type is small (rule of thumb: ≤16 bytes), represents a single value conceptually (a money amount, a coordinate, a time range), and is **immutable**.
+    - DateTime, decimal, TimeSpan, and Guid are all structs for exactly these reasons.
+- Mutability matters more for structs than for classes: copy semantics mean you sometimes mutate a *temporary copy* and your change silently vanishes. So write structs `readonly`.
+
+Equality defaults differ too, and it is worth knowing before you drop a type into a `HashSet` or `Distinct()`:
+
+- `struct` → field-by-field equality, but the default uses reflection unless you override `Equals`/`GetHashCode`.
+- `class` → reference equality unless you override it.
+- `record struct` / `record` → value equality generated for you — the reason records are the default for DTOs.
+
+## Nullable types
+
+- Value types can't be null — an `int` is always some number. But real domains need "absent": an employee's `TerminationDate` while they are still employed.
+- Hence `int?`, `DateTime?` — shorthand for `Nullable<T>`, a **struct** wrapping a value plus a `HasValue` flag.
+    - `Nullable<T>` itself is never null. It is a struct that carries whether it currently holds a value.
+    - `int? x;` → the compiler treats it as `Nullable<int> x;`. The struct isn't null; it simply reports "I don't currently contain a valid int."
 
 ```csharp
-struct Point { public int X; public int Y; }
-class Box { public int X; }
+// simplified — the real Nullable<T> also has GetValueOrDefault(), etc.
+public struct Nullable<T> where T : struct
+{
+    private bool hasValue;
+    private T value;
 
-var a = new Point { X = 1 };
-var b = a;        // full copy of the fields
-b.X = 9;          // a.X is still 1
+    public bool HasValue => hasValue;
 
-var p = new Box { X = 1 };
-var q = p;        // copy of the reference
-q.X = 9;          // p.X is now 9
+    public T Value
+    {
+        get
+        {
+            if (!hasValue)
+                throw new InvalidOperationException();
+            return value;
+        }
+    }
+}
+
+// int? x = 5;          int? x = null;
+// -----------------    -----------------
+// HasValue = true      HasValue = false
+// Value    = 5         Value    = 0  (ignored)
 ```
 
-## Where they live is a consequence, not a rule
+- Reference types could *always* be null — historically the source of the most common exception in all of .NET: `NullReferenceException`.
+    - With nullable reference types on: `string` means "never null, I promise"; `string?` means "might be null, callers must check."
 
-A local struct usually sits on the stack, but a struct field inside a class lives on the heap with its owner, and a struct captured by a lambda is lifted into a compiler-generated class. "Value type" is about copy semantics; storage is an implementation detail the runtime picks.
-
-## Boxing
-
-Assigning a value type to object or to an interface allocates a heap box and copies the value into it. Unboxing copies it back out. In hot paths this is the quiet allocation that shows up as GC pressure — usually from a non-generic collection, a params object[], or an interface constraint the JIT cannot devirtualize.
+`default` is the keyword for "the default value of this type", and it ties the two worlds together:
 
 ```csharp
-object o = 42;            // box: heap allocation + copy
-int back = (int)o;        // unbox: copy out
-
-// generic constraint keeps it unboxed
-static bool Eq<T>(T x, T y) where T : IEquatable<T> => x.Equals(y);
+DateTime d = default;   // 01/01/0001 12:00:00 AM
+bool     b = default;   // false
+int      x = default;   // 0
+int?     y = default;   // null
 ```
 
-## Equality defaults differ
+`int? y = default` lands on `null` because `Nullable<int>`'s default state is `HasValue = false` (with `Value = 0` ignored).
 
-- struct: field-by-field equality, but the default implementation uses reflection unless you override Equals/GetHashCode.
-- class: reference equality unless you override it.
-- record struct and record: value equality generated for you — the reason records are the default for DTOs.
+## Boxing and unboxing
 
-## When it actually matters
+- Boxing happens when a **value type is used where an `object` (or interface) is expected**. The runtime:
+    - allocates a heap object,
+    - copies the value into it,
+    - hands back a reference.
+- Unboxing copies it back out. Each box = one heap allocation = future GC work.
 
-Prefer a struct when the thing is small (roughly 16 bytes or less), immutable, and short-lived — an id, a money amount, a coordinate. Prefer a class for anything with identity or mutable state. A large mutable struct passed around by value is the worst of both: copies everywhere and surprising writes that go nowhere.
+```csharp
+int hours = 40;
+object boxed = hours;        // boxing: allocation + copy
+int unboxed = (int)boxed;    // unboxing: cast + copy
+```
+
+- Generics exist precisely to give type safety **without** boxing — `List<int>` knows it holds ints, so nothing needs to become `object`. (This is the bridge into Day 2.)
+- String interpolation of a struct via its `ToString()` is fine, but passing a struct into something typed as `object` — old APIs, some logging overloads, non-generic collections — still boxes today.
 
 <NoteToSelf>
-readonly struct + in parameters remove the defensive copies the compiler otherwise inserts. Measure before reaching for them.
+The aliasing trap and immutability cancel out in `Money { decimal Amount; string Currency }`: copying a Money shares the one string reference, but strings are immutable, so no one can mutate the shared object — the Day-1 bug can't fire. That is the whole model clicking together in one type. Also: `readonly struct` + `in` parameters remove the defensive copies the compiler otherwise inserts — measure before reaching for them.
 </NoteToSelf>
