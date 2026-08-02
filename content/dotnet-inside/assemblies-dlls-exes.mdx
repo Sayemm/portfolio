@@ -1,0 +1,72 @@
+---
+title: "Assemblies, DLLs, and EXEs"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 8
+lead: 'An assembly is the real unit .NET cares about. A DLL and an EXE are just two containers for one — and in modern .NET, the EXE does not even hold the code.'
+---
+
+## The assembly is the real unit; the file is just its container
+
+Roslyn's emit stage, from the last article, produced *one assembly*. That word deserves a precise meaning, because it — not the file — is what .NET actually reasons about.
+
+An **assembly** is .NET's unit of compilation, deployment, versioning, and identity. One project produces one assembly, and that assembly bundles the three things emit created — IL, metadata, and a manifest — into a single logical whole. Physically, that logical whole is stored in a file ending in `.dll` or `.exe`. So the split is clean: *assembly* is the concept; `.dll` / `.exe` is the packaging around it.
+
+## DLL and EXE are the same kind of thing
+
+A `.dll` and a `.exe` are both assemblies. Both contain IL, metadata, and a manifest. Both use the same underlying file container. What separates them is not their contents but their intended use:
+
+- a **DLL** is a library — something *loaded* by other code,
+- an **EXE** is *launchable* — something the operating system can start directly.
+
+That is the entire distinction at the file level. Same insides, different doorways in.
+
+## In modern .NET, the code lives in the DLL — always
+
+Here is the part that upends the old mental model. Build a runnable application and the output contains *both* files:
+
+```
+build a runnable app  ->  output:
+|
++-- MyApi.dll   the real program  (IL + metadata + manifest)
++-- MyApi.exe   a small native launcher (the "apphost")
+                  starts the runtime, then loads MyApi.dll
+```
+
+The actual program — all the IL — is in the **DLL**. The **EXE** is a tiny *native* launcher, called the apphost, whose only job is to start the runtime and hand control to the DLL.
+
+This is why double-clicking `MyApi.exe` and typing `dotnet MyApi.dll` do the same thing: both start the runtime on the same DLL. The EXE is a convenience wrapper around exactly that command. And it is why, on Linux and macOS, there is no `.exe` at all — just an extensionless launcher, or the plain `dotnet MyApi.dll` invocation.
+
+Worth naming the shift directly: in the old .NET Framework, the EXE *was* the code — it held the IL and the OS launched it through a Windows hook. Modern .NET moved the code permanently into the DLL and reduced the EXE to a bootstrapper.
+
+## Library projects produce only a DLL
+
+A class library has no entry point — no `Main`, nothing to start. It compiles to a single `.dll` and nothing else, because there is nothing to launch.
+
+An application project (one whose output type is an executable, with a `Program.Main`) produces the DLL *and* the launcher. So the rule is simple: **a DLL always; an EXE only when there is something to run.**
+
+## One solution, several assemblies
+
+Real solutions are not one project. They split into several, and each project produces its own assembly:
+
+```
+Solution
+|
++-- Api        -> Api.dll  + Api.exe (launcher)   <- startup project
++-- Business   -> Business.dll
++-- Data       -> Data.dll
++-- Shared     -> Shared.dll
+```
+
+The reasons to split are separation of concerns, reuse across projects, independent versioning, and clean deployment boundaries. Only the startup project also emits a launcher; every other project is a library, so it stops at a DLL.
+
+## Every assembly has an identity
+
+The runtime does not track assemblies by filename. It tracks them by **identity**: a simple name, a version, a culture, and — if the assembly is signed — a public key token. Two files both called `MyLib.dll` but carrying different versions are, to the runtime, two different assemblies.
+
+That identity is precisely what the manifest records. Which points at the next article: the last several pieces have repeated that an assembly holds "IL, metadata, and a manifest" as if that settled anything. The next one opens the DLL and shows what each of those three actually is.
+
+<NoteToSelf>
+A .NET DLL is a **PE file** — the same Portable Executable container Windows uses for native `.exe` and `.dll` files. The difference is a small CLI (managed) header inside it that flags the file as .NET and points at IL and metadata instead of native machine code. That shared container is why Windows recognises the file at all, and why a native launcher can bootstrap it. To actually see the IL, metadata, and manifest inside, a decompiler like ILSpy (or `ildasm`) cracks the DLL open — which is the most concrete possible preview of the next article.
+</NoteToSelf>

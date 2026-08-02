@@ -1,0 +1,77 @@
+---
+title: "Inside an assembly: IL, metadata, and manifest"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 9
+lead: 'Open a DLL and there is no C# inside, and no machine code either. There are three things: instructions no CPU can run, a full description of every type, and an identity card. Together they make the file self-describing.'
+---
+
+## Three things in one file
+
+The assemblies article ended at the doorway: open the DLL. Inside the PE container are three logical parts — and, tellingly, not one of them is C# and not one is machine code:
+
+```
+MyApi.dll  (a PE container)
+|
++-- IL         the instructions    (what to do)
++-- Metadata   type descriptions   (what things are)
++-- Manifest   assembly identity    (who I am, what I need)
+```
+
+Every article since Roslyn has named these three in passing. Here they come apart, one at a time.
+
+## IL: instructions no CPU can run
+
+IL is the portable instruction set introduced back in the "why .NET exists" article — CPU-neutral, identical on every machine. Roslyn's emit stage produced it, and no processor runs it directly.
+
+The reason it can stay portable is a design choice worth seeing. The very first article showed the CPU using named **registers** (`eax`, `ebx`) whose count and names differ from one architecture to the next. IL refuses to name any register. It is **stack-based**: instructions push operands onto an evaluation stack and pop results back off it. The same `2 + 3` that became register moves in the first article becomes this in IL:
+
+```
+ldc.i4  2     ; push the constant 2
+ldc.i4  3     ; push the constant 3
+add           ; pop two, push their sum
+```
+
+No register appears, so IL commits to no CPU. The JIT, later, maps these stack operations onto whatever registers the real processor actually has. IL is the layer that is deliberately agnostic about how many registers exist.
+
+IL is also **typed** — it carries enough type information for the runtime to check the code is memory-safe before running it. And every .NET language emits *this same IL*. The "shared target" that the earlier articles kept describing is, concretely, these instructions.
+
+## Metadata: the assembly describes itself
+
+Sitting alongside the IL is metadata: a structured, machine-readable description of everything in the assembly — every class, method, field, property, parameter, return type, accessibility level, and attribute. Not documentation, not comments. Exact tables.
+
+Four different consumers read it:
+
+- the **compiler** read it — as reference-assembly metadata — to resolve names during the binding stage from the Roslyn article,
+- the **runtime** reads it to lay out types in memory and resolve calls,
+- **reflection** reads it at run time to inspect types dynamically,
+- the **IDE** reads it for IntelliSense and go-to-definition.
+
+The consequence is one of .NET's defining traits: assemblies are **self-describing**. Everything needed to understand the code travels inside the file itself. There are no separate header files to keep in sync — the way C and C++ split declarations into `.h` files that can drift out of step with the code. One `.dll` answers "what is in here" completely and without help.
+
+## Manifest: the assembly's identity card
+
+The manifest is a special slice of that metadata that describes the assembly *as a whole*, rather than the types inside it. It records three things:
+
+- the **identity** from the assemblies article — name, version, culture, and public key token,
+- the **files** that make up the assembly,
+- and the **references**: every other assembly this one depends on, each with the version it needs.
+
+This is how the runtime knows what the file *is* and what it *requires*. When the application starts, the loader reads the manifest to discover which other assemblies to locate and load — the exact mechanism the run-time articles are about to lean on.
+
+## What to do, what things are, who I am
+
+The three parts collapse into a clean summary:
+
+- **IL** — *what to do*.
+- **Metadata** — *what things are*.
+- **Manifest** — *who I am, and what I need*.
+
+A DLL is therefore not merely compiled code. It is compiled code that carries a complete description of itself and its dependencies, in one portable file.
+
+That self-description is exactly what makes everything ahead possible. The runtime can take this single file, read its manifest to load what it depends on, read its metadata to understand its types, and JIT its IL into native code — with nothing external required. Which finally sets up the question the back half of the series answers: what actually happens the moment the application is told to run? That is the next article.
+
+<NoteToSelf>
+IL and metadata are not two separate blobs that happen to share a file — they interlock. Every entity in metadata has a **token**, a small handle, and IL instructions reference metadata *by token*. A method call is not a name in the IL stream; it is `call` followed by a token that points into the metadata tables to say exactly which method. That is why the two cannot be separated: the instructions are full of pointers into the descriptions. To watch C# turn into this — IL, tokens, and all — sharplab.io does it live in the browser, and ILSpy or `ildasm` opens any DLL on disk. Reading real IL for ten minutes makes this entire article concrete.
+</NoteToSelf>

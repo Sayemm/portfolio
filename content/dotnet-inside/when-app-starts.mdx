@@ -1,0 +1,74 @@
+---
+title: "What happens when an app starts"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 10
+lead: 'A DLL on disk is inert — a file of IL that no CPU can run. Starting an application is the story of how that inert file becomes a live process, and it begins with a program that is not the app at all.'
+---
+
+## From an inert file to a live process
+
+The build half of this series ended with a self-describing DLL of IL sitting in `bin`. On disk it does nothing: IL runs on no processor, as the "inside an assembly" and "why .NET exists" articles established. Starting the application is the sequence that turns that inert file into a running process.
+
+And, as the assemblies article already hinted, the application is not even the first thing to run.
+
+## Launch: the host runs, not the app
+
+There are two ways to start, with one outcome. `dotnet MyApi.dll` starts the runtime host directly. Double-clicking `MyApi.exe` runs the apphost — the thin native wrapper from the assemblies article — which does the very same thing.
+
+Either way, the first code to execute is the **host**, not the application. The host is a small program whose entire purpose is to get a runtime running and then hand control to the app.
+
+## The host reads the config the build left behind
+
+The build walk-through produced two JSON files and called them notes left for later. This is later. The host reads both:
+
+- **`runtimeconfig.json`** — which runtime and framework versions this app needs, plus the roll-forward policy if the exact version is missing.
+- **`deps.json`** — the dependency graph: which assemblies to load, and where they live.
+
+With those in hand, the host locates the required shared frameworks on the machine (for a framework-dependent app) or uses the copies published beside it (for a self-contained one). The framework-reference resolution from the build finally cashes out here, at run time.
+
+## The host starts CoreCLR
+
+Once the runtime is located, the host starts **CoreCLR** — the actual .NET runtime, the machinery that will execute managed code. Everything before this was setup. What CoreCLR *is* and everything it does is the subject of the next article; for the startup story, it is enough that the host now hands control to it.
+
+## The loader reads the manifest and loads dependencies
+
+CoreCLR loads the application assembly and reads its **manifest** — the identity-and-references record from the "inside an assembly" article — to discover which other assemblies this one depends on. It loads those too, using `deps.json` to find them on disk, and does so as they are needed rather than all at once.
+
+This is where self-describing assemblies pay off: the runtime needs no external description of the program. Each file carries its own manifest, so loading the graph is just following references from one manifest to the next.
+
+```
+dotnet MyApi.dll   (or MyApi.exe apphost)
+|
++-- 1. Host starts
+|     reads runtimeconfig.json  -> which runtime + frameworks
+|     reads deps.json           -> which assemblies, where
+|
++-- 2. Host locates the runtime + shared frameworks
+|
++-- 3. Host starts CoreCLR
+|
++-- 4. Loader loads MyApi.dll
+|     reads the manifest -> loads referenced assemblies
+|
++-- 5. CoreCLR finds the entry point  (Program.Main)
+|
++-- 6. JIT compiles Main's IL -> native, execution begins
+```
+
+## Finding and running the entry point
+
+CoreCLR uses metadata to find the entry point — `Program.Main`, or the `Main` the compiler generates behind top-level statements. But `Main` is still IL, and no CPU runs IL. So the JIT compiles `Main` from IL into native machine code — and each further method the same way, the first time it is called — and execution begins. The application's own code is now running.
+
+For a web application, what `Main` does next is build the host, wire up dependency injection, assemble the middleware pipeline, and start Kestrel. That is the final article of the series. The startup story — from launch to `Main` executing — ends right here.
+
+## What just happened, and what comes next
+
+A static DLL became a live process through a fixed handoff: host, then config, then runtime location, then CoreCLR, then assembly loading, then the entry point, then JIT, then running code.
+
+Two of those steps name components the series has so far only pointed at. The next three articles open them up: what the runtime actually is and contains, what the CLR inside it is responsible for, and how the JIT turns IL into machine code. This article was the map; those are the close-ups.
+
+<NoteToSelf>
+The first execution of every method pays a JIT cost, which means application startup and the very first request are JIT-dominated — the process is busy translating IL to native as it goes. In a long-running server this is a one-time warmup that quickly stops mattering. In a short-lived or serverless process that starts, handles a little work, and exits, that warmup is a large fraction of the whole lifetime, which is why cold-start latency is such a recurring concern there. Precompiling ahead of time — ReadyToRun, or Native AOT — trades some of the JIT's flexibility to shrink that warmup. The mechanics of why sit in the JIT article ahead.
+</NoteToSelf>

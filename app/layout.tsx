@@ -45,9 +45,14 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // data-scroll-behavior tells Next the smooth scrolling in globals.css is
+  // deliberate, so it suppresses it during route transitions (where an
+  // animated scroll restore looks like a bug) but keeps it for in-page
+  // anchor jumps.
   return (
     <html
       lang="en"
+      data-scroll-behavior="smooth"
       className={`${archivo.variable} ${plexMono.variable} bg-ground`}
     >
       <body className="min-h-screen bg-ground text-ink">
