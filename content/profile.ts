@@ -4,7 +4,13 @@ export const hero = {
   kicker: "Backend developer · Regina, SK · Canada",
   firstName: "Mofakh",
   lastName: "Islam",
-  lede: "I build backend services in C# and .NET on Azure at ShiftLab, an AI-powered workforce management startup.",
+  /** Split so the employer can carry a link. This is a .ts file, so the JSX
+   *  lives in the page; the copy stays here. */
+  lede: {
+    before: "I build backend services in C# and .NET on Azure at ",
+    link: { label: "ShiftLab", href: "https://www.shiftlab.io/" },
+    after: ", an AI-powered workforce management startup.",
+  },
   body: "Mostly a public notebook — my scratchpad thoughts, turned into organized notes. Everything I learn gets written up here so I can find it again, refresh it, and so someone else can skip the digging.",
 };
 
@@ -104,6 +110,7 @@ export const jobs = [
     points: [
       "Developing AI-powered workforce management software for employee scheduling, time tracking and labor optimization.",
       "Building scalable backend services and integrations with C#, .NET, Azure Service Bus, Azure Functions and SQL Server.",
+      "Building and maintaining CI/CD pipelines with GitHub Actions to automate application builds, testing, and deployments across development, staging and production environments.",
     ],
   },
   {
@@ -193,10 +200,32 @@ export const education = [
   },
 ];
 
-export const also = [
-  "Published “Friend Recommendation System Based on Heterogeneous Data from Social Network”.",
-  "Competitive programming on LeetCode, Codeforces, CodeChef, LightOJ and UVA.",
-  "Web Development Coordinator, CUET Computer Club; member of CUET Debating Society.",
+/** Same split as the hero lede — copy here, markup in the page, so an entry
+ *  can carry a link without this file needing JSX. */
+export type AlsoItem = {
+  before: string;
+  link?: { label: string; href: string };
+  after?: string;
+};
+
+export const also: AlsoItem[] = [
+  {
+    before: "Published ",
+    link: {
+      label:
+        "“Friend Recommendation System Based on Heterogeneous Data from Social Network”",
+      href: "https://link.springer.com/chapter/10.1007/978-981-99-1435-7_47",
+    },
+    after: ".",
+  },
+  {
+    before:
+      "Competitive programming on LeetCode, Codeforces, CodeChef, LightOJ and UVA.",
+  },
+  {
+    before:
+      "Web Development Coordinator, CUET Computer Club; member of CUET Debating Society.",
+  },
 ];
 
 export const closing = {

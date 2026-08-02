@@ -30,21 +30,19 @@ The escape hatch is the intermediate language from order 1. C# compiles **once**
 ## Compile once to IL, finish on the machine
 
 ```
-        C# source
-            │
-            ▼
-     Roslyn compiler        (happens once)
-            │
-            ▼
-           IL                (CPU-neutral)
-            │
-   ┌────────┼────────┐
-   ▼        ▼        ▼
- Windows  Linux    macOS
- runtime  runtime  runtime  (each finishes IL → native)
-   │        │        │
-   ▼        ▼        ▼
- native   native   native
+C# source
+  |
+  v
+Roslyn compiler   (happens once)
+  |
+  v
+IL   (CPU-neutral)
+  |
+  +--> Windows runtime --> native
+  +--> Linux runtime   --> native
+  +--> macOS runtime   --> native
+
+  (each runtime finishes IL -> native)
 ```
 
 One `MyApp.dll` full of IL runs on all three operating systems because each platform ships a .NET runtime that performs the final IL-to-native step for its own CPU. This is what "build once, run everywhere" actually means — not magic in the DLL, but a runtime already present on the far end.

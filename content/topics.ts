@@ -63,7 +63,7 @@ export const topics: Topic[] = [
     id: "dotnet-inside",
     name: ".NET Inside",
     blurb: "The runtime underneath — CLR, GC, assemblies, hosting.",
-    order: 1.5,
+    order: .5,
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
 ];

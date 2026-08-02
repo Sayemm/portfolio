@@ -1,0 +1,89 @@
+---
+title: "The CLR: what the execution engine is responsible for"
+date: 2026-08-01
+status: written
+minutes: 11
+order: 12
+lead: 'The runtime article named the engine and its parts. This is the engine at work — the standing responsibilities the CLR holds continuously, from the instant it receives control until the process exits.'
+---
+
+## From parts to responsibilities
+
+The runtime article gave the anatomy: the CLR contains a loader, a type system, a JIT, a GC, and the rest. This article is the physiology — what those parts *do*, together, while code runs.
+
+The CLR (CoreCLR) is the execution engine, and its job is everything between "there is IL to run" and "the correct native effect happens, safely." None of it is a one-time step. Each is a responsibility held for the whole life of the process:
+
+```
+CLR responsibilities  (active the whole time code runs)
+|
++-- Load      find + load assemblies, build type structures
++-- Lay out   turn metadata into method tables + object layout
++-- Compile   drive the JIT: IL -> native, on first call
++-- Manage    allocate + reclaim memory (the GC)
++-- Guard     type safety, casts, bounds, verification
++-- Unwind    raise, propagate, and catch exceptions
++-- Schedule  managed threads, the pool, GC coordination
++-- Bridge    interop with native code (P/Invoke)
+```
+
+## Loading: from files to a live type system
+
+The startup article had the loader read a manifest and pull in referenced assemblies. The CLR's loader does more than fetch files. It reads each assembly's metadata and constructs the in-memory type system — the runtime representation of every type actually used. Types load **lazily**, on first use, not all at once, so a program only pays to realise the types it touches.
+
+Load contexts govern how and from where assemblies resolve, and they have a sharp edge worth knowing: the same type loaded through two different contexts is treated as two *different* types. This is the bridge from the on-disk metadata of the "inside an assembly" article to the live structures the runtime article described.
+
+## Laying out types and dispatching calls
+
+From metadata, the CLR computes each type's memory layout — where each field sits, how large an instance is — and builds its **method table**, the runtime list of the type's methods. A virtual or interface call is resolved through that method table at run time, following the method-table pointer that the runtime article showed on every object.
+
+Type identity is the CLR's ruling, and it is stricter than a name match: two types are the same only if they come from the same assembly identity *and* are the same type. This is why the version recorded in the manifest matters — it is part of what makes a type that type, and not a same-named type from a different version.
+
+## Executing: driving the JIT, then running native
+
+In normal operation the CLR never interprets IL — it compiles it. The first time a method is called, the CLR hands that method's IL to the JIT, receives native code back, patches the call site so every later call jumps straight to the native version, and runs it. Some methods arrive already precompiled (ReadyToRun), and for those the CLR can skip the translation entirely.
+
+The mechanics of turning IL into machine code are the next article. The CLR's responsibility is the *orchestration* around it: deciding when to compile, caching the result so it happens once, and stitching freshly generated native code into a process that is already running.
+
+## Managing memory: the garbage collector
+
+This is the responsibility with no article of its own, so it gets a fuller treatment here.
+
+The CLR allocates every reference-type object on the **managed heap**, and allocation is cheap — usually just advancing a pointer past the last object. The real work is reclamation. The GC periodically determines which objects are still **reachable** by tracing references from a set of roots (local variables, static fields, values in CPU registers). Anything not reachable is garbage. After collecting, the GC **compacts** the heap, sliding surviving objects together so free space stays in one contiguous block and the next allocation stays a simple pointer bump.
+
+It leans on a bet called the generational hypothesis — most objects die young:
+
+- New objects start in **gen 0**. Survivors are promoted to **gen 1**, then **gen 2** for the long-lived.
+- Most collections scan only gen 0, which is small and fast. Full **gen 2** collections, which scan everything, are rarer and more expensive.
+- Very large objects go on a separate large object heap, which is not compacted by default because moving big blocks is costly.
+
+The defining trait is that collection timing is the CLR's decision, not the code's. This is the fine print on the managed bargain from the runtime article: memory is reclaimed automatically, but *when* is not controllable. Finalizers therefore run at an unpredictable moment, which is exactly why deterministic cleanup uses `IDisposable` and `using` — those run at a point the code chooses, rather than whenever the GC happens to arrive.
+
+## Guarding: type safety and verification
+
+The CLR enforces that code cannot violate type or memory safety. An object cannot be read as the wrong type; an array cannot be written past its end (bounds are checked); memory cannot be reached through arbitrary pointer arithmetic in verifiable code. Casts are checked against the method table, and an invalid cast throws an exception rather than silently corrupting memory.
+
+This is what "memory-safe by default" means, and it is the guarantee unmanaged C and C++ do not give. The escape hatches — `unsafe` code and interop — exist precisely because they step outside this guarantee deliberately, and are marked so it is obvious where the guard was dropped.
+
+## Unwinding: structured exceptions
+
+When an exception is thrown, the CLR takes over the stack. It walks the call frames one by one, consulting each method's exception-handling metadata — the protected regions and handlers that Roslyn recorded during compilation — to find a matching `catch`, running any `finally` blocks along the way as it unwinds.
+
+Because this is a runtime service driven by metadata rather than a language feature, exceptions propagate correctly across method boundaries and even across languages: a `catch` in C# can handle an exception thrown by F# code, because both compiled their handler information into the same metadata form. The stack trace is the CLR reporting the real frames it walked.
+
+## Scheduling: threads and GC coordination
+
+The CLR maps managed threads onto operating-system threads and provides the thread pool that asynchronous and parallel work runs on. Its subtler duty is coordinating those threads with the GC. To move objects during compaction, the GC needs every managed thread paused at a **safe point** — a spot where the thread's live references are precisely known. Managed threads cooperate by reaching such points regularly; the runtime suspends them there, lets the GC relocate live objects and fix up all the references, then resumes them. That cooperation is why the GC can physically move a running program's objects without breaking it.
+
+## Bridging: calling native code
+
+Sometimes managed code must call an unmanaged library — the operating system, or a native SDK. The CLR's interop layer (P/Invoke) marshals arguments between their managed and native representations, manages the transition across the boundary — including informing the GC that a thread has left managed code, so it is handled correctly during a collection — and brings the results back. It is the controlled doorway out of the managed world and back into it.
+
+## The engine, in one sentence
+
+The CLR is accountable for turning self-describing IL assemblies into correct, safe, native execution: loading them, giving their types shape, compiling them, feeding them memory, guarding their safety, handling their failures, scheduling their threads, and bridging them to native code. Every item on that list is a standing responsibility, held for as long as the process lives.
+
+Of all of them, one is the single translation that makes IL runnable at all — and it has now been deferred three times. The next article finally opens it: how the JIT turns IL into machine code.
+
+<NoteToSelf>
+The GC is not one fixed behaviour — it has modes, and the choice is a real performance lever. **Workstation GC** favours short pauses and a small footprint, the right default for a responsive desktop app. **Server GC** creates a separate heap and collection thread per core and collects them in parallel, trading larger memory use and longer individual pauses for far higher allocation throughput — which is why it is the default for server workloads. It is a `runtimeconfig.json` setting, meaning the same IL runs under materially different memory behaviour depending on one line of configuration the build produced. When a service's tail latency or memory profile looks wrong, this switch is one of the first things to check.
+</NoteToSelf>

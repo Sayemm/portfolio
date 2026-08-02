@@ -1,0 +1,83 @@
+---
+title: "The .NET runtime explained"
+date: 2026-08-01
+status: written
+minutes: 11
+order: 11
+lead: 'Runtime is the word used for the whole bottom half of .NET, which is why it feels vague. It is not one thing — it is an execution engine and a library — and, precisely, the runtime is not the same as the CLR.'
+---
+
+## Runtime is a word doing three jobs
+
+The startup article said, loosely, "the host starts the runtime" and "CoreCLR is the runtime." Both need pinning down, because *runtime* is used for three different scopes that are worth separating.
+
+As installed and as it runs, the runtime is two components: an **execution engine** (CoreCLR — the CLR) and a **base class library** (the BCL). The trap the concepts most people carry is that runtime and CLR are the same. They are not. The CLR is the engine — one component of the runtime, not the whole of it.
+
+```
+.NET runtime  (shipped as Microsoft.NETCore.App)
+|
++-- CoreCLR = the CLR = the execution engine  (native code)
+|     +-- Assembly loader    load DLLs, read metadata + manifest
+|     +-- Type system        build method tables, lay out objects
+|     +-- JIT (RyuJIT)        IL -> native, one method at a time
+|     +-- Garbage Collector   automatic memory management
+|     +-- Exception handling
+|     +-- Threading + sync
+|     +-- Interop (P/Invoke)  call into native libraries
+|
++-- BCL = Base Class Library  (managed code)
+      System.*  — object, string, collections, IO, JSON, ...
+```
+
+The rest of this article is that diagram, explained — and the two articles after it zoom into the engine and then into the JIT.
+
+## The execution engine is native code
+
+Here is the realization that makes the runtime click. The engine itself is **not** written in IL. CoreCLR — the loader, the JIT, the GC, the type system — is native code, written in C and C++ and compiled ahead of time for each platform.
+
+It has to be. Something must run *first* in order to run IL, and that something cannot itself be waiting on a JIT to translate it — that would be circular. So the engine is the native foundation that all managed code stands on. Managed code is portable precisely because the non-portable part, the engine, is shipped per platform and performs the final translation.
+
+This is the concrete reason, from the "why .NET exists" article, that there is a separate runtime build for each operating system and architecture. The IL DLL is one file for everyone; the engine that runs it is compiled specifically for x64 Windows, ARM64 macOS, x64 Linux, and so on.
+
+## The Platform Abstraction Layer
+
+Even the native engine tries not to be rewritten from scratch per operating system. CoreCLR sits on a **Platform Abstraction Layer** — a native layer that wraps OS-specific operations (creating threads, allocating memory pages, file and socket access, delivering exceptions) behind one uniform internal interface. The bulk of the engine is written against that interface, and only the thin abstraction layer underneath is re-implemented for each OS.
+
+So portability actually has two floors. IL is portable across *everything*. The engine's source is portable across operating systems *via the abstraction layer*, and is then compiled to native code for each target. The IL travels because both layers below it were built, once each, to let it.
+
+## Managed execution: what "manage" actually means
+
+The "why .NET exists" article named the bargain — managed means the runtime manages memory and execution — without saying what that supervision consists of. Concretely, while managed code runs, the engine is continuously providing four services:
+
+- **Memory.** The GC allocates every object on a managed heap and reclaims it automatically when nothing references it. There is no manual free, and so no use-after-free and no leak from a forgotten free.
+- **Type safety.** The type system ensures code accesses memory only in type-consistent ways. The layout of every object and the checks around casts and array bounds enforce it.
+- **Exceptions.** A structured mechanism raises and catches errors, and unwinds the call stack correctly across method and even language boundaries.
+- **Threads.** Creation, scheduling cooperation, and the synchronization primitives that coordinate them.
+
+*Managed code* is code that runs under this supervision. *Unmanaged code* — native C or C++ — runs without it and shoulders all of it by hand. The runtime is the supervisor that never leaves while managed code executes.
+
+## How the runtime sees an object
+
+A short peek that the GC and CLR articles will build on. A managed object on the heap is not merely its fields laid end to end. Each object carries a small runtime-owned header, and part of that header is a pointer to its type's **method table** — the engine's in-memory description of the type, constructed from the assembly's metadata at load time.
+
+That one pointer does an enormous amount of work. A virtual method call follows it to find the right method to invoke. The GC follows it to learn the object's size and which of its fields are references to trace. A cast follows it to check whether the object really is the target type. The metadata from the "inside an assembly" article does not stay inert data on disk — at load time the engine turns it into these live structures, and the method-table pointer on every object is how running code reaches them.
+
+## The BCL: the other half of the runtime
+
+Not all of the runtime is engine. The **Base Class Library** — `System.Object`, `string`, the collections, the IO types, the threading types, JSON, the numeric types — is *managed* code, itself compiled to IL, shipped as part of the same `Microsoft.NETCore.App`. A call to `List<T>` or `File.ReadAllText` runs BCL code, loaded and JIT-compiled exactly like the application's own assemblies.
+
+So the runtime is a native engine *plus* a large managed library that the engine runs. The web libraries from the "what .NET is" article (`Microsoft.AspNetCore.App`) are a second shared framework stacked on top of this one — not part of the base runtime, but resolved the same way.
+
+## Runtime, CLR, BCL — the precise split
+
+Stated cleanly, and honouring the distinction the concepts insist on:
+
+- **Runtime** — the whole shipped bottom layer: engine plus BCL.
+- **CLR (CoreCLR)** — the execution engine, one component of the runtime.
+- **BCL** — the base libraries, the other component.
+
+"The CLR runs the code" is true. "The CLR is the runtime" is not — the runtime is the CLR together with the libraries it runs. Getting that split right is what keeps the next two articles from blurring: the engine has many responsibilities, and the following article takes the engine — the CLR — and details what it is accountable for from the moment it receives control until the app exits. The article after that isolates the single component that turned `Main`'s IL into native code: the JIT.
+
+<NoteToSelf>
+CoreCLR is not the only .NET runtime. The platform ships two engines that expose the *same* BCL surface: **CoreCLR**, the mainstream JIT-based runtime this series describes, and **Mono**, a second engine used where CoreCLR does not fit — Blazor WebAssembly in the browser, and much of the mobile and MAUI story, including ahead-of-time-compiled scenarios. Same libraries, same IL, different engine underneath. It is the clearest proof that "the runtime" is a role, not a single program: swap the engine, keep everything above it, and the same assemblies still run.
+</NoteToSelf>

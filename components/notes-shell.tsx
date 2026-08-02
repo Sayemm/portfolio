@@ -1,7 +1,6 @@
 import { OutlineRail } from "@/components/outline-rail";
 import { TopicRail, type RailNote } from "@/components/topic-rail";
 import {
-  sortedTopics,
   notesForTopic,
   getTopic,
   formatDate,
@@ -38,11 +37,6 @@ export function NotesShell({ topicId, activeSlug, outline, children }: Props) {
         }`}
       >
         <TopicRail
-          topics={sortedTopics().map((t) => ({
-            id: t.id,
-            name: t.name,
-            count: notesForTopic(t.id).length,
-          }))}
           notes={railNotes}
           activeTopicId={topic.id}
           activeTopicName={topic.name}

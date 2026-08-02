@@ -1,0 +1,84 @@
+---
+title: "The JIT: turning IL into machine code"
+date: 2026-08-01
+status: written
+minutes: 10
+order: 13
+lead: 'This is the translation the whole series has been deferring. The JIT compiles IL into native code at the last possible moment — after the exact CPU is known, and only for the methods that actually run. That timing is its entire advantage.'
+---
+
+## The translation, at last
+
+The runtime and CLR articles both pointed here and stopped. The CLR *drives* the JIT; this is the thing itself.
+
+The **JIT** — Just-In-Time compiler, called RyuJIT inside CoreCLR — translates IL into native machine code for the current CPU, at run time, one method at a time, the first time each method is called. It is the second half of the two-stage model the series opened with: compile once to IL, then translate IL to native here.
+
+## A third path between compile and interpret
+
+The very first article drew a dichotomy: compile ahead of time (fast to run, but tied to one target) versus interpret live (portable, but slow because translation happens over and over).
+
+The JIT is a third path that takes the better half of each. It produces real native machine code, so execution is fast — but it produces it at run time on the actual machine, so the program stays portable. And unlike an interpreter, it pays the translation cost *once per method*, not once per instruction every time through. Portability and near-native speed, bought together, is the whole reason the two-stage design exists.
+
+## First call: the stub, the JIT, the patch
+
+The CLR article described the orchestration in passing. Here is the mechanism:
+
+```
+first call to Method()
+|
++-- 1. call lands on a stub   (no native code yet)
++-- 2. stub invokes the JIT
+|       reads Method's IL + metadata
+|       generates native code for THIS cpu
++-- 3. stub patched -> call site now points at native
++-- 4. later calls run native directly  (JIT cost paid once)
+```
+
+Every method begins life pointing at a small stub rather than at real code. The first call to it triggers the JIT, which reads the method's IL and metadata, generates native code for the current architecture, and rewrites the call site to point at that freshly generated code. From then on, calls run native at full speed. The translation happened exactly once.
+
+## From a stack machine to registers
+
+This is where two earlier threads finally meet. The "inside an assembly" article showed that IL is **stack-based** — it names no registers, only pushes and pops an evaluation stack. The very first article showed that a real CPU is **register-based** — it works in named registers whose count differs per architecture.
+
+The JIT is the bridge between them. It maps the stack operations of IL onto the finite, specific registers of the real processor. The `ldc.i4 / ldc.i4 / add` sequence from the IL article becomes register instructions like the `mov / add` from the first article. Doing that well is real compiler work: **register allocation** (which values live in which registers), **instruction selection** (which native operations to emit), and optimization. The deliberately CPU-agnostic middle layer meets one concrete CPU right here.
+
+## Tiered compilation: fast to start and fast at speed
+
+The JIT has a built-in conflict. Time spent compiling is time not spent running — yet better native code takes more compilation. Modern .NET resolves this with **tiers**.
+
+- **Tier 0.** On the first call, the JIT produces quick, lightly optimised code, fast — so startup stays snappy. This code is quietly instrumented to count how often the method runs.
+- **Tier 1.** A method that proves hot — called frequently, or looping — is recompiled in the background with full optimisation, and its call site is swapped to the optimised version. This is *tiering up*.
+- **On-stack replacement.** A method stuck in a long loop that started at Tier 0 can be upgraded to Tier 1 *mid-loop*, without waiting for it to return — the running frame is replaced on the stack. So even a long-running loop does not stay slow.
+
+The net effect: Tier 0 buys fast startup, Tier 1 buys fast steady state, and the runtime spends heavy optimisation effort only where measurement shows it will pay off.
+
+## Optimizations the last moment unlocks
+
+Because it runs on the real machine with real runtime information, the JIT can do things a build-time compiler cannot easily do:
+
+- **Target the exact CPU.** It detects the chip's actual instruction sets — wide SIMD, for instance — and emits instructions specific to it, instead of a lowest-common-denominator build that assumes the weakest supported processor.
+- **Devirtualize and inline from observed behaviour.** If a virtual call almost always lands on one type, the JIT can turn it into a direct call and inline the body.
+- **Remove bounds checks** it can prove are always safe, deleting the guard entirely inside hot loops.
+
+These are the payoff of translating late: the compiler simply knows more at run time than any ahead-of-time compiler could.
+
+## The cost, and the ways around it
+
+The flip side is warmup. The first call to each method pays the translation — which is the cold-start latency the startup article flagged — plus some memory to hold the generated code. For a long-lived server this is a negligible one-time cost. For a short-lived or serverless process, it is not.
+
+Two precompilation options trade JIT flexibility for less warmup:
+
+- **ReadyToRun** embeds publish-time native code alongside the IL, so many methods skip the cold JIT on startup, while the runtime can still re-JIT the hot ones at Tier 1. Faster start, larger binary.
+- **Native AOT** compiles everything to native ahead of time and ships no JIT at all — the smallest, fastest-starting output, but with no runtime code generation, which constrains reflection-heavy and dynamic scenarios.
+
+Default JIT-with-tiering is the right choice until a measured startup number says otherwise.
+
+## Why the JIT is the key to cross-platform
+
+One property matters most for what comes next: the JIT is **per-platform**. Each runtime build carries a JIT that targets its own OS and CPU. Hand the same IL DLL to the Windows-x64 JIT and it becomes x64 Windows native code; hand it to the macOS-ARM64 JIT and it becomes ARM64 macOS native code. One portable file, many native results — because the single machine-specific step was deferred to a machine-specific translator.
+
+That is exactly the mechanism behind the claim the next article takes on directly: how one DLL runs, unchanged, on Windows, Linux, and macOS.
+
+<NoteToSelf>
+Tier 0 is not just a fast placeholder — its instrumentation feeds **dynamic profile-guided optimization** (PGO), on by default in modern .NET. The counts and type observations that Tier 0 gathers while the program actually runs are handed to the JIT when it produces Tier 1, so the optimised code is shaped by real behaviour: the branches this workload actually takes, the types this call site actually sees. It is a quietly elegant design — the slow first tier is never wasted work, it is the profiling run that makes the fast tier smart. An ahead-of-time compiler, lacking that live data, has to guess.
+</NoteToSelf>

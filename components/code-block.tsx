@@ -1,19 +1,23 @@
 "use client";
 
-import { useEffect, useState, type ComponentPropsWithoutRef } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+} from "react";
 
 type Props = ComponentPropsWithoutRef<"pre"> & {
   "data-language"?: string;
-  "data-raw"?: string;
 };
 
 export function CodeBlock({
   children,
   className,
   "data-language": language,
-  "data-raw": raw,
   ...rest
 }: Props) {
+  const preRef = useRef<HTMLPreElement>(null);
   const [copied, setCopied] = useState(false);
 
   // A ```text fence is an ASCII diagram, not source. Same frame, but a Copy
@@ -27,10 +31,15 @@ export function CodeBlock({
   }, [copied]);
 
   function copy() {
-    if (!raw) return;
+    // Read the rendered text rather than threading the pre-highlight source
+    // through a shiki transformer: rehype-pretty-code emits one span per line
+    // separated by newline text nodes, so textContent *is* the original source,
+    // and this cannot drift when the highlighting pipeline changes.
+    const text = preRef.current?.textContent ?? "";
+    if (!text) return;
     // The clipboard can refuse (permissions policy, insecure context); leave
     // the label alone rather than claiming a copy that did not happen.
-    navigator.clipboard.writeText(raw).then(
+    navigator.clipboard.writeText(text).then(
       () => setCopied(true),
       () => {},
     );
@@ -53,6 +62,7 @@ export function CodeBlock({
         )}
       </div>
       <pre
+        ref={preRef}
         {...rest}
         className={`${className ?? ""} overflow-x-auto px-3 py-[14px] font-mono text-[13px] leading-[1.7] whitespace-pre`}
       >

@@ -8,14 +8,6 @@ import type { Note } from "@/lib/notes";
 const prettyCode: Options = {
   theme: modernist,
   keepBackground: false,
-  transformers: [
-    {
-      name: "expose-raw-source",
-      pre(node) {
-        node.properties["data-raw"] = this.source;
-      },
-    },
-  ],
 };
 
 export function NoteBody({ note }: { note: Note }) {

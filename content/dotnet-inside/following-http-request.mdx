@@ -1,0 +1,93 @@
+---
+title: "Following an HTTP request through ASP.NET Core"
+date: 2026-08-02
+status: written
+minutes: 11
+order: 15
+lead: 'Every article so far described machinery at rest. This one sets it in motion. A single HTTP request arrives, and every layer the series built — assemblies, the runtime, the CLR, the JIT, the cross-platform stack — lights up at once to answer it.'
+---
+
+## The machinery, finally in motion
+
+Everything up to now has been static: how code becomes a DLL, how that DLL is loaded, what the runtime, the CLR, and the JIT each are. The startup article got the application running and left it at a single line — Kestrel is listening.
+
+This article follows one request from that point, and uses it to show every layer working together. To set the scene in one sentence: at startup, the host started CoreCLR, which ran `Main`, which built the dependency injection container, assembled the middleware pipeline, and started Kestrel. The server is now waiting.
+
+## The request arrives at the server
+
+A browser sends an HTTP request over TCP to the server's address and port. The operating system accepts the connection and hands the raw bytes to the process, where **Kestrel** — ASP.NET Core's built-in, cross-platform web server, part of the web framework from the "what .NET is" article — is reading the socket.
+
+Worth stating plainly: Kestrel is itself managed .NET code. Reading the socket, parsing the bytes — all of it is IL that the JIT turned into native instructions. The web server is not outside this story. It is more of the same code the series has been tracing.
+
+## Kestrel turns bytes into an HttpContext
+
+Kestrel parses the raw byte stream into a structured HTTP request — method, path, headers, body — and wraps it in an **HttpContext**, the object representing this one request and its eventual response. That context travels alongside the request through everything that follows.
+
+The CLR is already at work. The HttpContext, the header strings, the buffers — all allocated on the managed heap, on a thread drawn from the thread pool. The GC will reclaim them once the request is done.
+
+## Into the middleware pipeline
+
+The request enters the **middleware pipeline** — the ordered chain assembled at startup. Each middleware receives the request, may inspect or change it, and then either passes it onward or short-circuits and responds itself.
+
+```
+request in
+  |
+  v  exception handler  ---------------------+
+  v  HTTPS redirect                          |
+  v  routing (match endpoint)                |  same chain,
+  v  authentication / authorization          |  unwinding on
+  v  endpoint (the action)                   |  the way out
+  |                                          |
+  +--------------> produces a response ------+
+                                             |
+                                        response out
+```
+
+The pipeline runs in both directions. The request flows *down* through each middleware to the endpoint, and the response flows back *up* through the same middleware in reverse. Any middleware that wrapped its call to the next stage gets to run code *after* the response exists — recording how long the request took, adding a header, logging the outcome.
+
+## Routing and the endpoint
+
+The routing middleware matches the request path and method against the application's registered endpoints and selects one — a controller action or a minimal API handler. This is the step where a bare URL such as `GET /orders/42` becomes a decision to call one specific method.
+
+## Model binding and dependency injection
+
+Before that method runs, two framework services prepare it:
+
+- **Model binding** turns raw request data — route values, query string, headers, a JSON body — into the typed parameters the method declares. The text `"42"` from the URL becomes an `int id`.
+- The **DI container**, built at startup, supplies the action and everything it depends on: the services it needs, a database context, whatever its constructor asks for, created and wired on demand.
+
+Neither is magic. Both are ordinary managed code that the CLR loaded and the JIT compiled — the framework is simply more assemblies, running the same way the application does.
+
+## The application code runs
+
+Now the action executes the application's own logic — typically a layered chain: the controller calls a service, the service calls a repository, the repository queries the database.
+
+Underneath every one of those calls, the full stack is present. Each method, on its first invocation, was translated from IL into native code by the per-platform JIT, and now runs as native instructions on the processor — on whatever operating system and architecture the server happens to be, because the IL was portable and the runtime is not. Values live in registers and on the managed heap; the GC reclaims whatever the request allocates.
+
+And when the code `await`s the database or a network call, the threading behaviour from the CLR article turns concrete. Rather than block its thread while waiting on that I/O, ASP.NET Core releases the thread back to the pool to serve other requests, and resumes the method on an available thread once the I/O completes. That single mechanism is how one server handles thousands of concurrent requests without holding thousands of threads idle.
+
+## Producing and serializing the response
+
+The action returns a result — an object, or a description of a status and its content. The framework turns that into an HTTP response: serialising an object to JSON with `System.Text.Json`, a library from the runtime's base class library, and setting the status code and headers on the HttpContext.
+
+Serialisation is itself managed code walking the object using the type information the assembly carries. The metadata from the "inside an assembly" article — the exact description of every type and member — that guided the compiler at build time now guides turning those objects into JSON at run time. The same self-description, doing a second job.
+
+## Back out, and onto the wire
+
+The response travels back up through the middleware pipeline, the chain unwinding, each wrapping middleware running its after-logic. Finally Kestrel writes the response bytes back over the socket, and the browser renders them.
+
+The request is complete. The HttpContext and every allocation made on its behalf become unreachable, and the GC will collect them on some future pass — without the code ever asking it to.
+
+## The whole series, in one request
+
+Pull all the way back. A single `GET /orders/42` touched every layer this series built.
+
+It ran code from assemblies that were compiled from C# to IL by Roslyn, under MSBuild, through the SDK — assemblies that are files of IL, metadata, and manifest. Those assemblies were loaded by the CLR at startup, their IL turned into native code by the per-platform JIT, running on whatever operating system and CPU the server uses, because IL is portable and the runtime is not. Throughout, the CLR fed the request memory through the GC, scheduled its threads, guarded its types, and stood ready to unwind its exceptions, while the runtime, its base class library, and the ASP.NET Core framework supplied Kestrel, dependency injection, routing, and JSON.
+
+And beneath all of it, the reason every one of these layers exists at all: a processor understands only native machine code. Everything above was the long, deliberate path from human-readable C# down to instructions a CPU can run — and, in this final article, back up again to a response in a browser.
+
+That is the full journey, from the browser to the CPU and back.
+
+<NoteToSelf>
+This request explains a phenomenon every developer has seen and rarely connects to its cause: the *first* request to a freshly deployed service is slow, and every request after it is fast. The reason is now assemblable from the whole series. On that first request, a large part of the pipeline — Kestrel's paths, the middleware, routing, model binding, the action, the serialiser — is being JIT-compiled from IL to native for the very first time, at Tier 0, *during the request*. Subsequent requests reuse that native code and, for the hot paths, the optimised Tier 1 versions. The abstract warmup from the JIT article is not abstract at all; it is the first `curl` against a new deployment taking a beat longer than the second. Warming an endpoint after deploy, or precompiling with ReadyToRun, is simply paying that cost before a real user does.
+</NoteToSelf>

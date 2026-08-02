@@ -53,36 +53,36 @@ Your entry point runs, and now it is application code building the application:
 End to end, from your keystroke to a listening server:
 
 ```
-   dotnet MyApi.dll
-        │
-        ▼
-   dotnet HOST starts
-   ├─ reads MyApi.runtimeconfig.json
-   ├─ determines required framework versions
-   ├─ finds Microsoft.NETCore.App
-   └─ finds Microsoft.AspNetCore.App
-        │
-        ▼
-   starts CoreCLR  (the runtime)
-        │
-        ▼
-   loads assemblies into one process
-   MyApi.dll · System.Text.Json.dll ·
-   Microsoft.AspNetCore.*.dll · ...
-        │
-        ▼
-   resolves refs → JIT (IL → native)
-   → runs Program.Main()
-        │
-        ▼
-   ASP.NET Core initializes
-   DI · config · middleware · routing
-        │
-        ▼
-   Kestrel starts
-        │
-        ▼
-   listening on http://localhost:5000
+dotnet MyApi.dll
+  |
+  v
+dotnet HOST starts
+  +-- reads MyApi.runtimeconfig.json
+  +-- determines required framework versions
+  +-- finds Microsoft.NETCore.App
+  +-- finds Microsoft.AspNetCore.App
+  |
+  v
+starts CoreCLR   (the runtime)
+  |
+  v
+loads assemblies into one process
+  MyApi.dll, System.Text.Json.dll,
+  Microsoft.AspNetCore.*.dll, ...
+  |
+  v
+resolves refs -> JIT (IL -> native)
+  -> runs Program.Main()
+  |
+  v
+ASP.NET Core initializes
+  DI, config, middleware, routing
+  |
+  v
+Kestrel starts
+  |
+  v
+listening on http://localhost:5000
 ```
 
 ## Two ways to ship: who carries the runtime

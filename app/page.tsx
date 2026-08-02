@@ -191,7 +191,18 @@ export default function Home() {
               {hero.lastName}
             </h1>
             <p className="mb-8 max-w-[34ch] text-[21px] leading-[1.45] text-pretty">
-              {hero.lede}
+              {hero.lede.before}
+              {/* Ink text with a 2px accent rule beneath — the accent carries
+                  the emphasis without breaking the sentence into a red word. */}
+              <a
+                href={hero.lede.link.href}
+                target="_blank"
+                rel="noreferrer"
+                className="font-semibold text-ink underline decoration-accent decoration-2 underline-offset-[6px] transition-colors hover:text-accent hover:decoration-accent-600"
+              >
+                {hero.lede.link.label}
+              </a>
+              {hero.lede.after}
             </p>
             <p className="mb-9 max-w-[52ch] text-[15px] leading-[1.6] text-neutral-700 text-pretty">
               {hero.body}
@@ -397,10 +408,21 @@ export default function Home() {
             <ul className="m-0 list-none p-0">
               {also.map((item) => (
                 <li
-                  key={item}
+                  key={item.before}
                   className="border-t border-rule-soft py-3 text-[15px] leading-[1.5]"
                 >
-                  {item}
+                  {item.before}
+                  {item.link ? (
+                    <a
+                      href={item.link.href}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-semibold text-ink underline decoration-accent decoration-2 underline-offset-[4px] transition-colors hover:text-accent hover:decoration-accent-600"
+                    >
+                      {item.link.label}
+                    </a>
+                  ) : null}
+                  {item.after}
                 </li>
               ))}
             </ul>
