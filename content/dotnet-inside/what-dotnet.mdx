@@ -1,0 +1,84 @@
+---
+title: "What .NET actually is"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 3
+lead: 'The word .NET names five different things at once. Only one of them is correct — the other four are parts of it.'
+---
+
+## Five words for one thing, and only one fits
+
+.NET gets called a language, a runtime, an SDK, a framework, and a platform — sometimes in a single sentence. Four of those name a *part*. One names the *whole*.
+
+The whole is a **platform**. The runtime, the SDK, and the frameworks are components inside it, and the language is a neighbour it hosts rather than a piece of it. Sorting out which is which removes most of the fog around the word.
+
+```
+.NET  —  the platform
+|
++-- SDK  (builds apps)
+|   |
+|   +-- Runtime  (runs apps)
+|   |   +-- CLR   execution engine
+|   |   +-- JIT   IL to native
+|   |   +-- GC    memory management
+|   |   +-- BCL   base class library
+|   |
+|   +-- Roslyn · MSBuild · dotnet CLI · templates
+|
++-- Frameworks on top  (ASP.NET Core · EF Core · MAUI)
+
+     ^
+     |  target the platform (not part of it)
+   C# · F# · VB.NET
+```
+
+## The language is not .NET
+
+C# is the language. So are F# and VB.NET. The language is the grammar from order 2 — the rules for writing code. .NET is never the language; it is what the language targets and runs on.
+
+Collapsing the two ("learning .NET" when the thing being learned is C#) is the single most common beginner slip. The clean split: **C# is written; .NET is targeted.**
+
+## The runtime is what a machine needs to *run* a .NET app
+
+The **runtime** is the piece that executes an already-compiled application. It contains the CLR (the execution engine), the JIT (which turns IL into native code), the GC (which manages memory), the assembly loader, and the base libraries the app calls into. Later topics take each of these apart.
+
+An end user who only needs to *run* a .NET program installs the runtime and nothing else. The runtime cannot build anything — it has no compiler.
+
+## The SDK is what a developer needs to *build* one
+
+The **SDK** is a superset of the runtime. It bundles a runtime *plus* the tools that turn source into a program: Roslyn (the C# compiler), MSBuild (the build orchestrator), the `dotnet` CLI, and project templates. It can build, run, publish, and test.
+
+So the relationship is strict containment: the SDK includes a runtime. A machine with the SDK installed can therefore both build and run — which is why a development machine never needs the runtime installed separately.
+
+## "Framework" is the most overloaded word here
+
+Three unrelated meanings hide behind this one word:
+
+- **Shared framework** — a versioned bundle of libraries the runtime provides. `Microsoft.NETCore.App` holds the base libraries; `Microsoft.AspNetCore.App` holds the web libraries. These ship with the runtime.
+- **Application framework** — a higher-level library built *on top of* the platform to solve a domain: ASP.NET Core for web, EF Core for data access, MAUI for UI. These are chosen per project, not part of the base install.
+- **.NET Framework** (capital F) — a specific, named product: the original Windows-only .NET from 2002, now legacy. This is not "a framework" in the generic sense, and not the same thing as modern .NET.
+
+That last collision — capital-F *Framework* the product versus lowercase-f *framework* the concept — traps beginners constantly. They are different in kind, not just spelling.
+
+## The name has a history worth knowing
+
+Three eras explain most of the confusion in older documentation:
+
+- **.NET Framework (2002)** — Windows-only, the original line. Still runs a great deal of enterprise software.
+- **.NET Core (2016)** — a ground-up rewrite: cross-platform, open source, modular. A separate product, not an update to the Framework.
+- **.NET 5 and later (2020 onward)** — the two lines unified under one plain name, `.NET`. The word "Core" was dropped. Crucially, .NET 5, 6, 7, 8, and 9 are the continuation of .NET **Core**, not of .NET **Framework**.
+
+The practical payoff: a Stack Overflow answer that mentions ".NET Framework 4.8" or a Windows-only API belongs to the old line and may not apply to a modern .NET 8 project. The version number alone reveals which world an answer comes from.
+
+## Platform: the umbrella that holds all of it
+
+Assembled, .NET-the-platform is the entire ecosystem: the languages that target it, the SDK that builds, the runtime that runs, the CLR/JIT/GC inside that runtime, the shared and application frameworks layered on top, and the CLI and tooling wrapped around the whole thing.
+
+So the honest one-line answer to "is .NET a language, framework, runtime, SDK, or platform?" — it is the **platform**. The framework, runtime, and SDK are parts of it; the language is what it hosts.
+
+And of those parts, exactly one is the developer's entry point: the SDK. Everything — building, running, publishing — starts there. Which makes the next question unavoidable: what is actually inside the SDK, and why is it far more than a compiler? That is order 4.
+
+<NoteToSelf>
+There was a fourth naming artifact: **.NET Standard**. It was never an implementation — it was a *specification*, a list of APIs that a library could target so the same DLL would load on both .NET Framework and .NET Core during the years they coexisted. Modern .NET (5+) mostly retired the need for it, but older libraries still declare `netstandard2.0` as a target, and that string means "a spec, not a runtime." Recognising it as a compatibility contract rather than a platform version avoids a real head-scratcher when reading old `.csproj` files.
+</NoteToSelf>

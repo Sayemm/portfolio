@@ -1,0 +1,101 @@
+---
+title: "The .NET SDK: more than a compiler"
+date: 2026-08-01
+status: written
+minutes: 8
+order: 4
+lead: 'A compiler turns one language into another. Building a real program needs far more — resolving dependencies, ordering projects, generating config, producing something runnable. The SDK is the whole assembly line; the compiler is one station on it.'
+---
+
+## The developer installs the SDK; the user installs the runtime
+
+Order 3 drew the line: the runtime *runs* apps, the SDK *builds* them, and the SDK contains a runtime. On the .NET download page this shows up as two separate choices.
+
+- A machine that only needs to **run** a finished .NET app installs the **runtime**.
+- A machine that needs to **build** one installs the **SDK** — and because the SDK bundles a runtime, that same machine can run apps too.
+
+This is why a development box never installs the runtime separately. Two commands make the split visible:
+
+```
+dotnet --list-sdks       # what can build
+dotnet --list-runtimes   # what can run
+```
+
+A machine can have several of each, at different versions, side by side.
+
+## Open the box: what the SDK actually contains
+
+The SDK is not one program. It is a coordinated bundle of tools, each responsible for one part of turning source into a running application:
+
+```
+dotnet SDK
+|
++-- Runtime          also lets the SDK run apps
+|   +-- CLR · JIT · GC · BCL
+|
++-- Roslyn           C# compiler        (source -> IL)
++-- MSBuild          build orchestrator (reads .csproj)
++-- dotnet CLI       the command that gets typed
++-- NuGet client     fetches package dependencies
++-- Templates        dotnet new scaffolding
++-- Test host        dotnet test integration
+```
+
+Every later topic in this series is really a close-up of one of these boxes.
+
+## A compiler is one station, not the assembly line
+
+Roslyn's job is narrow and precise: take the `.cs` files, produce IL and metadata for **one** assembly. That is genuinely all a compiler does — and it is not enough to produce a program anyone can run.
+
+Building a real project also requires:
+
+- restoring the NuGet packages the project depends on,
+- resolving which framework and reference assemblies to compile against,
+- ordering multiple projects so a dependency builds before whatever needs it,
+- invoking Roslyn with exactly the right references and options,
+- copying content files, and generating `deps.json` and `runtimeconfig.json`,
+- placing the finished output in `bin`.
+
+MSBuild coordinates all of that and calls Roslyn as a *single step* inside it. The SDK ships both tools plus the rules that wire them together. That gap — between "compile one assembly" and "produce a runnable project" — is exactly why the SDK is more than a compiler.
+
+## The dotnet CLI is the one door to all of it
+
+Every one of those tools is reached through a single command: `dotnet`.
+
+```
+dotnet new         scaffold a project from a template
+dotnet restore     fetch dependencies
+dotnet build       compile to IL, produce output
+dotnet run         build, then start the app
+dotnet publish     produce a deployable output
+dotnet test        build and run tests
+dotnet add package edit the .csproj dependency list
+```
+
+The CLI itself is a thin driver. It reads the command, then hands the real work to MSBuild, NuGet, Roslyn, or the runtime as appropriate. One tool to memorise; many engines behind it.
+
+## Versions: the SDK that builds and the runtime it targets can differ
+
+An SDK carries its own version — `8.0.400`, for instance. That single SDK can build projects targeting several different runtime versions, so "which .NET is installed" always has two answers: which **SDKs** can build, and which **runtimes** can run. The two lists from earlier exist precisely because these are different questions.
+
+For repeatable builds across a team, a `global.json` file can pin which SDK version a repository uses, so every machine builds with the same toolchain rather than whatever happens to be newest locally.
+
+## What each command sets in motion
+
+The most-typed command is `dotnet build`, and it is a relay:
+
+```
+dotnet build
+   -> CLI dispatches to MSBuild
+   -> MSBuild reads the .csproj, restores, resolves references
+   -> MSBuild calls Roslyn  (source -> IL)
+   -> output written to bin:  MyApi.dll + config files
+```
+
+`dotnet run` does all of that and then starts the app through the runtime. That relay is the map for the next stretch of the series: order 5 walks the whole build end to end, order 6 zooms into MSBuild, and order 7 into Roslyn.
+
+So the natural next question is the one behind the most common command of all — step by step, what actually happens when `.cs` files become a DLL? That is order 5.
+
+<NoteToSelf>
+The `dotnet` executable wears two hats, and which one it wears depends on the first argument. `dotnet build` / `dotnet run` — it acts as the **CLI driver**, dispatching to SDK tools. `dotnet MyApi.dll` — it acts as the **app host**, starting the runtime to execute an assembly. Same binary, two completely different jobs, chosen by whether the first argument is a known SDK verb or a path to a DLL. Noticing this collapses a lot of "wait, is `dotnet` the build tool or the runtime?" confusion — it is both, by design.
+</NoteToSelf>

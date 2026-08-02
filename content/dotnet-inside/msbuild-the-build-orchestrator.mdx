@@ -1,0 +1,87 @@
+---
+title: "MSBuild: the build orchestrator"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 6
+lead: 'The build walk-through kept naming a coordinator without explaining it. MSBuild is that coordinator — and the surprising part is that the project file is not its configuration. The project file is its program.'
+---
+
+## The .csproj is not configuration; it is a build program
+
+MSBuild is a general-purpose build engine. Its job is to read a build *described in XML* and execute it. The `.csproj` is exactly that XML — not a settings file that some other tool consults, but the program MSBuild runs.
+
+This reframes the coordinator from the build walk-through. MSBuild is an interpreter; the `.csproj` is the source it interprets. And as that walk-through hinted, most of that source is written not by the developer but by the SDK.
+
+## Four building blocks: properties, items, targets, tasks
+
+An MSBuild program is built from four kinds of thing, and every build rule is some combination of them:
+
+```
+<Project>              the build program
+|
++-- PropertyGroup      properties = single named values
+|     TargetFramework, Configuration, OutputPath
+|
++-- ItemGroup          items = lists, each entry with metadata
+|     Compile (.cs files), Reference, Content
+|
++-- Target             a named unit of work
+      runs Tasks:  Csc (-> Roslyn), Copy, MakeDir
+```
+
+- **Properties** are scalars — one name, one value. `TargetFramework` is `net8.0`; `Configuration` is `Debug`.
+- **Items** are lists with attached metadata. The set of `.cs` files to compile is an item list; so are the references and the content files to copy.
+- **Targets** are named units of work, arranged by dependency. A target says what it depends on and contains the steps to run.
+- **Tasks** are the steps themselves — and a task is *actual executable code*, a class MSBuild loads and runs. The `Csc` task invokes Roslyn; `Copy` copies files; `MakeDir` creates folders.
+
+Properties and items are the data. Targets and tasks are the behaviour. MSBuild's whole model is: evaluate the data, then run the behaviour in the right order.
+
+## The file is tiny because the SDK ships the program
+
+The look at the SDK described it as, in large part, a bundle of MSBuild targets. This is where that pays off. The one-line `Sdk="Microsoft.NET.Sdk"` attribute imports hundreds of predefined properties, items, and targets — the real logic of "how to build a .NET project."
+
+So the effective program MSBuild runs is enormous. The visible `.csproj` is a thin layer of overrides sitting on top of it, supplying a handful of values and letting the SDK's targets do the work. A six-line project file builds a complete application because MSBuild is really executing the SDK's build program, with the developer's file filling in the blanks.
+
+## Evaluate, then execute
+
+MSBuild runs a build in two phases, and keeping them separate explains a lot of otherwise-baffling behaviour:
+
+- **Evaluation** — read the project and every file it imports, top to bottom, computing the final value of every property and the full contents of every item list. The result is an in-memory model of the build.
+- **Execution** — run the requested targets, in dependency order, against that model.
+
+Because evaluation reads imports in order, *position matters*. A property set after an import overrides that import's default; a property the SDK sets late can override one the developer set early. When a build setting stubbornly "will not take," this evaluation order is almost always the reason.
+
+## Targets form a graph; MSBuild walks it
+
+The default entry point is the `Build` target, and it does almost none of the work itself. It *depends on* a chain of other targets, and MSBuild reads those dependency declarations to compute an execution order:
+
+```
+Build
+  depends on:
+    ResolveReferences   locate framework / package / project refs
+    CoreCompile         run the Csc task  ->  Roslyn:  .cs -> IL
+    CopyFilesToOutput   place the results in bin
+```
+
+No one writes that order by hand. Each target declares what it must run after (or before), and MSBuild derives the sequence from the graph. Adding a step means declaring a new target and where it hooks in — not editing a script in the middle.
+
+## Why a graph, and not a plain script
+
+The declarative-graph design buys three things a top-to-bottom script could not:
+
+- **Incremental builds.** A target can declare its `Inputs` and `Outputs`; MSBuild skips it when the outputs are already newer than the inputs. This is the up-to-date check behind the fast second build from the earlier walk-through.
+- **Parallelism.** Projects with no dependency between them can build at the same time, because the graph makes their independence explicit.
+- **Extensibility.** A custom target can attach itself with `BeforeTargets` or `AfterTargets` to run at a precise point, without touching the SDK's targets at all.
+
+Together these are why a build is reproducible across a team and still customisable per project.
+
+## Where MSBuild stops and the compiler begins
+
+For all its coordination, MSBuild compiles nothing. Its responsibility ends at "call the right task, with the right inputs, at the right time." The `CoreCompile` target runs the `Csc` task, and that task hands the resolved source files and references over to Roslyn.
+
+Everything MSBuild did — restore, evaluate, resolve, order, skip-if-unchanged — was in service of that single handoff. So the next question points straight at it: inside that one task, what does Roslyn actually do to turn C# into IL? That is the next article.
+
+<NoteToSelf>
+The claim "the visible file is tiny, the real program is huge" is directly inspectable. `dotnet build -bl` writes a `msbuild.binlog` recording every evaluated property, every item, and every target and task that ran, with inputs and outputs. Opened in the MSBuild Structured Log Viewer, it is the fully expanded program — SDK imports and all — laid out as a tree. When a build does something inexplicable, this is the ground truth: not what the `.csproj` says, but what MSBuild actually computed and executed.
+</NoteToSelf>

@@ -1,0 +1,74 @@
+---
+title: "Roslyn: the C# compiler"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 7
+lead: 'A compiler does not translate line by line. Roslyn reads the whole program as structure, works out what every name means, and only then writes a single instruction of IL. Seeing it that way explains what compiles, what does not, and why.'
+---
+
+## The one task from the last article, opened up
+
+The MSBuild article ended at a precise point: the `CoreCompile` target runs the `Csc` task, which hands the resolved source files and references to Roslyn. This is that handoff seen from the inside.
+
+Roslyn is the C# compiler. Its job is narrow — turn `.cs` text into a single assembly of IL, metadata, and a manifest — and it does that job in four stages. Translation into IL is the *last* of them; three stages of understanding come first.
+
+```
+.cs source text
+|
++-- 1. Lex     text -> tokens         (words and symbols)
++-- 2. Parse   tokens -> syntax tree  (structure; grammar checked)
++-- 3. Bind    names -> symbols       (meaning; types checked)
++-- 4. Emit    bound tree -> IL       (assembly written)
+```
+
+## Stage 1 — lexing turns text into tokens
+
+Source starts as a flat run of characters. The lexer groups those characters into **tokens**: keywords (`if`, `class`), identifiers (`result`), literals (`42`, `"hi"`), and punctuation (`+`, `;`, `{`). Whitespace and comments become *trivia* — attached to the tokens but carrying no meaning for the program. After lexing, the compiler no longer thinks in characters; it thinks in a stream of meaningful units.
+
+## Stage 2 — parsing builds a syntax tree
+
+The parser arranges those tokens into a tree that mirrors the grammar of C#: a namespace holds a class, a class holds a method, a method holds statements, a statement holds expressions. This is the **syntax tree**, and it is purely structural. It knows that `2 + 3` is an addition of two literals — but it does not yet know or care what type they are.
+
+Grammar mistakes surface here. A missing semicolon or an unbalanced brace is a *syntax error*: the parser could not fit the tokens into the shape the language allows.
+
+## Stage 3 — binding attaches meaning
+
+The syntax tree describes what the code *looks like*. Binding decides what it *means*. Roslyn resolves every name to a specific symbol: which `Console`, which overload of `WriteLine`, which local variable, which type.
+
+This is the stage that consumes the resolved references from the build walk-through. Roslyn reads the **reference assemblies** — the API surfaces, signatures without implementations — to know what types and members even exist. Type checking happens here too: is `2 + 3` valid, is an argument the right type, is a member accessible from here.
+
+Most compile errors a beginner sees are *semantic* errors from this stage, not syntax errors: "type or namespace not found," "no overload matches these arguments," "cannot implicitly convert." The grammar was fine; the *meaning* did not hold together. The output of binding is a **bound tree** — the syntax tree with a resolved meaning fastened to every node.
+
+## Stage 4 — emit writes the assembly
+
+Only now does translation occur. Roslyn walks the bound tree and produces three things, bundled into one output file:
+
+- **IL** — the portable instructions.
+- **Metadata** — a structured description of every type and member in the assembly.
+- **Manifest** — the assembly's identity and the list of assemblies it references.
+
+All three land in `MyApi.dll`. And, as the "why .NET exists" article established, the instructions are IL, not machine code — Roslyn stops at the portable form. The next two articles take apart exactly what IL, metadata, and manifest each are.
+
+## Compiling is not the same as being correct
+
+Roslyn checks precisely two things: **syntax** (does the code obey the grammar) and **semantics** (do the names resolve, the types agree, the members allow access). It checks nothing about whether the program does the right thing.
+
+Code that divides by zero, loops forever, or returns the wrong answer compiles cleanly. "It compiles" means "it is well-formed and type-consistent" — never "it works." An enormous amount of early frustration lives in the gap between those two statements.
+
+## Roslyn is a platform, not just a batch tool
+
+The name *Roslyn* belongs to the open-source rewrite that turned the compiler into a set of queryable APIs. The syntax tree and the meaning-resolving **semantic model** are not private internals — they are exposed for other tools to read.
+
+This is what powers the editor. IntelliSense, the red squiggles that appear as code is typed, rename, and refactorings all run the same lexing–parsing–binding analysis described above, continuously, in the background. Two features build directly on it:
+
+- **Analyzers** inspect the syntax and semantic model during compilation and report diagnostics — style, correctness, or security warnings.
+- **Source generators** run during compilation and *add* new source, which is then compiled alongside the project. Code generated from code, inside the same build.
+
+So "the compiler" is not a box invoked once and forgotten. It is a service the whole toolchain queries, of which producing a DLL is only one use.
+
+The emit stage bundled IL, metadata, and manifest into a `.dll` and moved on. But what *is* a `.dll`, exactly — and how does it differ from an `.exe`, or from the broader idea of an assembly? That is the next article.
+
+<NoteToSelf>
+Nullable reference types are a *binding-stage* feature, which is why they fit here. The null-state tracking (`string` versus `string?`) is an analysis Roslyn performs during semantic analysis, and it only ever produces warnings — it inserts no runtime check whatsoever. The annotations are recorded into metadata so other compilations can read them, but the compiled program behaves identically with the feature on or off. It is the cleanest example of the series' recurring split: a compile-time guarantee that leaves the runtime completely untouched.
+</NoteToSelf>

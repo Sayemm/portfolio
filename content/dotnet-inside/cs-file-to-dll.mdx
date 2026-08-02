@@ -1,0 +1,94 @@
+---
+title: "From .cs files to a DLL"
+date: 2026-08-01
+status: written
+minutes: 9
+order: 5
+lead: 'dotnet build is a single command, but not a single action. Between typing it and a DLL appearing in bin, five distinct things happen — and exactly one of them is compilation.'
+---
+
+## One command, five stages
+
+The earlier look at the SDK ended on a relay: `dotnet build` hands off to a chain of tools. Here is that chain in full. The important idea up front — a build is a pipeline, and compiling the code is only one stage of it:
+
+```
+dotnet build
+|
++-- 1. Dispatch    CLI hands off to MSBuild
++-- 2. Restore     resolve + fetch NuGet packages
++-- 3. Evaluate    read .csproj, load SDK, resolve references
++-- 4. Compile     MSBuild calls Roslyn:  .cs -> IL
++-- 5. Output      write the assembly + config into bin
+```
+
+Most beginners assume `build` means "compile." Compilation is stage 4 of 5.
+
+## Stage 1 — the CLI hands off
+
+As the SDK breakdown noted, the `dotnet` command is a thin driver. On `dotnet build` it does almost nothing itself: it recognises the verb and dispatches the real work to MSBuild. Nothing has been compiled yet.
+
+## Stage 2 — restore resolves the dependencies
+
+Before any code can compile, every package the project depends on has to be present. NuGet reads the `PackageReference` entries in the `.csproj`, works out the full dependency graph — including the transitive packages those packages need — downloads anything missing into a shared package cache, and writes a `project.assets.json` file describing where each resolved assembly lives.
+
+Modern SDKs run this automatically as part of `build`, so an explicit `dotnet restore` is rarely necessary. It is still a distinct stage, and when a build fails with "package not found," this is the stage that failed.
+
+## Stage 3 — MSBuild evaluates the project
+
+Now MSBuild reads the `.csproj`. The one-line `Sdk="..."` attribute pulls in the SDK's build logic — the rules that define what "build a .NET project" even means. With those loaded, MSBuild resolves three different kinds of reference:
+
+- **Framework references** — the shared frameworks from the "what .NET is" article (`Microsoft.NETCore.App`, `Microsoft.AspNetCore.App`), supplied by the installed runtime, not downloaded.
+- **Package references** — the assemblies restore just resolved.
+- **Project references** — other projects in the same solution.
+
+For a solution with several projects, MSBuild also computes the build order, so a project builds only after everything it depends on. Still nothing compiled — this stage decides *what to compile against*.
+
+## Stage 4 — Roslyn compiles, and only the project's own code
+
+MSBuild now invokes Roslyn, handing it the resolved reference set. Roslyn parses the `.cs` files, checks types and syntax, and emits a single assembly containing IL, metadata, and a manifest.
+
+The key restraint: Roslyn compiles **only this project's source**. The framework and the packages are *referenced*, never recompiled — they were already compiled by their authors. In fact Roslyn does not even read their real implementations; it compiles against **reference assemblies**, which carry the public API shape with hollow method bodies. The build needs to know the framework's *signatures*, not its guts.
+
+Output of this stage: `MyApi.dll` — portable IL, as the "why .NET exists" article set up, not machine code.
+
+## Stage 5 — MSBuild assembles the output folder
+
+Roslyn produced an assembly. MSBuild now produces a *runnable folder*. Into `bin/Debug/net8.0/` it writes:
+
+```
+MyApi.dll                the IL Roslyn produced
+MyApi.pdb                debug symbols (line numbers for stack traces)
+MyApi.deps.json          the dependency graph, so the host knows what to load
+MyApi.runtimeconfig.json which runtime + framework versions to load
+appsettings.json         copied content and config
+(referenced package DLLs) as needed
+```
+
+The `.dll` is the code; the two `.json` files are instructions for later. Neither runs anything yet — they are notes left for whatever starts the process.
+
+## What build deliberately does not do
+
+Three things a build never does, each a topic of its own further on:
+
+- It does not **run** the app — that is `dotnet run` and the app host.
+- It does not **recompile the framework** — reference assemblies, not implementations.
+- It does not produce **machine code** — the output is IL, and turning IL into native instructions happens at run time, method by method, through the JIT.
+
+The DLL sitting in `bin` is CPU-neutral IL. On its own it cannot run on any processor.
+
+## obj versus bin, Debug versus Release
+
+Two folders appear, and they are not the same:
+
+- **`obj/`** is scratch space: the `project.assets.json` from restore, the generated `GlobalUsings.g.cs`, and intermediate compile state.
+- **`bin/`** is the final output — the runnable folder from stage 5.
+
+Deleting both is exactly what `dotnet clean` does. MSBuild is also **incremental**: it compares the timestamps of inputs against outputs and skips any stage whose inputs have not changed, which is why a second build with no edits finishes almost instantly.
+
+The build **configuration** picks a trade-off. `Debug` (the default) keeps full symbols and disables optimisation, so a debugger can step through the code line by line. `Release` enables optimisations and strips debug helpers, producing faster, leaner output for shipping.
+
+Across all five stages, one component stood at the controls — reading the project, loading the SDK, resolving references, ordering the work, deciding what to skip, and calling the compiler at the right moment. That component is MSBuild, and it has been described so far only as "the orchestrator." The next article opens it up: what MSBuild actually is, and how it knows what to do.
+
+<NoteToSelf>
+The incremental up-to-date check is timestamp-based, and it is occasionally *wrong* — a generated file, a clock skew, or a target that forgets to declare its outputs can leave MSBuild believing a stale build is current. This is the real mechanism behind the oldest advice in software: "it works after a clean." `dotnet clean` (or deleting `obj` and `bin`) does not fix the code — it erases the stale outputs so the up-to-date check has nothing to be wrong about. Reach for it only when a build result stops matching the source; routinely cleaning throws away the entire point of incremental builds.
+</NoteToSelf>
