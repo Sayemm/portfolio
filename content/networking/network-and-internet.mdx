@@ -1,0 +1,81 @@
+---
+title: "Networks and the internet"
+date: 2026-08-02
+status: written
+minutes: 8
+order: 2
+lead: 'A network is not the cables and boxes. It is a logical grouping of hosts that can reach each other directly. The internet is just a very large number of those groupings, wired together.'
+---
+
+## Before networks: carrying data by hand
+
+The problem networks solved was physical and tedious. To move a file from one computer to another, someone copied it onto portable media — a disk, later a USB drive — carried it across the room or the building, plugged it into the second machine, and copied it off. This has a nickname: **sneakernet**, because the transport layer was a person in sneakers.
+
+Networking exists to automate exactly that. It lets hosts share data across a wire, on their own, with no human courier in the loop. Everything that follows is machinery in service of that one goal.
+
+## A network is a logical grouping, not a pile of hardware
+
+The one-line definition is that a network transports traffic between hosts. The more useful definition is precise about *what* a network is:
+
+**A network is a logical grouping of hosts that require similar connectivity — hosts that share an address space and can reach one another directly.**
+
+The word doing the real work is **logical**. A network is not the switches and cables; it is the *grouping*. Hosts on the same network share an IP range — the hierarchy from the previous article — and can talk to each other directly, with nothing in between translating from one network to another. The physical devices in the next few articles (hubs, switches, routers) are the machinery that makes this grouping function, but the network itself is the idea that *these hosts belong together*.
+
+The smallest possible network is two hosts connected to each other. Add a wire between two devices and, by this definition, a network already exists.
+
+## Networks within networks
+
+A network can contain smaller networks inside it — **subnetworks**, or **subnets**. This is the address hierarchy from the previous article made concrete: one large address space, subdivided again and again.
+
+```
+ACME network            10.x.x.x
+  |
+  +-- New York          10.20.x.x
+  |     +-- Sales         10.20.55.x
+  |     +-- Engineering   10.20.66.x
+  |
+  +-- London            10.30.x.x
+        +-- Sales         10.30.55.x
+        +-- Engineering   10.30.66.x
+```
+
+Each indentation is a network nested inside a larger one. Groups get their own subnet when they need different connectivity from their neighbours — a distinction the router article will return to in detail. For now the shape is the point: networks can hold networks, which can hold networks, all the way down.
+
+## The internet is a network of networks
+
+Every one of these separate networks connects to one shared resource: **the internet**. And the internet is not a single giant network — the name says so. *Internet* is short for **inter-network**, literally "between networks." It is a vast number of independent networks, interconnected, so that a host inside one can reach a host inside another.
+
+![Separate networks — ACME, a home, a coffee shop, a school — all connected through the internet](/images/networking/internet.png)
+
+```
+                the internet
+             (a network of networks)
+                     |
+     +---------+-----+-----+----------+
+     |         |           |          |
+   ACME      Home        Coffee     School
+  network    Wi-Fi        Shop      network
+             network     network
+```
+
+Each box is its own self-contained network with its own address space. The internet is what links them so traffic can cross from one to another.
+
+## ISPs connect the networks
+
+The connections between all those networks are handled by **Internet Service Providers**. An ISP provides the link that joins a private network — a home, an office — to the wider internet, and carries its traffic toward other networks.
+
+ISPs themselves are layered. A local or regional provider connects up to larger backbone providers, which connect to one another, so "the internet" is really a mesh of providers passing traffic between networks. There is no single center and no single owner — just networks, connected to other networks, through providers, all the way out.
+
+## Logical idea, physical reality
+
+That is the organizing idea for the next stretch of the series. A network is a *logical* grouping; most of what follows is the *physical* machinery that builds and connects those groupings:
+
+- **repeaters and hubs** — extend and share a single wire,
+- **switches** — move traffic *within* one network,
+- **routers** — move traffic *between* networks.
+
+And it all begins with the most basic physical fact of all: a signal travelling down a wire fades as it goes. The next article starts exactly there, with the humble device whose only job is to fix that — the repeater.
+
+<NoteToSelf>
+Every example in these notes uses `10.x.x.x` or `192.168.1.x`, and that is not a coincidence. Those are **private** address ranges — `10.0.0.0/8`, `172.16.0.0/12`, and `192.168.0.0/16` — reserved for use *inside* private networks like a home or an office. They are deliberately not unique on the internet: countless separate networks reuse `192.168.1.x` internally at the same moment. **Public** addresses, by contrast, must be globally unique. The device that bridges a private network to the public internet is a router performing NAT (network address translation) — a topic these notes do not reach, but the reason the example addresses all look the way they do.
+</NoteToSelf>

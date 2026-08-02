@@ -11,10 +11,18 @@ type Props = {
   topicId: string;
   activeSlug: string | null;
   outline?: Heading[];
+  /** True on /notes/<topic>/links, so the rail can mark that entry active. */
+  onLinksPage?: boolean;
   children: React.ReactNode;
 };
 
-export function NotesShell({ topicId, activeSlug, outline, children }: Props) {
+export function NotesShell({
+  topicId,
+  activeSlug,
+  outline,
+  onLinksPage,
+  children,
+}: Props) {
   const topic = getTopic(topicId)!;
   const notes = notesForTopic(topicId);
 
@@ -41,6 +49,8 @@ export function NotesShell({ topicId, activeSlug, outline, children }: Props) {
           activeTopicId={topic.id}
           activeTopicName={topic.name}
           activeSlug={activeSlug}
+          linkCount={topic.links?.length ?? 0}
+          onLinksPage={onLinksPage}
         />
 
         <div className="pt-10 pb-24 rail:px-12">{children}</div>

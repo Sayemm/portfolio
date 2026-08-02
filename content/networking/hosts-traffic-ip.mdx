@@ -1,0 +1,79 @@
+---
+title: "Hosts, traffic, and IP addresses"
+date: 2026-08-02
+status: written
+minutes: 7
+order: 1
+lead: 'Before any data moves across the internet, three things have to exist: something to send it, the data itself, and an address to send it to. Every other networking idea is built on these three.'
+---
+
+## The whole internet, in three words
+
+Networking comes with a mountain of vocabulary, but almost all of it rests on three plain terms:
+
+- a **host** — something that sends or receives,
+- **traffic** — the data being sent,
+- an **IP address** — the identity that says where it goes.
+
+Every device, protocol, and diagram later in this series exists to do one thing: move *traffic* between *hosts*, using *IP addresses* to decide where it belongs.
+
+## A host is anything that sends or receives traffic
+
+A **host** is any device that sends or receives traffic over a network. Computers, laptops, phones, printers, servers, cloud servers, and every IoT device — smart TVs, watches, refrigerators — are all hosts. They differ wildly in purpose, but they all follow the same rules to communicate.
+
+Hosts split into two roles:
+
+- a **client** *initiates* a request,
+- a **server** *responds* to it.
+
+A server is nothing exotic — it is a computer running software that answers a specific kind of request. A web server knows how to serve web pages; installing web-server software is enough to turn any machine into one.
+
+The key subtlety: these roles are **relative to a single conversation**, not fixed identities. A server becomes a client the moment it initiates a request of its own. So "client" and "server" describe a role in one exchange, not a permanent label on a box.
+
+## Traffic is the data in motion
+
+**Traffic** is the data packets transmitted between hosts. That data can be almost anything — files, emails, web pages, video streams, voice calls, any form of digital communication.
+
+Traffic also has a direction, named relative to a host: from a client up to a server is **upload**; from a server back down to a client is **download**. It is the same wire either way — only the direction of travel changes the name.
+
+## An IP address is a host's identity
+
+To send or receive anything, a host needs an address, the same way sending mail needs a postal address. That address is its **IP address**.
+
+Crucially, the IP address is stamped on *everything* a host sends. Every packet carries two of them: a **source** and a **destination**.
+
+```
+a packet on the wire:
+
+  [ src IP 10.1.1.22 | dst IP 3.3.3.3 | ...the data... ]
+```
+
+When a client sends a request, it stamps the source as its own address and the destination as the server's. When the server replies, it does the same in reverse. Every single thing on the internet carries this source-and-destination pair — it is how any reply ever finds its way back.
+
+## What an IP address actually is
+
+An IP address is just **32 bits**. To make 32 bits readable, they are broken into **4 chunks** called **octets**, and each octet is written as a decimal number from **0 to 255**:
+
+```
+   10    .    30    .    55    .   127
+ [8 bits] [8 bits] [8 bits] [8 bits]      = 32 bits
+  0-255    0-255    0-255    0-255
+```
+
+The range is 0 to 255 because each octet is 8 bits, and 8 bits hold 2^8 = 256 distinct values (0 through 255). Four octets of 8 bits each is where the 32 comes from.
+
+The addresses are also **hierarchically assigned** — not handed out at random. Like a postal address that narrows from country to city to street to house, an IP address narrows down *where a host sits*. Breaking an address into those layers is a process called **subnetting**.
+
+![One IP block, subdivided by office and then by team](/images/networking/ip-hierarchy.png)
+
+*The address `10.30.55.127` reads as: a host at ACME (`10.x.x.x`), in London (`10.30.x.x`), in Sales (`10.30.55.x`).*
+
+## Why the hierarchy matters
+
+A flat, random list of every host on earth would be impossible to search — finding one address would mean checking all of them. Hierarchy fixes that. Because the address narrows location step by step, the network can rule out enormous regions at a glance, the same way a postal system routes on the country before it ever looks at the street.
+
+That structure is not a convenience — it is the thing that makes *routing* possible at all, which is where this series is heading. But traffic cannot be routed until there is something to carry it between hosts in the first place. That something is a **network**, and the next article builds one up from two connected hosts all the way to the internet.
+
+<NoteToSelf>
+"32 bits" has a famous consequence. Thirty-two bits can express only 2^32 addresses — about 4.3 billion. That sounded limitless in the 1980s and is nowhere near enough for a planet of phones, servers, and IoT devices, so the world genuinely ran out of fresh IPv4 addresses. The fix is **IPv6**, which uses 128 bits — enough addresses to be effectively inexhaustible. Nearly everything in this series is explained with the 32-bit IPv4 form because it is easier to read, but the shortage it caused is the reason IPv6 exists.
+</NoteToSelf>

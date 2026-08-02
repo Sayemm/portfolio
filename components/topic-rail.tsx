@@ -10,6 +10,8 @@ type Props = {
   activeTopicId: string;
   activeTopicName: string;
   activeSlug: string | null;
+  linkCount: number;
+  onLinksPage?: boolean;
 };
 
 export function TopicRail({
@@ -17,6 +19,8 @@ export function TopicRail({
   activeTopicId,
   activeTopicName,
   activeSlug,
+  linkCount,
+  onLinksPage = false,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -68,6 +72,19 @@ export function TopicRail({
             );
           })}
         </div>
+
+        {linkCount > 0 ? (
+          <Link
+            href={`/notes/${activeTopicId}/links`}
+            onClick={() => setOpen(false)}
+            className={`mt-6 flex items-baseline justify-between border-t-2 border-rule pt-3 font-mono text-[10px] tracking-[0.12em] uppercase hover:text-accent ${
+              onLinksPage ? "text-accent" : "text-neutral-600"
+            }`}
+          >
+            <span>Useful links</span>
+            <span className="text-neutral-500">{linkCount}</span>
+          </Link>
+        ) : null}
       </div>
     </div>
   );

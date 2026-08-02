@@ -7,6 +7,9 @@ export type Topic = {
    *  chip row is generated from this list, so a new topic appears there
    *  automatically. */
   chip: { bg: string; fg: string };
+  /** Outside reading worth keeping. Optional: the rail entry and the
+   *  /notes/<topic>/links page appear only for topics that have some. */
+  links?: { label: string; href: string }[];
 };
 
 export const topics: Topic[] = [
@@ -44,6 +47,12 @@ export const topics: Topic[] = [
     blurb: "What happens between a request and a response.",
     order: 5,
     chip: { bg: "#e0efeb", fg: "#0b5a4e" },
+    links: [
+      {
+        label: "Networking Fundamentals: How data moves through the Internet",
+        href: "https://www.practicalnetworking.net/index/networking-fundamentals-how-data-moves-through-the-internet/",
+      },
+    ],
   },
   {
     id: "system-design",

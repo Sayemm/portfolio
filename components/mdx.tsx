@@ -1,3 +1,4 @@
+import { Children, isValidElement } from "react";
 import type { MDXComponents } from "mdx/types";
 import { CodeBlock } from "@/components/code-block";
 
@@ -25,21 +26,49 @@ export function NoteToSelf({ children }: { children: React.ReactNode }) {
   return <Callout label="Note to self">{children}</Callout>;
 }
 
+/** `![alt](/images/…)` in a note. Plain <img> rather than next/image because
+ *  markdown carries no dimensions; the file lives in public/ and is served
+ *  as-is. Diagrams keep their colour — the grayscale rule is for photography. */
+function MdxImage({ src, alt }: { src?: string; alt?: string }) {
+  if (typeof src !== "string") return null;
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={src}
+      alt={alt ?? ""}
+      className="mb-6 block h-auto max-w-full border-2 border-rule"
+    />
+  );
+}
+
 export const mdxComponents: MDXComponents = {
   NoteToSelf,
   Callout,
+  img: MdxImage,
   h2: (props) => (
     <h2
       {...props}
       className="mt-[42px] mb-[14px] scroll-mt-[72px] border-t-2 border-rule pt-[14px] text-[26px] font-extrabold tracking-[-0.02em]"
     />
   ),
-  p: (props) => (
-    <p
-      {...props}
-      className="mb-5 max-w-[66ch] text-[16px] leading-[1.68] text-pretty"
-    />
-  ),
+  p: (props) => {
+    // Markdown wraps a lone image in a paragraph. Let it stand on its own so
+    // it does not inherit body-text margins on top of the figure's own.
+    const kids = Children.toArray(props.children);
+    if (
+      kids.length === 1 &&
+      isValidElement(kids[0]) &&
+      kids[0].type === MdxImage
+    ) {
+      return <>{kids[0]}</>;
+    }
+    return (
+      <p
+        {...props}
+        className="mb-5 max-w-[66ch] text-[16px] leading-[1.68] text-pretty"
+      />
+    );
+  },
   ul: (props) => (
     <ul
       {...props}
