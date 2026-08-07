@@ -1,0 +1,177 @@
+---
+title: "Generics and constraints"
+date: 2026-08-6
+status: written
+minutes: 10
+order: 2
+lead: 'Generics are not just "reusable containers". They are how we keep the compiler''s type-checking and skip boxing at the same time — and constraints are the promises that turn an unknown T into something we can actually use.'
+---
+
+## The problem generics exist to solve
+
+Before generics, a "list of things that works for any type" had exactly one option: a collection of `object` — `ArrayList`. It hurts in two distinct ways, and it is worth separating them because they map to the two wins generics give back.
+
+```csharp
+using System.Collections;
+
+var l = new ArrayList();
+l.Add(5);
+l.Add("Hello");
+
+var number = (int)l[0];
+var second = (int)l[1]; // compiles fine, then throws InvalidCastException at RUNTIME
+                        // it accepted the string with no complaint; the explosion happens later
+
+var shifts = new List<int>();
+shifts.Add(5);
+shifts.Add("ten");      // COMPILE-TIME error: cannot convert string to int
+```
+
+Two problems, two fixes:
+
+- **Type safety.** `ArrayList` accepted the string silently and blew up later, far from the mistake. `List<int>` rejects it at the exact line, in the editor, before the code ever runs.
+- **No boxing, no casting.** `ArrayList` boxed every `int` into a heap object and forced a cast on the way out. `List<int>` stores real `int`s — no box, no cast. (This is the direct payoff of the boxing note from Day 1.)
+
+`List<T>` is a **template**: `T` is a placeholder, and `List<int>` is the version where every `T` is `int` — type-checked, cast-free, box-free. `T` is the **type parameter**; `int` is the **type argument** (same relationship as a method's parameter vs. the argument we pass).
+
+<NoteToSelf>
+Interview trap: C# generics are **not** C++ templates. They are *reified* — the type survives at runtime (Java erases it). Under the hood the JIT shares **one** compiled body across all reference-type arguments (`List<string>`, `List<Employee>` reuse the same code) and generates **specialized** code only for value types (`List<int>`, `List<double>` each get their own). So "stamps out a copy per type" is literally true only for value types.
+</NoteToSelf>
+
+## Writing our own generic type
+
+Consuming generics is easy; writing them is what we do when we build shared infrastructure. The smallest possible one is a holder for a value of any type:
+
+```csharp
+var intObj = new Check<int>(42);
+var stringObj = new Check<string>("Hello, World!");
+
+public class Check<T>
+{
+    public T Value { get; set; }
+
+    public Check(T value)
+    {
+        Value = value;
+    }
+}
+```
+
+The point: we write the code **once** and it stays type-safe for `int`, `string`, `Employee`, anything. Before generics we'd have written `IntBox`, `StringBox`, `EmployeeBox`... or fallen back to `object` and thrown away type checking. Generics are how we get reuse **without** sacrificing the compiler.
+
+## Generic methods
+
+A whole generic class isn't required — a single method can carry its own type parameter, with the angle brackets right after the name:
+
+```csharp
+static T FirstOrGiven<T>(List<T> items, T fallback)
+    => items.Count > 0 ? items[0] : fallback;
+
+var hours = new List<int> { 8, 6, 4 };
+int first = FirstOrGiven(hours, -1);   // compiler infers T = int — no <int> needed
+```
+
+The nice part: we usually don't write `<T>` at the call site, because the compiler **infers** it from the arguments. That inference is why LINQ reads so cleanly later — `.Select()`, `.Where()`, `.First()` are all generic methods inferring `T` from the data.
+
+## Constraints
+
+Inside `Check<T>`, `T` could be *anything*, so we can barely do anything to it: store it, return it, call `.ToString()`. We cannot call `.Save()`, or `new T()`, or compare it — the compiler has no idea whether an arbitrary `T` supports those.
+
+```csharp
+public class Repository<T>
+{
+    public T Create() => new T();   // won't compile
+}
+```
+
+The error is explicit: *"cannot create an instance of the variable type 'T' because it does not have the new() constraint."* The compiler is protecting us — what if someone writes `Repository<SomethingWithNoParameterlessConstructor>`? Then `new T()` would be impossible. So C# makes us **promise up front what T can do**. Those promises are **constraints**, written with `where`.
+
+This is exactly why `new()` exists — a type whose only constructor takes an argument can't be `new`-ed blind:
+
+```csharp
+var ok  = new Check { Count = 5 };                  // fine — has an implicit parameterless ctor
+var bad = new NeedsArg();                            // ERROR — its only ctor needs an int
+
+public class Check { public int Count { get; set; } }
+
+public class NeedsArg
+{
+    private int _count;
+    public NeedsArg(int x) => _count = x;            // no parameterless ctor exists
+}
+```
+
+Now the constrained repository — read the `where` clause as three separate promises, each of which unlocks one specific thing:
+
+```csharp
+public interface IEntity
+{
+    int Id { get; set; }
+}
+
+public class Repository<T> where T : class, IEntity, new()
+{
+    private readonly List<T> _items = new();
+    private int _nextId = 1;
+
+    public T Add(T item)
+    {
+        item.Id = _nextId++;                          // legal because T : IEntity → T has an Id
+        _items.Add(item);
+        return item;
+    }
+
+    public T? GetById(int id)                          // T? legal because T : class
+        => _items.FirstOrDefault(x => x.Id == id);
+
+    public T CreateBlank() => new();                   // legal because T : new()
+
+    public IReadOnlyList<T> All() => _items;
+}
+```
+
+Each constraint is a *promise* that unlocks a *capability*:
+
+- `class` → `T` is a reference type, so `T?` and `null` are meaningful → a missing lookup can return `null`.
+- `IEntity` → the compiler now knows every `T` has an `Id` → `item.Id = ...` compiles. Drop this constraint and that line fails.
+- `new()` → a parameterless constructor is guaranteed → `new T()` / `new()` is allowed.
+
+Constraints we'll actually meet, roughly by frequency: `where T : class` (reference type), `where T : struct` (value type), `where T : IEntity` (implements an interface / inherits a base class), `where T : new()` (parameterless constructor). Stack them freely, but the order is fixed — `class`/`struct` first, `new()` last. The compiler enforces the ordering and guides us.
+
+## Completing the repository: Remove and Update
+
+```csharp
+public bool Remove(int id)
+{
+    var existing = _items.FirstOrDefault(x => x.Id == id);
+    if (existing is null)
+        return false;                                  // nothing matched → nothing removed
+
+    _items.Remove(existing);
+    return true;
+}
+
+public T Update(T item)
+{
+    var index = _items.FindIndex(x => x.Id == item.Id);
+    if (index < 0)
+        throw new InvalidOperationException($"No entity with Id {item.Id} exists.");
+
+    _items[index] = item;                              // swap in place, same slot
+    return item;
+}
+```
+
+`Remove` returns whether anything actually left the list, so the caller can react to a miss. `Update` finds the row by `Id`, swaps it in place, and throws when there is nothing to update — a repository should never silently "succeed" at updating a record that was never there.
+
+## The class-but-not-new() gotcha (EF Core)
+
+Here the constraints pay off in a real framework. EF Core's `DbSet<T>` is declared `where T : class` — but deliberately **not** `new()`.
+
+The `class` constraint is non-negotiable: EF Core tracks entities by **identity**, builds runtime **proxies** that derive from the entity type (for change detection and lazy loading), and needs `null` to be meaningful for optional relationships. All of that is reference-type behaviour; a struct cannot play.
+
+The absence of `new()` is the interesting half. EF never writes `new T()`. It materialises a database row into an object through **reflection and compiled expression trees** — and that machinery can call a *private* or *protected* parameterless constructor, or a *parameterised* one bound to columns. Requiring `new()` — which specifically demands a **public** parameterless constructor — would rule those entities out. EF asks for *less* than `new()` precisely because it wants *more* flexibility than `new()` allows.
+
+<NoteToSelf>
+The pattern to carry forward: a constraint is the minimum promise that makes the code compile — never a wishlist. `new()` looks harmless but it demands a *public* parameterless constructor, which is exactly why EF Core refuses to require it. Ask for the least `T` needs, so the most types qualify.
+</NoteToSelf>
