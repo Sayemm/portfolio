@@ -1,0 +1,174 @@
+---
+title: "Collections internals: List, Dictionary, HashSet"
+date: 2026-08-10
+status: written
+minutes: 11
+order: 3
+lead: 'Every collection has a shape, and the shape is what decides what is fast. A List is an array — brilliant by index, slow to search. A Dictionary and a HashSet are hash tables — brilliant to look up, with no order. The real skill is picking the one that fits the question asked most often.'
+---
+
+## How List&lt;T&gt; actually grows
+
+A `List<T>` holds a contiguous **array** inside it, and arrays have a fixed size. So what happens when we `Add` past that size? The list must allocate a **bigger array and copy everything over**. How often that happens is governed by two numbers:
+
+- `Count` — how many items we have actually added.
+- `Capacity` — how big the internal array currently is.
+
+Each time the array fills, the list allocates a new array **twice the size** and copies the old contents in. We can watch the doubling happen:
+
+```csharp
+var list = new List<int>();
+int last = -1;
+
+for (int i = 0; i < 20; i++)
+{
+    if (list.Capacity != last)
+    {
+        Console.WriteLine($"Count {i,2} -> Capacity {list.Capacity}");
+        last = list.Capacity;
+    }
+    list.Add(i);
+}
+// Capacity walks 0 -> 4 -> 8 -> 16 -> 32 ... it doubles
+```
+
+Copying is O(n) work — so why is a list considered fast? **Because doubling makes those expensive copies rare.** To reach 1,000,000 items the array resizes only ~20 times (log₂ of a million), not a million times. Spread across a million cheap `Add`s, the total copy cost averages out to a constant per item. That is **amortized O(1)**: any single `Add` might occasionally trigger a big copy, but *on average* each `Add` is constant-time.
+
+The practical payoff — pre-size when the count is known ahead of time:
+
+```csharp
+using System.Diagnostics;
+const int N = 10_000_000;
+
+var sw = Stopwatch.StartNew();
+var grows = new List<int>();      // capacity 0 -> doubles ~24 times, lots of copying
+for (int i = 0; i < N; i++) grows.Add(i);
+sw.Stop();
+Console.WriteLine($"No initial capacity: {sw.ElapsedMilliseconds} ms");
+
+sw.Restart();
+var sized = new List<int>(N);     // capacity N up front -> zero regrowth
+for (int i = 0; i < N; i++) sized.Add(i);
+sw.Stop();
+Console.WriteLine($"Pre-sized capacity:  {sw.ElapsedMilliseconds} ms");
+```
+
+The pre-sized version wins clearly — no reallocations, no copying, and less GC pressure from all those discarded arrays. Whenever the rough size is known — "about to load 5,000 shifts from the database" — pass it to the constructor: `new List<Shift>(expectedCount)`. It is a free speedup. (This is also why the EF Core team pre-sizes collections when a query's row count is known.)
+
+<NoteToSelf>
+Capacity is not Count. `new List<int>(5)` sets **Capacity = 5** but **Count = 0** — it reserves room, it does not add items. The list is still empty; it just will not need to regrow until the 6th item. Mixing these up is a classic off-by-a-mental-model slip.
+</NoteToSelf>
+
+## Why List&lt;T&gt; lookups can be slow
+
+A `List<T>` is great at some things and quietly terrible at others, and its **shape** (a contiguous array) decides which:
+
+- **Fast, O(1):** add to the end (amortized), access by index, iterate in order. Indexing is `start + index × itemSize` — the array jumps straight to the slot.
+- **Slow, O(n):** `Contains`, `IndexOf`, `Remove(item)`, `Insert` in the middle — anything that has to **search** or **shift** elements. `Contains` walks item by item until it finds a match.
+
+So when the real question is *"is this employee ID in the collection?"* and it gets asked a lot, `List<T>` is the wrong tool. That is exactly the problem the next type solves.
+
+## Dictionary&lt;TKey,TValue&gt;: the magic of hashing
+
+A dictionary answers *"give me the value for this key"* in **O(1)** — constant time, whether it holds ten items or ten million. The trick is **hashing**, and it is worth understanding deeply because it is the mechanism behind dictionaries, hash sets, database indexes, and caches everywhere.
+
+Picture the dictionary as a **row of numbered buckets** — say 16 of them, labelled 0–15. Storing a key is two steps:
+
+1. Ask the key for its hash: `GetHashCode()` returns a big integer, say `70021`.
+2. Squeeze that into a bucket number: `70021 % 16 = 5`. → drop it in **bucket 5**.
+
+Looking the key up later runs the **exact same two steps** and jumps straight to bucket 5 — no scanning. Hashing turns *"search through everything"* into *"compute the address and go straight there."*
+
+There are two wrinkles we need to know before trusting a dictionary — one about *speed*, one about *correctness*.
+
+## Wrinkle 1 — Collisions
+
+`%` squeezes billions of possible hashes down into a handful of buckets, so **different keys sometimes land in the same bucket**. That is a *collision*, and it is normal — not a bug.
+
+The dictionary handles it by keeping a **small chain of entries per bucket** and doing a quick equality check (`Equals`) among just those entries. So a bucket is not "one slot" — it can hold two or three keys, and the dictionary walks that short chain to find the right one.
+
+The key consequence for speed: **a few collisions are fine; many collisions degrade a dictionary toward O(n)** — chains grow long, every lookup walks a long chain, and it quietly becomes a list again. Good hash codes spread keys **evenly** across buckets to keep chains short and collisions rare. This is the whole reason a *bad* `GetHashCode` (one that returns the same number for everything) is a performance disaster even when it is technically "correct."
+
+## Wrinkle 2 — The equality contract
+
+This is the one that bites people, so here it is in slow motion. Two things do the work, and they split the job:
+
+- **`GetHashCode()` picks the bucket.** (Which shelf do we walk to?)
+- **`Equals()` finds the exact item within that bucket.** (Which item on that shelf is ours?)
+
+`GetHashCode` gets us to the *neighbourhood*; `Equals` finds the *exact house*. And — tying back to Wrinkle 1 — **`Equals` only runs *inside* a bucket, after the hash has already chosen it.** That single fact is what makes the next bug possible.
+
+Now the bug, in slow motion — a class that overrides `Equals` but forgets `GetHashCode`:
+
+```csharp
+var byBadge = new Dictionary<EmployeeKey, string>();
+var key = new EmployeeKey(42);
+byBadge[key] = "Sharmin";
+
+bool there = byBadge.ContainsKey(new EmployeeKey(42));  // true or false?
+Console.WriteLine($"Found by equal key: {there}");
+
+public class EmployeeKey
+{
+    public int Badge { get; }
+    public EmployeeKey(int badge) => Badge = badge;
+
+    public override bool Equals(object? o) => o is EmployeeKey k && k.Badge == Badge;
+    // NOTE: no GetHashCode override — this is the bug
+}
+```
+
+It prints **False**, even though the two keys are `Equals`. Walk it through:
+
+- **Storing** `new EmployeeKey(42)`: `GetHashCode()` was not overridden, so it uses the **default**, which is based on the object's *identity in memory* (roughly "where this specific object lives"), not on `Badge`. Say it returns `88888` → `88888 % 16 = 8` → stored in **bucket 8**.
+- **Looking up** a *brand-new* `new EmployeeKey(42)` with the same badge: default `GetHashCode` again, but this is a *different object* in memory, so it returns a *different* number, say `11111` → `11111 % 16 = 7` → the dictionary walks to **bucket 7**, finds it empty, and reports "not here."
+
+It **never even visits bucket 8**, where the item actually sits. `Equals` never runs, because `Equals` only runs *inside* a bucket and we went to the wrong bucket entirely. The item is physically in the dictionary, yet it can never be found. A genuinely nasty production bug.
+
+That is what the contract exists to prevent:
+
+> **If two things are equal, they must produce the same hash code.**
+
+Equal ⟹ same hash. The reverse is *not* required — two *unequal* things are allowed to share a hash (that is just a collision, and `Equals` sorts them out inside the bucket). What is forbidden is equal things with *different* hashes.
+
+The fix connects straight back to the Day 1 equality note — a `record` generates **both** members from the **same field**, so they can never fall out of sync:
+
+```csharp
+public record EmployeeKey(int Badge);   // value equality + matching GetHashCode, generated
+```
+
+Two `EmployeeKey(42)` objects now agree: `Equals` → true, and `GetHashCode` → the same number (both computed from `Badge = 42`). Same bucket, lookup works. This is *why* records are the default for dictionary keys and DTOs — the compiler keeps the contract airtight.
+
+<NoteToSelf>
+"Never use a class as a key" is a myth worth un-learning — `string` is a class and it is the most common dictionary key in existence. The real rule is the contract: equal keys must hash equally. A class is a fine key as long as it honours that — either use a `record`, or override `Equals` and `GetHashCode` **together**, from the same fields, never one without the other.
+</NoteToSelf>
+
+## HashSet&lt;T&gt;: a dictionary with no values
+
+Once the dictionary clicks, `HashSet<T>` is easy: the **same hashing machinery, storing only keys, no values**. Its whole job is answering *"have I seen this before?"* and *"is this in the set?"* in O(1), and enforcing uniqueness.
+
+```csharp
+var badgesSeen = new HashSet<int>();
+var clockIns = new[] { 101, 102, 101, 103, 102, 101 };
+
+foreach (var badge in clockIns)
+{
+    if (badgesSeen.Add(badge))              // Add returns false if already present
+        Console.WriteLine($"First clock-in today: badge {badge}");
+}
+```
+
+`HashSet.Add` returns a `bool` — `true` if the item was new, `false` if already present — so we get *"insert and check-if-new"* in one O(1) operation. Set operations (`UnionWith`, `IntersectWith`, `ExceptWith`) are the other superpower: *"which employees are available Monday **and** trained on register 3?"* is an `IntersectWith` of two sets.
+
+## Choosing the right collection
+
+Most performance problems are really *wrong-collection* problems. Match the collection to the **question asked most often**:
+
+- Ordered list, mostly added at the end, accessed by position or iterated → **`List<T>`**.
+- "Look up a value by a key" → **`Dictionary<TKey,TValue>`**.
+- "Is this in the set / have we seen it / are these unique" → **`HashSet<T>`**.
+- First-in-first-out work queue → **`Queue<T>`**; last-in-first-out → **`Stack<T>`**.
+
+<NoteToSelf>
+The trap to recognise on sight: `List.Contains` inside a loop over big data. Each `Contains` is O(n), and calling it inside an O(n) loop makes the whole thing **O(n²)**. The fix is almost always one line — load the data into a `HashSet` first, then each check is O(1). Spotting a `.Contains` inside a `foreach` over thousands of rows is spotting a latent performance bug.
+</NoteToSelf>
