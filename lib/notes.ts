@@ -23,11 +23,35 @@ export type Note = {
 
 export type Heading = { id: string; text: string };
 
-/** YAML parses an unquoted `2026-07-18` into a UTC Date, not a string. */
-function toIsoDate(value: unknown): string | null {
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** YAML parses an unquoted `2026-07-18` into a UTC Date, not a string — but
+ *  only when it is zero-padded. `2026-08-6` stays a string, renders correctly,
+ *  and then sorts lexicographically *above* `2026-08-22` because "6" > "2".
+ *  Reject anything unpadded rather than let it quietly reorder Recent notes. */
+function toIsoDate(value: unknown, where: string): string | null {
+  if (value === undefined || value === null) return null;
   if (value instanceof Date) return value.toISOString().slice(0, 10);
-  if (typeof value === "string") return value.slice(0, 10);
-  return null;
+  if (typeof value === "string" && ISO_DATE.test(value.slice(0, 10))) {
+    return value.slice(0, 10);
+  }
+  throw new Error(
+    `${where}: invalid date ${JSON.stringify(value)}. Use YYYY-MM-DD, zero-padded.`,
+  );
+}
+
+const STATUSES: readonly NoteStatus[] = ["written", "outline"];
+
+/** An unrecognised status used to fall through to "outline", which hid the
+ *  note from Recent and mislabelled it — silently. Fail the build instead. */
+function readStatus(value: unknown, where: string): NoteStatus {
+  if (value === undefined) return "outline";
+  if (typeof value === "string" && STATUSES.includes(value as NoteStatus)) {
+    return value as NoteStatus;
+  }
+  throw new Error(
+    `${where}: unknown status ${JSON.stringify(value)}. Use "written" or "outline".`,
+  );
 }
 
 function readTopicNotes(topic: Topic): Note[] {
@@ -38,12 +62,13 @@ function readTopicNotes(topic: Topic): Note[] {
     .map((file) => {
       const raw = fs.readFileSync(path.join(dir, file), "utf8");
       const { data, content } = matter(raw);
+      const where = `content/${topic.id}/${file}`;
       return {
         topicId: topic.id,
         slug: file.replace(/\.mdx$/, ""),
         title: data.title as string,
-        date: toIsoDate(data.date),
-        status: (data.status as NoteStatus) ?? "outline",
+        date: toIsoDate(data.date, where),
+        status: readStatus(data.status, where),
         minutes: typeof data.minutes === "number" ? data.minutes : null,
         lead: (data.lead as string) ?? "",
         outline: (data.outline as string[]) ?? [],
