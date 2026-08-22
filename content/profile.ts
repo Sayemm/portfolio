@@ -1,5 +1,3 @@
-import { topics } from "@/content/topics";
-
 export const hero = {
   kicker: "Backend developer · Regina, SK · Canada",
   firstName: "Mofakh",
@@ -35,17 +33,6 @@ export const languages = [
   { label: "TypeScript", bg: "#e3eaf5", fg: "#1e4c82" },
   { label: "SQL", bg: "#f7ecdb", fg: "#8a5400" },
 ];
-
-/** Derived from topics.ts, never hand-listed — adding a topic adds its chip. */
-export const writingAbout = topics
-  .slice()
-  .sort((a, b) => a.order - b.order)
-  .map((t) => ({
-    label: t.name,
-    bg: t.chip.bg,
-    fg: t.chip.fg,
-    topicId: t.id,
-  }));
 
 export type Social = {
   label: string;

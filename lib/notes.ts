@@ -66,8 +66,17 @@ export function allNotes(): Note[] {
   return cache;
 }
 
+/** Busiest topic first. `order` is only the tie-breaker now, so the running
+ *  order reorders itself as notes are added — nothing to maintain by hand. */
 export function sortedTopics(): Topic[] {
-  return topics.slice().sort((a, b) => a.order - b.order);
+  const counts = new Map<string, number>();
+  for (const note of allNotes()) {
+    counts.set(note.topicId, (counts.get(note.topicId) ?? 0) + 1);
+  }
+  return topics.slice().sort((a, b) => {
+    const byCount = (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0);
+    return byCount !== 0 ? byCount : a.order - b.order;
+  });
 }
 
 export function getTopic(topicId: string): Topic | undefined {

@@ -1,0 +1,288 @@
+---
+title: "Namespace, Class, Method, Statements: Where Code Is Allowed to Live"
+date: "2026-08-22"
+status: "published"
+minutes: 8
+order: .99
+lead: "Namespaces hold types, classes hold members, methods hold statements — a strict containment chain. The 'a namespace cannot directly contain statements' error and the entire top-level-statements feature both fall out of that one hierarchy."
+---
+
+## The one rule
+
+Everything in this note reduces to a single chain. Each level may only contain the level below it.
+
+```text
+namespace          -> groups types
+   |
+   +-- class        -> holds members (fields, properties, methods, ...)
+          |
+          +-- method   -> holds executable statements
+                 |
+                 +-- statements   -> the code that actually runs
+```
+
+A statement cannot skip a level and sit directly inside a namespace. That single fact is the whole story behind the most common startup error in C#.
+
+## Namespace: a grouping of types
+
+A namespace is a name for a group of types. It is not a class and holds no code of its own.
+
+```csharp
+namespace CsharpDemo;
+
+public class Program
+{
+}
+```
+
+Read as:
+
+```text
+CsharpDemo            (namespace)
+   |
+   +-- Program        (class)
+```
+
+What a namespace is allowed to contain is a fixed list — all of them are *types*:
+
+```text
+namespace
+   |
+   +-- class       OK
+   +-- struct      OK
+   +-- interface   OK
+   +-- enum        OK
+   +-- delegate    OK
+   |
+   +-- statement   NOT ALLOWED   (CS0116)
+```
+
+## Class: a holder of members
+
+A class contains fields, properties, methods, and constructors — never loose statements at its top level either. Executable code lives one more level down, inside a method.
+
+```csharp
+public class Program
+{
+    public static void Main()
+    {
+    }
+}
+```
+
+```text
+Program              (class)
+   |
+   +-- Main()        (method)
+```
+
+## Method: a holder of statements
+
+A method body is the first place executable statements are legal.
+
+```csharp
+public static void Main()
+{
+    string str = "hello";
+    Console.WriteLine(str);
+}
+```
+
+```text
+Main()                       (method)
+   |
+   +-- string str = "hello";
+   +-- Console.WriteLine(str);
+```
+
+Put the whole chain together and the traditional shape of a C# program appears:
+
+```text
+CsharpDemo
+   |
+   +-- Program
+          |
+          +-- Main()
+                 |
+                 +-- string str = "hello";
+                 +-- Console.WriteLine(str);
+```
+
+## Why loose statements under a namespace fail
+
+Given the hierarchy, this file is illegal:
+
+```csharp
+// Program.cs — DOES NOT COMPILE
+namespace CsharpDemo;
+
+string str = "hello";            // statement sitting directly in the namespace
+Console.WriteLine(str);          // -> CS0116
+```
+
+The compiler sees statements as direct children of the namespace:
+
+```text
+CsharpDemo
+   |
+   +-- string str = ...          NOT ALLOWED
+   +-- Console.WriteLine(...)    NOT ALLOWED
+```
+
+The message is exact: `A namespace cannot directly contain members such as fields, methods or statements`. A namespace holds types; statements belong in a method. The fix is to give them a method to live in.
+
+```csharp
+// Program.cs — legal: statements now live inside Main
+namespace CsharpDemo;
+
+public class Program
+{
+    public static void Main()
+    {
+        string str = "hello";
+        Console.WriteLine(str);
+    }
+}
+```
+
+## Top-level statements: the compiler writes the class and method
+
+Modern C# allows the `Program` class and `Main` method to be omitted. Statements written at the very top of a file are called *top-level statements*.
+
+```csharp
+// Program.cs — top-level statements
+string str = "hello";
+Console.WriteLine(str);
+```
+
+Conceptually this is turned into the traditional shape automatically:
+
+```text
+Program.cs
+   |
+   +-- string str = "hello";     <- written by hand
+   +-- Console.WriteLine(str);   <- written by hand
+   |
+   =>  compiler generates:  class Program { <entry method> { ...these statements... } }
+```
+
+The class and the entry method are never written by hand — the compiler synthesizes them. Only **one file per project** may contain top-level statements, since only one entry point can exist.
+
+<NoteToSelf>
+What the compiler actually generates. Top-level statements are lowered into a class named `Program` placed in the **global namespace** (no declared namespace), with a synthesized entry-point method whose real name is the unspeakable `<Main>$`, taking `string[] args`. The generated class is `internal partial` and the method is `private static`; the return shape follows the code (`void`, `int`, `Task`, or `Task<int>` when `await` or a return value is used). Because the class is `partial`, a hand-written `public partial class Program;` in another file merges into it — that is the trick that makes the entry type visible to a test project. The `args` array and top-level `await` are available directly in the statements.
+</NoteToSelf>
+
+## Why a namespace cannot precede top-level statements
+
+The two ideas collide directly. A `namespace` declaration says "what follows is declared *inside* this namespace." Top-level statements must sit at the top level of the file, outside any namespace. So starting a namespace and then writing loose statements asks for the one thing the hierarchy forbids.
+
+```csharp
+namespace CsharpDemo;
+
+string str = "hello";   // now "inside CsharpDemo" -> CS0116
+```
+
+The earlier confusion was never a C# 14 change. It was a top-level statement placed inside a namespace. C# supports both styles — they just cannot be mixed in that way.
+
+## The two styles, side by side
+
+```csharp
+// Traditional — explicit class and method, lives happily in a namespace
+namespace CsharpDemo;
+
+public class Program
+{
+    public static void Main()
+    {
+        string str = "hello";
+        Console.WriteLine(str);
+    }
+}
+```
+
+```csharp
+// Top-level — no namespace, no class, no Main; compiler fills them in
+string str = "hello";
+Console.WriteLine(str);
+```
+
+```text
+Traditional                         Top-level
+-----------                         ---------
+CsharpDemo                          (global namespace)
+   +-- Program                         +-- Program        (generated)
+         +-- Main()                          +-- entry()  (generated)
+               +-- statements                      +-- statements
+```
+
+## Where top-level code lives, and what the project name does not do
+
+Top-level code does not need a namespace to work. Its generated `Program` sits in the global namespace regardless of the project's name.
+
+The project name and `RootNamespace` do **not** silently namespace anything:
+
+```xml
+<PropertyGroup>
+  <RootNamespace>CsharpDemo</RootNamespace>
+</PropertyGroup>
+```
+
+This affects defaults new files are scaffolded with — it does not rewrite existing declarations. A type is in `CsharpDemo` only when its file says so:
+
+```csharp
+namespace CsharpDemo;
+
+public class Person
+{
+}
+```
+
+Without that line, `Person` is in the global namespace, not `CsharpDemo.Person`.
+
+## Where an extension class fits
+
+An extension method is just a method inside a static class inside a namespace — nothing exotic in the hierarchy.
+
+```csharp
+// StringExtensions.cs
+namespace CsharpDemo;
+
+public static class StringExtensions
+{
+    public static string Shout(this string str) => $"{str.ToUpper()}!";
+}
+```
+
+```text
+CsharpDemo
+   |
+   +-- StringExtensions   (static class)
+          |
+          +-- Shout()     (extension method)
+```
+
+A two-file program is then completely ordinary: one file carries the entry point, the other carries the namespaced helper.
+
+```csharp
+// Program.cs — top-level statements; `using` brings the extension's namespace into scope
+using CsharpDemo;
+
+string greeting = "hello";
+Console.WriteLine(greeting.Shout()); // HELLO!
+```
+
+```text
+Program.cs                       StringExtensions.cs
+   |                                 |
+   +-- top-level statements          +-- namespace CsharpDemo
+          |                                 |
+          +-- (generated Program)           +-- StringExtensions
+                 |                                 |
+                 +-- (generated entry)             +-- Shout()
+```
+
+If the entry point instead lives in `namespace CsharpDemo`, the `using` is unnecessary — the extension is already in scope. The extension resolves whenever its namespace is visible at the call site: same namespace, or imported with `using`.
+
+<NoteToSelf>
+The single rule to keep: a namespace contains types, a type contains members, a method contains statements. Top-level statements are a shortcut where the compiler supplies the missing type and method — which is exactly why they cannot be wrapped in a namespace, and why the project name never auto-assigns one.
+</NoteToSelf>

@@ -1,0 +1,249 @@
+---
+title: "A New Way to Write Extension Methods"
+date: "2026-08-22"
+status: "published"
+minutes: 7
+order: 1
+lead: "C# 14 keeps the old this-parameter extension method untouched and adds an extension block that groups members by receiver type — and that one change unlocks properties, operators, and static members the old form could never express."
+---
+
+## Setup
+
+C# 14 ships with .NET 10. The language version is enabled per project:
+
+```xml
+<!-- Csharp14Demo.csproj -->
+<PropertyGroup>
+  <TargetFramework>net10.0</TargetFramework>
+  <LangVersion>14</LangVersion> <!-- or: latest -->
+</PropertyGroup>
+```
+
+Extension members can partially compile against other runtimes, but targeting a different `.NET` version invites compatibility problems, so `.NET 10` is the target here.
+
+## The old way: a method smuggled in through a parameter
+
+An extension method has always been a static method living in a static class, marked by a `this` modifier on its first parameter. The `this` parameter is the instance the method appears to hang off.
+
+```csharp
+// StringExtensions.cs
+namespace Csharp14Demo;
+
+public static class StringExtensions
+{
+    // `this string value` = "attach this method to string;
+    //  the instance arrives in `value`"
+    public static string Shout(this string value)
+    {
+        return $"{value.ToUpper()}!";
+    }
+}
+```
+
+At the call site it looks like a real instance method on `string`:
+
+```csharp
+// Program.cs — same namespace as StringExtensions, so no `using` is needed
+namespace Csharp14Demo;
+
+public class Program
+{
+    public static void Main()
+    {
+        string greeting = "hello";
+        Console.WriteLine(greeting.Shout()); // HELLO!
+    }
+}
+```
+
+<NoteToSelf>
+Entry-point gotcha (CS0116). Loose statements — `string greeting = "hello"; Console.WriteLine(...);` with no class around them — are *top-level statements*, and those are legal only in one designated file per project, before any type declaration, and with **no surrounding `namespace`**. Add a `namespace` line to that file and the statements are now sitting directly inside the namespace, which is illegal: `A namespace cannot directly contain members such as fields, methods or statements`. A namespace may only contain types. The fix is to move the statements into a method — a `Program` class with `static void Main` — because a class *is* something a namespace can contain. For the extension to resolve, the caller must see the extension's namespace: share the namespace (no `using`) or add `using <thatNamespace>;`.
+</NoteToSelf>
+
+The mechanism works, but the syntax leaks the mechanism. The word `static` is noise, the receiver hides inside a parameter list, and there is no way to express anything that is not a method — no properties, no operators, nothing static on the type itself.
+
+## The new way: an extension block
+
+C# 14 introduces the `extension` keyword. The receiver — the type being extended and the name for its instance — is declared **once**, on the block. Members inside are then written with no `static`, no `this`, no ceremony.
+
+```csharp
+// StringExtensions.cs
+namespace Csharp14Demo;
+
+public static class StringExtensions
+{
+    // receiver declared once: type `string`, instance named `value`
+    extension(string value)
+    {
+        public string Shout()
+        {
+            return $"{value.ToUpper()}!";
+        }
+    }
+}
+```
+
+Two things worth pinning down:
+
+- The method inside the block is written as if it were an ordinary instance method — no `static`, no `this`. The receiver `value` is simply in scope.
+- The block **still lives inside a static class**. That has not changed. What changed is where the receiver is declared and how the members read.
+
+## Same call site, different declaration
+
+The rewrite above is invisible to callers. `greeting.Shout()` compiles and runs identically whether `Shout` was declared the old way or the new way.
+
+```csharp
+string greeting = "hello";
+greeting.Shout(); // HELLO!  — call site does not care which syntax declared it
+```
+
+<NoteToSelf>
+The new syntax is not a runtime feature. An extension block lowers to exactly the same static methods the old form produced. Extension properties compile to `get_`/`set_` accessor methods — the same convention every C# property has used since day one. No boxing, no wrapper type, no per-call cost over the classic form. Purely an authoring-time improvement.
+</NoteToSelf>
+
+## One block, many members
+
+Because the receiver is declared on the block, several members can share it. Related extensions cluster under one declaration instead of repeating `this string value` on every signature.
+
+```csharp
+public static class StringExtensions
+{
+    extension(string value)
+    {
+        public string Shout()    => $"{value.ToUpper()}!";
+        public string Whisper()  => value.ToLowerInvariant();
+        public string Reversed() => new string(value.Reverse().ToArray());
+    }
+}
+```
+
+Grouping by receiver is the readability win. The block header states the subject once; the body is a list of things that can be done to it.
+
+## What the block unlocks
+
+Grouping is the surface. The real payload is that an extension block can hold member kinds the `this`-parameter form never could.
+
+### Extension properties
+
+A count or a flag is a *characteristic*, not an *action*. The old form was forced to spell it as a method (`GetWordCount()`). The new form can express it as a property.
+
+```csharp
+public static class StringExtensions
+{
+    extension(string value)
+    {
+        public int WordCount =>
+            value.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+
+        public bool IsBlank => string.IsNullOrWhiteSpace(value);
+    }
+}
+```
+
+Called with no parentheses, like any property:
+
+```csharp
+"the quick brown fox".WordCount; // 4
+"   ".IsBlank;                   // True
+```
+
+### Static extension members
+
+Some members belong to the **type**, not to an instance — factories, constants, parsers. Declaring them needs a receiver *type* but no instance, so the receiver parameter is written **without a name**.
+
+```csharp
+public readonly record struct Coordinate(int X, int Y);
+
+public static class CoordinateExtensions
+{
+    // no parameter name → these extend the type `Coordinate` itself
+    extension(Coordinate)
+    {
+        // static extension property — reads like a built-in constant
+        public static Coordinate Origin => new(0, 0);
+
+        // static extension method — reads like a real factory
+        public static Coordinate FromString(string text)
+        {
+            var parts = text.Split(',');
+            return new Coordinate(int.Parse(parts[0]), int.Parse(parts[1]));
+        }
+    }
+}
+```
+
+```csharp
+Coordinate origin = Coordinate.Origin;            // (0, 0)
+Coordinate p      = Coordinate.FromString("3,4"); // (3, 4)
+```
+
+`Coordinate.Origin` and `Coordinate.FromString(...)` look like members that shipped on the type. They did not — the type is untouched.
+
+### Operators
+
+Operators are static methods with special names, so they too become expressible as extensions. Domain types can gain arithmetic without owning the operator declaration.
+
+```csharp
+public static class CoordinateExtensions
+{
+    extension(Coordinate)
+    {
+        public static Coordinate operator +(Coordinate a, Coordinate b) =>
+            new(a.X + b.X, a.Y + b.Y);
+    }
+}
+```
+
+```csharp
+Coordinate sum = new Coordinate(1, 2) + new Coordinate(3, 4); // (4, 6)
+```
+
+### Generics, and mixing instance with static
+
+The receiver can be generic, and a single block can carry both instance and static members. Instance members use the receiver name; static members ignore it.
+
+```csharp
+public static class EnumerableExtensions
+{
+    extension<T>(IEnumerable<T> source)
+    {
+        // instance members — use `source`
+        public bool IsEmpty => !source.Any();
+        public IEnumerable<T> Tail() => source.Skip(1);
+
+        // static member in the same block — cannot touch `source`,
+        // extends the type instead
+        public static IEnumerable<T> Empty() => [];
+    }
+}
+```
+
+## The mental model
+
+```text
+static class StringExtensions
+|
++-- extension(string value)        receiver: type + instance name
+|   |
+|   +-- Shout()                    instance method    -> uses value
+|   +-- WordCount                  instance property  -> uses value
+|   +-- Reversed()                 instance method    -> uses value
+|
++-- extension(string)              no instance name
+    |
+    +-- static members             extend the type    -> ignore value
+```
+
+The receiver line is the whole idea: name the thing being extended once, then list what can be done to it — as methods, as properties, as static members of the type.
+
+<NoteToSelf>
+The classic `this`-parameter form still works, verbatim, and can sit in the same static class as new extension blocks. Nothing to migrate. Adding one extension property to a type means dropping an `extension` block next to the existing methods — the old methods keep compiling unchanged. Coexistence was an explicit design constraint: converting an extension method to the new syntax must not break the code that calls it.
+</NoteToSelf>
+
+<NoteToSelf>
+Disambiguation has not changed. When two extension members collide, or an extension hides a real instance member, the resolution is still to qualify the call with the defining static class name (`StringExtensions.Shout(greeting)`). This is why moving an extension to a differently named static class is a breaking change — some call site disambiguates by that class name.
+</NoteToSelf>
+
+<NoteToSelf>
+Supported in extension blocks: methods, properties, operators, and the static forms of these. Not supported: fields and events (an object's memory layout can't be extended after the fact), plus indexers, constructors, and nested types are out of the initial release. Extension *fields* are stated to never be coming — an extension only operates on the public surface of an existing object, not its layout.
+</NoteToSelf>

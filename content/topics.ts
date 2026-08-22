@@ -21,6 +21,19 @@ export const topics: Topic[] = [
     chip: { bg: "#ede4f2", fg: "#5a1c6b" },
   },
   {
+    id: "csharp-14",
+    name: "C# 14",
+    blurb: "What the newest language version actually changes.",
+    order: 1.2,
+    chip: { bg: "#f9e6f1", fg: "#7c1f5c" },
+    links: [
+      {
+        label: "C# 14 skill path",
+        href: "https://app.pluralsight.com/paths/skill/c-14",
+      },
+    ],
+  },
+  {
     id: "dotnet",
     name: ".NET",
     blurb: "ASP.NET, EF Core and the Azure pieces around them.",

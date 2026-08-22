@@ -4,7 +4,6 @@ import {
   hero,
   meta,
   languages,
-  writingAbout,
   socials,
   type Social,
   stack,
@@ -28,7 +27,10 @@ const RECENT_LIMIT = 8;
 
 function Shell({ children, id }: { children: React.ReactNode; id?: string }) {
   return (
-    <div id={id} className="mx-auto max-w-[1280px] scroll-mt-[60px] px-5 sm:px-8">
+    <div
+      id={id}
+      className="mx-auto max-w-[1280px] scroll-mt-[60px] px-5 sm:px-8"
+    >
       {children}
     </div>
   );
@@ -48,6 +50,7 @@ function SectionHeading({ title }: { title: string }) {
  *  Lucide has deprecated its brand marks. Lucide's glyphs are stroked outlines;
  *  LeetCode and Codeforces only exist as solid brand marks, so each icon
  *  carries its own render mode. */
+
 const ICONS: Record<
   Social["icon"],
   { filled?: boolean; paths: React.ReactNode }
@@ -101,7 +104,9 @@ function SocialLinks() {
             key={item.label}
             href={item.href}
             aria-label={item.label}
-            {...(item.external ? { target: "_blank", rel: "noreferrer" } : null)}
+            {...(item.external
+              ? { target: "_blank", rel: "noreferrer" }
+              : null)}
             style={{ "--brand": item.color } as React.CSSProperties}
             className="flex h-9 w-9 flex-none items-center justify-center border border-rule-hairline text-[var(--brand)] hover:border-[var(--brand)] hover:bg-[var(--brand)] hover:text-ground"
           >
@@ -133,12 +138,12 @@ function SocialLinks() {
  *  row would leave the bottom rule stopping short. These empty cells carry the
  *  same rules to close it. Column count differs per breakpoint, so each filler
  *  only shows at the widths that actually need it. */
+
 function GridFillers({ count }: { count: number }) {
   const needAt = (cols: number) => (cols - (count % cols)) % cols;
   const two = needAt(2);
   const three = needAt(3);
   const fillers = Math.max(two, three);
-
   return (
     <>
       {Array.from({ length: fillers }, (_, i) => (
@@ -175,7 +180,6 @@ export default function Home() {
   const topics = sortedTopics();
   const recent = recentNotes(RECENT_LIMIT);
   const total = noteCount();
-
   return (
     <main>
       {/* a. Hero */}
@@ -229,7 +233,6 @@ export default function Home() {
               </a>
             </div>
           </div>
-
           <div className="flex flex-col">
             <div className="flex items-end gap-3.5 border-b border-rule-soft pt-16 pb-[22px] rail:pl-6">
               {/* The ring lives on the wrapper, not the image, so the grayscale
@@ -256,7 +259,9 @@ export default function Home() {
                   {cell.label}
                 </div>
                 <div className="text-[15px] font-semibold">{cell.value}</div>
-                <div className="text-[13px] text-neutral-700">{cell.detail}</div>
+                <div className="text-[13px] text-neutral-700">
+                  {cell.detail}
+                </div>
               </div>
             ))}
             <div className="border-b border-rule-soft py-5 rail:pl-6">
@@ -285,23 +290,23 @@ export default function Home() {
                 Writing about
               </div>
               <div className="flex flex-wrap gap-1.5">
-                {writingAbout.map((topic) => {
-                  const first = notesForTopic(topic.topicId)[0];
+                {topics.map((topic) => {
+                  const first = notesForTopic(topic.id)[0];
                   return (
                     <Link
-                      key={topic.label}
-                      href={`/notes/${topic.topicId}/${first.slug}`}
+                      key={topic.id}
+                      href={`/notes/${topic.id}/${first.slug}`}
                       style={
                         {
-                          "--chip-bg": topic.bg,
-                          color: topic.fg,
+                          "--chip-bg": topic.chip.bg,
+                          color: topic.chip.fg,
                           borderRadius: "999px",
                           padding: "4px 11px",
                         } as React.CSSProperties
                       }
                       className="bg-[var(--chip-bg)] font-mono text-[11px] font-semibold transition-colors hover:bg-transparent"
                     >
-                      {topic.label}
+                      {topic.name}
                     </Link>
                   );
                 })}
@@ -343,7 +348,9 @@ export default function Home() {
               <div className="text-[20px] font-extrabold tracking-[-0.01em]">
                 {job.company}
               </div>
-              <div className="mt-1 text-[14px] text-neutral-700">{job.role}</div>
+              <div className="mt-1 text-[14px] text-neutral-700">
+                {job.role}
+              </div>
               <div className="mt-2 font-mono text-[11px] text-accent-700">
                 {job.stack}
               </div>
@@ -399,7 +406,9 @@ export default function Home() {
                 className="border-t border-rule-soft py-3.5"
               >
                 <div className="text-[16px] font-semibold">{item.degree}</div>
-                <div className="text-[14px] text-neutral-700">{item.detail}</div>
+                <div className="text-[14px] text-neutral-700">
+                  {item.detail}
+                </div>
               </div>
             ))}
           </div>
@@ -538,7 +547,10 @@ export default function Home() {
             <a href={closing.github} className="text-ground hover:text-ground">
               GitHub
             </a>
-            <a href={closing.linkedin} className="text-ground hover:text-ground">
+            <a
+              href={closing.linkedin}
+              className="text-ground hover:text-ground"
+            >
               LinkedIn
             </a>
             <span className="text-ground-70">{closing.place}</span>
