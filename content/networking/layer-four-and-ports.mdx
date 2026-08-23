@@ -1,0 +1,79 @@
+---
+title: "Layer 4 and ports"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 7
+lead: 'Layers 2 and 3 get data to the right machine. But a machine runs many programs at once. Layer 4 gets data to the right program — using an address called a port, which is not the kind of port you plug a cable into.'
+---
+
+## First: two very different things called "port"
+
+Before anything else, clear a trap. The word **port** is about to mean something completely different from the "port" of the last few articles, and mixing them up derails everything.
+
+- A **physical port** is a hardware jack — an interface. It has a NIC behind it, so it has a MAC address and an IP address. This is the port a cable plugs into.
+- A **Layer 4 port** is a *number* — like `80`, `443`, or `9999`. It is a software address that identifies *which program* on a host some data belongs to. It has no hardware, no NIC, and no MAC.
+
+```
+"port 3" on a switch     ->  physical jack #3   ->  hardware, has a MAC
+"port 443" on a server   ->  the HTTPS service  ->  a number, no MAC
+```
+
+For the rest of this article, **port always means the number**. Do not look for a cable.
+
+## The problem: one machine, many programs
+
+The layers so far deliver to a machine. Layer 2 gets a frame to the right NIC by MAC; Layer 3 gets a packet to the right host by IP. But a single host runs many programs at once — a browser, a game, a chat client — all using the network simultaneously.
+
+So when data arrives at the host, a new question appears that no lower layer answers: *which program is it for?* Getting the bytes to the machine is not enough; something has to get them to the right application on that machine. That is **Layer 4**, and its job is service-to-service delivery — program to program.
+
+## Ports: Layer 4's addressing scheme
+
+Every layer with a delivery job has an addressing scheme: Layer 2 has MAC, Layer 3 has IP, and **Layer 4 has ports**. A port is simply a number that identifies a specific program or service on a host.
+
+![Layer 4 directing arriving data to the right program by port number](/images/networking/l4-ports.png)
+
+Every connection actually uses *two* ports, and they are chosen very differently:
+
+- The **destination port** is fixed by the application and well known. A web server listens on `80` for HTTP or `443` for HTTPS; other services have their own standard numbers. So a client does not just aim at the server's IP — it aims at an IP *and* a port, like `3.3.3.3:80`.
+- The **source port** is picked at random by the client, fresh for each connection — say `9999`. It is the port the client will listen on for the reply to that specific request.
+
+Where do these live? The source and destination *IP addresses* sit in the Layer 3 header; the source and destination *ports* sit in the Layer 4 header. (How those headers stack together is the next article.)
+
+![A client using a random source port to reach a fixed destination port on a server](/images/networking/l4-src-dst-ports.png)
+
+## Ports isolate data streams
+
+Because every connection carries its own pair of ports, one host can hold many conversations at once without mixing them. Each arriving packet's port number routes it to the exact program waiting for it.
+
+The everyday proof is a browser with several tabs open to the *same* website. Same client IP, same server IP, same destination port (`443`) — yet each tab opened with a different *source* port, so their replies never get confused. Ports are precisely what keep one tab from receiving another tab's data.
+
+That points at the real mechanism. A single connection is uniquely identified not by one address but by **four things together**: source IP, source port, destination IP, destination port. Two tabs to the same server share three of the four and differ only in source port — and that one difference is enough for the operating system to keep the streams completely separate. The pairing of an IP with a port (one end of the four) is what is called a **socket** — the full address of one side of a conversation.
+
+## TCP and UDP: two strategies for Layer 4
+
+Ports are the *addressing* of Layer 4. **TCP** and **UDP** are the two *strategies* for actually moving the data stream. Both use ports; they differ entirely in what they guarantee.
+
+- **TCP** (Transmission Control Protocol) is **connection-oriented and reliable**. Before any data flows, the two sides establish a connection through a three-way handshake — a real TCP handshake, worth stating plainly because it is often miscalled a "TLS handshake," which is a separate, later thing. TCP then acknowledges data that arrives, retransmits anything lost, and delivers the bytes *in order*. The price is overhead and a little latency. It is the right choice whenever correctness matters: web pages, file transfers, email.
+- **UDP** (User Datagram Protocol) is **connectionless and fast**. It simply sends. No handshake, no acknowledgement, no retransmission, no ordering. If a packet is lost, it is gone. The reward is speed and minimal overhead. It is the right choice when timeliness beats completeness: live video, voice calls, online games, DNS lookups.
+
+```
+                TCP                         UDP
+             ---------                   ---------
+ setup       handshake first             none, just send
+ delivery    ordered + retransmitted     best-effort, may drop
+ speed       slower (more overhead)      faster (little overhead)
+ use when    correctness matters         timeliness matters
+```
+
+The trade is the whole story: TCP is reliable but slower, UDP is fast but lossy. The choice comes down to one question — for this use case, is a late-but-correct byte better, or a fast-but-maybe-missing one? (TCP's inner mechanics, like the handshake steps and flow control, belong to a later protocols chapter; the shapes here are enough to reason with.)
+
+## The full addressing story, and what is missing
+
+Layer 4 completes the chain of delivery. Layer 2 gets data to the right NIC by MAC, Layer 3 to the right host by IP, and Layer 4 to the right program by port. Together they can move data from one specific program on one machine to another specific program on another machine, anywhere.
+
+What has been glossed over is *how*. Each layer adds its own header — a port header, an IP header, a MAC header — and somehow they all attach to the data, travel together, and get peeled off in the right order on the far side. That wrapping process is called **encapsulation**, and it, along with the model's top layers, is the next article.
+
+<NoteToSelf>
+"The client picks a random source port" is more precise than random. Ports fall into ranges: the **well-known** ports `0-1023` are the assigned service numbers (`80`, `443`, `22`, and so on) that servers *listen* on; the **ephemeral** range (commonly `49152-65535`) is where a client's operating system draws a temporary source port for each new outgoing connection, returning it to the pool when the connection closes. So a server's destination port is fixed and famous, while a client's source port is a throwaway from a specific high range — which is also why "opening a port" on a firewall almost always refers to a *destination* port, the door a service listens behind.
+</NoteToSelf>

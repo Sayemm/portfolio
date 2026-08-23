@@ -1,0 +1,87 @@
+---
+title: "VLANs and multiple switches"
+date: 2026-08-23
+status: written
+minutes: 10
+order: 12
+lead: 'One switch can be split into several isolated networks, and several switches can act as one. Both tricks fall straight out of the three actions — the only genuinely new idea is that broadcasts define the boundary.'
+---
+
+## Unicast versus broadcast frames
+
+The three actions from the last article handle two kinds of frame differently:
+
+- A **unicast** frame — destination MAC is one specific host — is forwarded if the switch knows the port, flooded if it does not.
+- A **broadcast** frame — destination MAC is `ff:ff:ff:ff:ff:ff` — is *always* flooded out every port. ARP requests, from the same-network article, are the classic example.
+
+![Unicast frames forwarded or flooded; broadcast frames always flooded](/images/networking/switch-unicast-vs-broadcast.png)
+
+A clarification the notes make well: a switch acting as a forwarder never *originates* a broadcast — flooding a broadcast frame is just forwarding it as it is already addressed. The only time a switch sends its own broadcast is when it is behaving as a host (management traffic). Passing traffic through, it only ever learns, floods, and forwards.
+
+The consequence that matters: every port on a switch receives every broadcast. That makes one switch a single **broadcast domain** — the idea first flagged back in the hubs article. Hold onto it, because it is the entire reason for the next idea.
+
+## VLANs: one switch, many networks
+
+A **VLAN** (Virtual LAN) divides a switch's ports into isolated, independent groups. One physical switch becomes several logical "mini-switches."
+
+![A single switch with its ports split into VLAN 20 and VLAN 30](/images/networking/vlan-isolated-groups.png)
+
+Each VLAN keeps its *own* MAC address table and runs learn-flood-forward completely independently. A frame in VLAN 20 is never seen by a port in VLAN 30, even though both live in the same physical box.
+
+![The switch maintaining a separate MAC table per VLAN](/images/networking/vlan-separate-tables.png)
+
+The precise definition is what makes this powerful: **a VLAN is a separate broadcast domain.** Ports in VLAN 20 form one broadcast domain, ports in VLAN 30 form another, and broadcasts (and unknown-unicast floods) stay inside their own VLAN and never leak across. That isolation is the whole point — split one switch into multiple independent networks without buying more hardware. It is how a single switch can carry, say, a finance network, a guest network, and an IoT network, each walled off from the others.
+
+And here is the catch that ties back to the router article: because VLANs are separate *networks*, moving traffic from VLAN 20 to VLAN 30 requires a **router** — the device that moves data between networks — even though both VLANs sit on the same physical switch. Same box, still needs a router to cross. (This is called inter-VLAN routing.)
+
+## Multiple switches act as one
+
+The learn-flood-forward logic scales across several connected switches without any change. Each switch independently runs the three actions, and no switch needs to know the whole topology. Follow one frame from host A, on a "blue" switch, to host B, on a connected "green" switch.
+
+**Phase 1 — the blue switch.** Host A sends toward B. The frame reaches the blue switch, which learns A on its port, does not know B, and floods out every other port — including the link to the green switch and the port to host C. Host C receives the flood, sees it is not the target, and discards it.
+
+![Multi-switch step 1](/images/networking/multi-switch-step-1.png)
+
+![Multi-switch step 2](/images/networking/multi-switch-step-2.png)
+
+![Multi-switch step 3](/images/networking/multi-switch-step-3.png)
+
+![Multi-switch step 4 — the blue switch floods to all other ports](/images/networking/multi-switch-step-4.png)
+
+**Phase 2 — the green switch.** The flooded frame crosses the inter-switch link and arrives at the green switch. Green learns A — but critically, it learns "A is reachable through the port connected to the blue switch," not that A is two switches away. Still not knowing B, it floods to its own hosts. Host D discards the copy; host B accepts it and prepares a reply.
+
+![Multi-switch step 5 — the green switch learns A via its uplink port](/images/networking/multi-switch-step-5.png)
+
+![Multi-switch step 6](/images/networking/multi-switch-step-6.png)
+
+![Multi-switch step 7](/images/networking/multi-switch-step-7.png)
+
+**Phase 3 — the reply teaches both switches.** Host B responds. As the reply travels back, the green switch learns B on B's port and forwards toward A (learned in phase 2); then the blue switch learns B on its inter-switch port and forwards to A.
+
+![Multi-switch step 8 — host B generates a response](/images/networking/multi-switch-step-8.png)
+
+![Multi-switch step 9](/images/networking/multi-switch-step-9.png)
+
+![Multi-switch step 10](/images/networking/multi-switch-step-10.png)
+
+![Multi-switch step 11](/images/networking/multi-switch-step-11.png)
+
+![Multi-switch step 12](/images/networking/multi-switch-step-12.png)
+
+After this, A-to-B traffic is forwarded precisely across both switches, with no more flooding.
+
+## A port can map to many MACs
+
+One detail falls out of all this and is worth stating plainly: a single switch port can map to *multiple* MAC addresses.
+
+![A single switch port holding several MAC mappings](/images/networking/multi-switch-step-13.png)
+
+The green switch's port toward the blue switch ends up holding entries for A, for C, and for every other host on the far side — because all of their traffic arrives through that one port. That is expected: an uplink between switches is the path to many hosts, so it learns many MACs.
+
+The elegance is that no switch ever holds a map of the network. Each switch knows only "which of *my* ports leads toward a given MAC." The green switch has no idea how far away A is or how many switches sit between them; it knows only "A is out my uplink port." That purely local knowledge, replicated in every switch, is enough to move any frame anywhere — the same distributed simplicity that made learn-flood-forward work on a single switch in the first place.
+
+Switches — one or many, whole or sliced into VLANs — move traffic *within* networks by MAC. But the instant traffic must cross *between* networks, including between two VLANs, a switch is out of its depth and the router takes over. How a router actually makes its between-networks decisions — the routing table — is the next chapter.
+
+<NoteToSelf>
+The two halves of this article raise an obvious question they do not quite answer: if a VLAN can span multiple switches, how does the second switch know which VLAN an arriving frame belongs to? The answer is **VLAN tagging**, standardised as 802.1Q. The link between two switches is configured as a **trunk**, and every frame crossing it gets a small VLAN tag inserted into its header naming its VLAN ID. The receiving switch reads the tag and drops the frame into the correct VLAN's table. So an access port (facing a host) carries untagged traffic for one VLAN, while a trunk port (facing another switch) carries tagged traffic for many. That single mechanism is what lets VLAN 20 exist on a dozen switches across a building and still behave as one isolated network.
+</NoteToSelf>

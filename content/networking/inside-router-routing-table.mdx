@@ -1,0 +1,77 @@
+---
+title: "Inside a router: the routing table"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 13
+lead: 'A switch learns where hosts are by watching traffic. A router cannot — it needs a map of networks handed to it in advance. That map is the routing table, and how it gets filled is the whole story of routing.'
+---
+
+## What makes a router a router
+
+A router moves traffic between networks, deciding by IP address as a Layer 3 device. But the sharpest definition is behavioural, and it comes from comparing a router to a host.
+
+![A router forwards packets not addressed to itself; a host does not](/images/networking/router-vs-host.png)
+
+When a packet arrives whose destination IP is *not* the device itself:
+
+- a **host** drops it — a host only cares about packets addressed to it,
+- a **router** tries to *forward* it toward its destination first — forwarding other devices' packets is its entire reason to exist.
+
+That is essentially the formal definition: a router is a node that forwards packets not addressed to itself, and a host is a node that does not. The single behaviour "forward what isn't mine" is what makes a router a router.
+
+## A foot in every network
+
+To forward *between* networks, a router has an interface — with its own IP address and its own MAC address — in every network it connects to. This is the per-interface point from earlier articles: a router has many IPs and many MACs precisely because it participates in many networks at once.
+
+![A router with an IP and a MAC on each of its interfaces](/images/networking/router-ip-mac-per-interface.png)
+
+Those interfaces give the router its very first knowledge — the networks directly attached to it.
+
+## The routing table: a map of networks
+
+Because a router must forward toward networks it may not even be attached to, it keeps a map of every network it knows about: the **routing table**.
+
+![A router maintaining a routing table of the networks it knows](/images/networking/routing-table-map.png)
+
+Each entry is a **route** — a set of instructions for reaching one specific network, amounting to "to reach network X, send the packet out this interface, toward this next hop." A packet arrives, the router reads its destination IP, works out which known network that IP falls into, and sends it out the matching interface.
+
+One detail is easy to miss and matters enormously: **a route is per-network, not per-host.** A router does not store an entry for every host on earth — it stores entries for *networks*, and lets the hierarchy of IP addresses from the first article do the rest. Routing on network prefixes rather than individual hosts is exactly what makes internet-scale routing possible. And like a switch, a router decides only the *next* hop — it holds local knowledge, not the whole end-to-end path.
+
+## Where routes come from (1): directly connected
+
+The routes a router gets for free are its **directly connected** networks — the ones attached to its own interfaces. Because it has an IP in each, it automatically knows those networks are reachable directly.
+
+![The directly connected routes a router knows automatically](/images/networking/directly-connected-routes.png)
+
+For a directly connected network, "forwarding" means delivering straight to the final host, since that host is local to the interface. Each router uses its own table to move packets along its part of the journey.
+
+![Each router using its own routing table to forward](/images/networking/router-uses-own-table.png)
+
+## What if there is no route?
+
+If a packet's destination network is not in the table, the router cannot forward it — so it drops the packet. From each router's point of view, the routing table *is* the map of every network that exists; anything not listed might as well not exist.
+
+(The escape from dropping everything unfamiliar is a **default route** — a catch-all entry that says "for anything I do not specifically recognise, send it this way." It is how a home router pushes every unknown destination toward the internet, and it gets a proper treatment with route summarisation, later.)
+
+## Where routes come from (2): static and dynamic
+
+Directly connected routes only cover a router's own networks. To learn about networks farther away, routes have to be added — and there are two ways.
+
+**Static routes** are configured by hand by an administrator.
+
+![A static route manually added by an administrator](/images/networking/static-routes.png)
+
+For example: "anytime R2 wants to reach the `10.0.44` network, send the packet to `10.0.55.1`," which is R1's IP. Static routes are precise and simple, but manual — every route is typed by a person, and nothing updates on its own if a link fails.
+
+**Dynamic routes** are learned automatically: routers talk to one another and share what they know, using a dynamic routing protocol.
+
+![Routers exchanging routes automatically via a dynamic routing protocol](/images/networking/dynamic-routes.png)
+
+The *content* of a dynamic route is identical to a static one — the only difference is how it was learned. The trade-off is the whole reason both exist: static routes are simple and predictable but do not scale and do not adapt, so adding a network means editing every router and losing a link just kills the traffic. Dynamic routes scale to large networks and heal automatically around failures, at the cost of complexity. Large networks — and the internet itself — run on dynamic protocols (RIP, OSPF, EIGRP, and BGP, the one that actually runs the internet), while small or fixed setups often use static routes.
+
+A router with a full table knows *where* to send a packet next. But knowing the next network is not the same as delivering the frame — the router still has to build a fresh Layer 2 header for the next hop, which means ARP all over again, at every hop. Following a single packet across multiple routers, with routing and ARP working together hop by hop, is the next article.
+
+<NoteToSelf>
+A host's default gateway, from the foreign-network article, is really just a routing table with a single entry. A host does a tiny version of what a router does: it too has a routing table, and for most hosts that table effectively says "directly connected network → deliver locally" and "everything else → send to the default gateway." That second line is a **default route** — the same catch-all a router uses, written `0.0.0.0/0`, meaning "any destination not matched by a more specific route." So "default gateway" and "default route" are two names for the same idea at two scales: a host forwarding everything unfamiliar to its one router is doing exactly what a router does when it forwards everything unfamiliar toward the internet.
+</NoteToSelf>

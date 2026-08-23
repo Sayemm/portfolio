@@ -1,0 +1,93 @@
+---
+title: "Routing in action: ARP hop by hop"
+date: 2026-08-23
+status: written
+minutes: 10
+order: 14
+lead: 'This is where every idea in the series meets. A single packet crosses three networks and two routers, and at every hop the same two tables cooperate: routing decides the direction, ARP finds the next device. The IP header never changes; the MAC header is rebuilt at every step.'
+---
+
+## Two tables, two jobs
+
+Everything with an IP address keeps an ARP table, and routers additionally keep a routing table. The two are filled in completely different ways and do completely different jobs.
+
+![A router's routing table and ARP table side by side, per interface](/images/networking/router-two-tables.png)
+
+- The **routing table** is a map of *networks*, populated **ahead of time** — directly connected, static, and dynamic routes from the last article. It answers: "for this destination network, which way is the next hop?"
+- The **ARP table** is a set of *IP-to-MAC* mappings, populated **on demand** as traffic flows, exactly as in the same-network article. It answers: "what is the MAC address of the device I am about to send to?"
+
+The reason for the difference is worth stating. A router must know about far-off networks *before* any traffic arrives — you cannot discover a distant network by watching local packets — so routing tables are prepared in advance. But ARP only ever needs the MAC of the immediate next neighbour, which can be learned on the spot. One table is built ahead; the other is filled just in time.
+
+Put together, every hop runs the same four-beat pattern: **routing lookup** (which way?) → **ARP** (next device's MAC?) → **build the L2 header** → **forward**.
+
+## The journey: A to C, across two routers
+
+Host A (`10.0.44.9`) wants to reach Host C (`10.0.66.7`), which is two networks away, on the far side of routers R1 and R2. Watch the routing-then-ARP dance repeat at each hop.
+
+## Hop 1 — Host A to R1
+
+Host A builds its Layer 3 header: source `10.0.44.9`, destination `10.0.66.7`. This is end-to-end, and it will never change for the rest of the trip.
+
+![Host A builds the L3 header but cannot yet build the L2 header](/images/networking/route-arp-01.png)
+
+The subnet-mask check says Host C is foreign, so Host A must send to its default gateway, R1 — but it has no ARP entry for R1 yet. So it ARPs for the gateway, R1 replies, and both cache each other.
+
+![Host A sends an ARP request for its gateway](/images/networking/route-arp-02.png)
+
+![R1 replies and learns Host A](/images/networking/route-arp-03.png)
+
+![Host A records the gateway's MAC](/images/networking/route-arp-04.png)
+
+Now Host A builds the Layer 2 header with R1's MAC as the destination, and sends the frame to R1.
+
+![Host A forwards the frame to R1](/images/networking/route-arp-05.png)
+
+## Hop 2 — R1 to R2
+
+R1 receives the frame, strips the Layer 2 header, and reads the Layer 3 destination: `10.0.66.7`. It looks that network up in its routing table — the next hop toward it is R2.
+
+![R1 strips the L2 header and looks up the destination in its routing table](/images/networking/route-arp-06.png)
+
+R1 needs R2's MAC and has no entry, so it runs a fresh ARP exchange — this time on the network between R1 and R2, a separate local conversation. R2 replies, both cache.
+
+![R1 sends an ARP request for R2](/images/networking/route-arp-07.png)
+
+![R2 replies and learns R1](/images/networking/route-arp-08.png)
+
+R1 then builds a brand-new Layer 2 header (its own outgoing MAC to R2's MAC) around the *same* packet — whose Layer 3 header it never touched — and forwards it to R2.
+
+![R1 builds a new L2 header and forwards to R2](/images/networking/route-arp-09.png)
+
+## Hop 3 — R2 to Host C, the last hop
+
+R2 receives, strips the Layer 2 header, and looks up `10.0.66.7` — and this time the destination network is **directly connected** to R2. That is the signal that R2 is the final hop: the destination host is on its own network, so it can deliver straight to it.
+
+![R2 finds the destination is directly connected — it is the last hop](/images/networking/route-arp-10.png)
+
+R2 ARPs for Host C locally, C replies, both cache, and R2 builds the final Layer 2 header (destination Host C's MAC) and delivers the frame. Host C receives it, de-encapsulates — strips the L2 header, strips the L3 header — and processes the data.
+
+![R2 delivers the frame to Host C, which processes the data](/images/networking/route-arp-11.png)
+
+## What changed, and what never did
+
+The entire trip, in one view, reveals the invariant that ties the whole series together:
+
+```
+hop        L2 header (rewritten each hop)      L3 header (constant)
+---        ------------------------------      --------------------
+A  -> R1   a9a9       -> R1-near-MAC           10.0.44.9 -> 10.0.66.7
+R1 -> R2   R1-far-MAC -> R2-near-MAC           10.0.44.9 -> 10.0.66.7
+R2 -> C    R2-far-MAC -> c7c7                  10.0.44.9 -> 10.0.66.7
+```
+
+The Layer 3 header — the end-to-end IP addresses — is identical at every step. It names the origin and the final destination, and no router alters it. The Layer 2 header is thrown away and rebuilt at every single hop, which is precisely why an ARP is needed at each one. This is the hop-to-hop versus end-to-end split from the OSI article, finally seen in full motion.
+
+![The complete A-to-C delivery across both routers](/images/networking/route-arp-complete.png)
+
+And routing "ends" on its own: a packet is forwarded router to router until it reaches a router whose table says the destination is directly connected — that router is the last hop, and it makes the final delivery.
+
+All of this assumed something, though: that every router already had a route to `10.0.66.7`'s network sitting in its table. In a network of any real size, routers cannot possibly store a route to every individual network on earth — the tables would be unmanageable. The final article shows how routers keep their tables small, by organising networks into hierarchies and summarising many routes into one.
+
+<NoteToSelf>
+"The L3 header never changes" is *almost* true, and the exception is beautiful. One field in the IP header does change at every hop: the **TTL** (Time To Live). Each router decrements it by one, and if it ever hits zero the packet is discarded — a safety valve that stops a mis-routed packet from looping between routers forever. The addresses stay constant end to end; only this hop-counter ticks down. And it powers a wonderful tool: **traceroute** deliberately sends packets with TTL 1, then 2, then 3, and so on, so each one expires at the next router along the path and reports back — which makes traceroute, in effect, a live printout of exactly the hop-by-hop journey this whole article describes.
+</NoteToSelf>

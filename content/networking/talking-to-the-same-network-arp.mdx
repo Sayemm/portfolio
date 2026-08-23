@@ -1,0 +1,90 @@
+---
+title: "Talking on the same network: ARP"
+date: 2026-08-23
+status: written
+minutes: 10
+order: 9
+lead: 'A host knows the IP address it wants to reach, but the wire runs on MAC addresses. Bridging that gap — turning a known IP into an unknown MAC — is the job of ARP, and it is the first thing that happens when two hosts on one network talk.'
+---
+
+## The setup
+
+Two hosts sit on the same network, connected through one or more switches — host A cannot tell whether there is one switch or several between it and host B, and it does not need to. Both hosts have a NIC and a MAC address, and both are configured with an IP address and a subnet mask. Host A has data to send to host B.
+
+![Two hosts on the same network, each with a MAC, an IP, and a subnet mask](/images/networking/same-net-setup.png)
+
+The goal is the two headers from the OSI article. To send its data, host A must build a **Layer 3 header** (end-to-end, by IP) and a **Layer 2 header** (hop-to-hop, by MAC). It knows the destination IP. It does *not* know the destination MAC. Filling in that one missing piece is what this entire exchange is about.
+
+## Step 1 — is the destination even on my network?
+
+Before anything else, host A has to decide whether host B is **local** (same network) or **foreign** (a different network), because the answer changes the whole procedure. It makes that decision with its **subnet mask**.
+
+The mask marks which part of an IP address is the *network* and which is the *host*. Host A has IP `10.1.1.22` and mask `255.255.255.0` — a `/24`, meaning the first three octets (`10.1.1`) are the network and the last octet is the individual host. Host A compares host B's IP, `10.1.1.33`: the first three octets match, so B is on the same network.
+
+![Host A comparing its IP and mask against B's IP to confirm B is local](/images/networking/same-net-local-check.png)
+
+(How host A knew B's IP at all: either a person typed it — `ping 10.1.1.33` — or DNS resolved a name into it, a topic for a later chapter.) Because B is local, host A can reach it **directly**, with no router involved, so it starts building the headers.
+
+## Step 2 — build the Layer 3 header (the easy one)
+
+Host A knows both IP addresses, so the Layer 3 header is trivial: source `10.1.1.22`, destination `10.1.1.33`. End-to-end delivery is handled.
+
+But Layer 3 cannot touch the wire — that requires Layer 2, and the Layer 2 header needs the destination *MAC*, which host A does not have.
+
+![Host A has the L3 header but is missing host B's MAC for the L2 header](/images/networking/same-net-need-mac.png)
+
+This is the key fact the notes state well: a computer is only ever *given* an IP address. It must discover MAC addresses on its own. That discovery is ARP.
+
+## Step 3 — ARP request: ask everyone
+
+ARP's job, from the OSI article, is to turn a known IP into its MAC. So host A sends an **ARP request** that asks, in effect, "whoever has IP `10.1.1.33`, tell me your MAC."
+
+But there is a chicken-and-egg problem. To send that question *directly* to B, host A would need B's MAC — the very thing it is trying to learn. The escape is to **broadcast**. Host A puts the ARP request into a frame whose destination MAC is the special broadcast address `ff:ff:ff:ff:ff:ff`, which every host on the network receives.
+
+![Host A broadcasting an ARP request for 10.1.1.33 to the whole network](/images/networking/same-net-arp-request.png)
+
+The request also carries host A's own IP and MAC, so the recipient can answer directly. And recall from the hubs article that a broadcast reaches every host on the network — the whole network is a single broadcast domain. Everyone gets the question; only the owner of `10.1.1.33` will bother to answer.
+
+## Step 4 — the ARP cache, and B learns A for free
+
+Every device with an IP keeps an **ARP cache** — a table of IP-to-MAC mappings it has already learned, so it does not have to ARP again for every single packet.
+
+![Host A's cache with an unresolved entry; host B's cache empty](/images/networking/same-net-arp-cache.png)
+
+Right now host A's cache holds one unresolved entry, `10.1.1.33 → ?`, and host B's cache is empty. But the instant B receives the broadcast, it reads host A's IP and MAC out of the request and records them. B now knows A without ever asking — a single request has already taught B half of the mapping.
+
+![Host B populating its cache with A's mapping just from receiving the request](/images/networking/same-net-b-learns-a.png)
+
+## Step 5 — ARP reply: answered directly
+
+Host B is the owner of `10.1.1.33`, so it replies: "I am `10.1.1.33`, and my MAC is `b3b3`."
+
+![Host B unicasting its ARP reply straight back to host A](/images/networking/same-net-arp-reply.png)
+
+This reply is **unicast**, not broadcast — sent straight back to A alone. Because B just learned A's MAC from the request, it can build a Layer 2 header addressed directly to A, with no need to disturb anyone else on the network. When the reply arrives, host A records the mapping in its cache: `10.1.1.33 → b3b3`. The missing MAC is finally known.
+
+## Step 6 — send the data at last
+
+Host A now has everything it needs. It completes the Layer 2 header on the original data with destination MAC `b3b3`, and sends it.
+
+![Host A completing the L2 header now that B's MAC is known](/images/networking/same-net-build-l2.png)
+
+The frame travels to B — hop-to-hop delivery accomplished. B receives it and de-encapsulates, as the encapsulation article described: it strips the Layer 2 header, strips the Layer 3 header, and processes the data.
+
+![The data finally sent from A to B](/images/networking/same-net-data-sent.png)
+
+## Step 7 — every message after this is instant
+
+Both caches are now populated: A knows B, and B already learned A back in step 4. Any further data in either direction can build its Layer 3 and Layer 2 headers immediately, with no ARP at all.
+
+![Both hosts now hold each other's mappings](/images/networking/same-net-caches-populated-1.png)
+
+![Further exchange in either direction is immediate](/images/networking/same-net-caches-populated-2.png)
+
+So ARP is a one-time cost at the start of a conversation — until the cache entry eventually ages out — not a tax paid on every packet.
+
+That was the complete story for two hosts on the *same* network: host A reached B directly because the subnet mask said B was local. But what happens when the destination turns out to be on a *different* network, one the host cannot reach directly at all? The subnet-mask decision from step 1 comes out the other way — and ARP gets used for something different: finding the router. That is the next article.
+
+<NoteToSelf>
+ARP has no authentication, and that is a real security hole. A host simply *trusts* any ARP reply it receives — there is no check that the sender actually owns the IP it claims. An attacker on the same network can exploit this with **ARP spoofing**: send forged replies mapping the gateway's IP (or any host's IP) to the attacker's own MAC, so victims start sending their traffic to the attacker instead. That is a classic man-in-the-middle setup, and it works precisely because ARP was designed in a more trusting era for pure convenience. Worth remembering that the same broadcast-and-believe simplicity that makes ARP easy to understand is also what makes it easy to abuse. (`arp -a` on most systems prints the current cache, which is where a poisoned entry would show up.)
+</NoteToSelf>

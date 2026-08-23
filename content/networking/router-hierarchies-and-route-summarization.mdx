@@ -1,0 +1,91 @@
+---
+title: "Router hierarchies and route summarization"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 15
+lead: 'A router cannot hold a route to every network on earth. It does not need to. Because addresses are hierarchical, thousands of specific routes collapse into a handful of summaries — and one final catch-all covers everything else.'
+---
+
+## The problem: tables cannot hold everything
+
+The previous article showed routing working end to end, but it quietly assumed that every router already had a route to the destination network. Taken literally, that is impossible — there are far too many networks in the world, and a routing table listing every subnet on the internet would be unmanageable.
+
+So how do real routing tables stay small? With the very same hierarchy that shaped IP addresses back in the first article.
+
+## Routers connect in a hierarchy
+
+Routers are not wired into a flat mesh. They are arranged in a hierarchy — a tree — and networks are handed out to match it. An entire site shares a common prefix (New York is `10.20.x.x`, Tokyo is `10.40.x.x`), and each department is a subnet inside its site (Sales `10.20.55.x`, Engineering `10.20.66.x`, and so on).
+
+![Routers arranged in a hierarchy, with sites sharing common address prefixes](/images/networking/router-hierarchy.png)
+
+This is deliberate. Hierarchical addressing laid over hierarchical routers is what makes a network easy to scale and its connectivity consistent — and, most importantly, it is what makes the next trick possible.
+
+## Route summarization: many routes become one
+
+Because all of New York's subnets share the prefix `10.20`, a distant router does not need a separate route for each of them.
+
+![A routing table listing every individual subnet as its own route](/images/networking/routes-unsummarized.png)
+
+Instead of carrying:
+
+```
+10.20.55.0/24 -> R4
+10.20.66.0/24 -> R4
+10.20.77.0/24 -> R4
+```
+
+it can keep a single summarised route:
+
+```
+10.20.0.0/16 -> R4
+```
+
+![The same table after summarising New York's subnets into one route](/images/networking/routes-summarized.png)
+
+One route now covers every subnet in New York. This is the direct payoff of hierarchical addressing from the first article: because grouped networks share a prefix, the whole group can be routed as one. The postal system does the same thing — a local sorting facility does not memorise every house on earth. It knows its own streets precisely, and for everything else it knows only "not local, send to the regional hub." Summarisation is exactly that: precise where you must be, broad everywhere else.
+
+## Reading the prefix: /24, /16, /8
+
+The number after the slash — the prefix length — says how many bits of the address are the "network" part that must match. The shorter the prefix, the broader the route; the longer the prefix, the more specific.
+
+```
+/24   match first 3 octets   10.20.55.x   one subnet
+/16   match first 2 octets   10.20.x.x    all of New York
+/8    match first 1 octet    10.x.x.x     everything under 10
+/0    match nothing          any address  literally everything
+```
+
+A `/16` route is one summary standing in for 256 possible `/24` subnets; a `/8` stands in for a vast block. Summarisation is just choosing a shorter prefix that still uniquely points the right way.
+
+## Most specific route wins
+
+Summarising creates overlap. A destination like `10.40.77.5` might match both a specific route (`10.40.77.0/24`, directly connected) and a broad one (`10.0.0.0/8` toward R5). Which one is used?
+
+![A destination matching both a specific route and a summary route](/images/networking/most-specific-route-wins.png)
+
+The rule is **longest-prefix match**: the router always chooses the *most specific* route that matches — the one with the longest prefix. So `10.40.77.5` is delivered via the `/24` (directly connected), while an address like `10.55.1.1`, matching nothing more specific, falls through to the `/8` toward R5.
+
+This is what lets summaries and specifics live together. A router keeps precise routes for the networks it knows exactly, and broad summaries for everything else, and the longest-prefix rule always resolves the two correctly.
+
+## The default route: the ultimate summary
+
+Push summarisation to its absolute limit and you reach a single route that matches *everything*: `0.0.0.0/0`. A `/0` requires zero bits to match, so every possible address matches it.
+
+![A default route, 0.0.0.0/0, as the catch-all in the table](/images/networking/default-route.png)
+
+This is the **default route** — "for anything not matched by a more specific route, send it this way." It is the broadest summary that can exist, and it is the escape from the previous article's rule that an unknown destination gets dropped: with a default route present, there is always a match, so unfamiliar destinations flow toward the internet instead of dying.
+
+And this closes a loop. The default route is the same idea as a host's **default gateway** from the foreign-network article: a host's routing table is essentially one `0.0.0.0/0` pointing at its local router. Default gateway, default route, ultimate summary — three names for one concept, at three scales.
+
+![The key points — hierarchy, summarisation, and the default route](/images/networking/routing-summary.png)
+
+## The whole picture
+
+Put together, it is a single elegant system. Hierarchical addresses let networks be grouped by prefix. Hierarchical routers let those groups be summarised into a few broad routes. Longest-prefix match lets specific and summary routes coexist. And a default route sweeps up everything left over. That is how a router at the edge of the internet can reach any of the world's millions of networks while holding only a handful of routes in its table.
+
+And with that, the journey is complete. Chapter by chapter, this series built up from a single bit on a wire: hosts and IP addresses, networks and the internet, the devices that move traffic within and between them, the layered rules of the OSI model, and finally the two great conversations of networking — how a host reaches its neighbour, and how a packet crosses the world hop by hop. Everything beyond this point — the specific protocols, the web, the backend — is built directly on these foundations.
+
+<NoteToSelf>
+There is one place on earth where this "keep the table small" story breaks on purpose: the core of the internet. The routers at the very centre run BGP and sit in what is called the **default-free zone** — they have no default route, because they *are* the "everything else" that default routes point toward, so they must genuinely know how to reach every network in existence. Those core routers carry the full internet routing table, which is on the order of a million IPv4 routes and still growing. Summarisation is therefore heaviest at the edges, where a small office router needs a couple of specifics and one default, and lightest at the core, where a backbone router carries close to everything. The model in this article is exactly right for the 99.9% of routers that live at the edges — and the rare exception at the core is what all those default routes ultimately lean on.
+</NoteToSelf>

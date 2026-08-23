@@ -1,0 +1,91 @@
+---
+title: "Encapsulation: segments, packets, frames"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 8
+lead: 'Every layer has its own header — a port header, an IP header, a MAC header. Encapsulation is the act of wrapping data in each of them on the way down, and unwrapping them on the way up. It is what makes the layers actually cooperate.'
+---
+
+## The layers above four, briefly
+
+Before assembling the stack, close out the model. Layers 5, 6, and 7 — **Session**, **Presentation**, and **Application** — sit above Transport, and their boundaries are famously blurry. As the previous chapter's note pointed out, the real-world TCP/IP model collapses all three into a single Application layer. Nominally, though:
+
+- **Session (5)** starts, maintains, and ends the conversations between two programs.
+- **Presentation (6)** deals with the *format* of the data — character encoding, compression, and encryption (TLS lives around here).
+- **Application (7)** is the protocols applications actually speak: HTTP, FTP, SMTP, DNS.
+
+![The top three OSI layers, and how the TCP/IP model folds them into one](/images/networking/osi-layers-5-6-7.png)
+
+The real work of getting data *across a network* happens in Layers 1 through 4, which is why this series lives down there. But all seven layers cooperate through a single mechanism — encapsulation.
+
+## Encapsulation: wrapping data on the way down
+
+A host generates some data to send. Before it can travel, it descends the stack, and at each layer it is wrapped in that layer's own header. That wrapping is **encapsulation**. Each step also has a name for the result:
+
+Layer 4 adds a header — for TCP, a TCP header — carrying the source and destination **ports** from the last article. Data plus that header is a **segment**.
+
+![Layer 4 wrapping the data with a port header to form a segment](/images/networking/encap-segment.png)
+
+The segment descends to Layer 3, which adds an IP header carrying the source and destination **IP addresses**. Now it is a **packet**.
+
+![Layer 3 wrapping the segment with an IP header to form a packet](/images/networking/encap-packet.png)
+
+The packet descends to Layer 2, which adds a header carrying the source and destination **MAC addresses** (and, for Ethernet, a small trailer at the end used to check the frame for corruption). Now it is a **frame**.
+
+![Layer 2 wrapping the packet with a MAC header to form a frame](/images/networking/encap-frame.png)
+
+Finally the frame is converted to ones and zeroes and placed on the wire — Layer 1, **bits**.
+
+![The frame converted to bits and placed on the wire](/images/networking/encap-bits.png)
+
+## Each layer wraps, and never looks inside
+
+Here is the idea that makes the whole thing work: **each layer reads only its own header and treats everything above it as opaque payload.** Layer 2 does not know or care that its payload contains an IP header — to it, the entire packet is just "data to carry." Layer 3 does not care that its payload contains ports.
+
+The clean mental model is envelopes inside envelopes. The application writes a letter (the data). Layer 4 seals it in an envelope addressed by *port*. Layer 3 seals that envelope inside a larger one addressed by *IP*. Layer 2 seals *that* inside one addressed by *MAC*. Every courier along the path reads only the outermost envelope it is responsible for, and never opens the ones nested inside.
+
+Each wrapped unit has a name, and the general term for "a chunk of data as it exists at a given layer" is a **PDU** — Protocol Data Unit. Segment, packet, frame, and bits are simply the PDU names at Layers 4, 3, 2, and 1.
+
+## De-encapsulation: unwrapping on the way up
+
+The receiving host does the exact reverse, called **de-encapsulation**. The bits come off the wire and are reassembled into a frame. Layer 2 reads and strips the MAC header, handing the packet up. Layer 3 reads and strips the IP header, handing the segment up. Layer 4 reads and strips the port header, and delivers the data to the correct program.
+
+So the full journey is symmetric — one layer adds a header on the way down, and the *same* layer removes it on the way up:
+
+```
+sending host  (encapsulate, top -> down):
+
+  [ data ]                              application data
+  [ L4 | data ]              segment    + ports
+  [ L3 | L4 | data ]         packet     + IP addresses
+  [ L2 | L3 | L4 | data ]    frame      + MAC addresses
+  1011101011...              bits        on the wire
+
+receiving host  (de-encapsulate, bottom -> up):
+
+  bits -> frame -> packet -> segment -> data
+```
+
+## The whole model, in one table
+
+With encapsulation understood, the entire OSI model collapses into a single summary.
+
+![The OSI model summarised — PDU, function, addressing, and devices per layer](/images/networking/osi-summary.png)
+
+```
+layer          PDU       function           addressing      devices
+-----          ---       --------           ----------      -------
+4 Transport    segment   service to service  TCP/UDP ports   hosts
+3 Network      packet    end to end          IP addresses    routers, hosts
+2 Data Link    frame     hop to hop          MAC addresses   switches
+1 Physical     bits      transporting bits   none            cables, Wi-Fi, hubs
+```
+
+Two honest caveats travel with this table. These layers are a *model*, not strict law — real protocols occasionally blur the boundaries. And the model is a conceptualisation of what must happen for data to flow, not a rigid rulebook the hardware is obligated to follow.
+
+That completes the model, and with it the vocabulary of the entire series so far: host, IP, MAC, port, switch, router, segment, packet, frame, hop-to-hop versus end-to-end. The next chapter finally sets it all in motion — it follows, step by step, everything two hosts on the *same network* actually do to talk to each other, starting with the ARP exchange that has only been named until now.
+
+<NoteToSelf>
+Encapsulation quietly implies something the notes never state: data does not travel as one giant blob. Every frame has a maximum size — the **MTU**, around 1500 bytes on Ethernet — so anything larger than that (a photo, a web page, a video stream) is broken into *many* segments, each becoming its own packet, its own frame, and its own burst of bits, then reassembled in order on the far side. This is why a single download is thousands of packets rather than one, why TCP's in-order-delivery guarantee matters so much, and why the per-frame header overhead is a real cost — a tiny payload still pays for a full set of headers. The envelope-in-envelope picture is correct, but there is rarely just one envelope: there is a long line of them, each carrying a slice of the whole.
+</NoteToSelf>

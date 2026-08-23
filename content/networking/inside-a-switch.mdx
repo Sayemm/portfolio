@@ -1,0 +1,81 @@
+---
+title: "Inside a switch: learn, flood, forward"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 11
+lead: 'A switch looks intelligent, but its entire behaviour reduces to three actions and one table. Learn where hosts are, flood when it does not know, forward when it does — that is the whole of switching.'
+---
+
+## A switch reads only Layer 2
+
+A switch facilitates communication within a single network, and it does so as a strictly **Layer 2** device: it makes every decision using the Layer 2 (MAC) header alone, and treats everything after it — the IP header, the port header, the data — as opaque payload it never inspects.
+
+![A switch making decisions from the L2 header only, ignoring everything above it](/images/networking/switch-l2-only.png)
+
+This is the encapsulation idea from the earlier article in action: the switch reads its own layer and ignores the rest. It has no concept of IP addresses or networks at all — which is precisely why it can only operate within one network and can never route between networks.
+
+To watch it work, start from the point where host A already knows host D's MAC (the ARP exchange from the earlier articles is done). The question now is what the switch in the middle does with the frame.
+
+![Host A ready to send to host D through the switch](/images/networking/switch-setup.png)
+
+## The MAC address table
+
+A switch maintains exactly one data structure: the **MAC address table**, which maps each MAC address to the switch port it lives behind. It starts empty and fills as traffic flows. Everything a switch does is built on this table — and beyond maintaining it, a switch only ever performs three actions: **learn**, **flood**, and **forward**.
+
+## Learn — always from the source
+
+When a frame arrives on a port, the switch reads its **source** MAC and records "this MAC is reachable through this port."
+
+![The switch learning host A's MAC from the frame's source address](/images/networking/switch-learn.png)
+
+The insight worth underlining is that a switch learns from *source* addresses, never destination. It works out where a host is by noticing where that host's traffic comes *from* — so every single arriving frame is a free lesson about its sender. Host A's frame arrives on port 5, and the switch learns: A is on port 5.
+
+## Flood — when the destination is unknown
+
+Now the switch must deliver the frame to host D. It looks up D's MAC in the table — but there is no entry for D yet, because the table has only just begun learning.
+
+![The switch flooding the frame out all other ports because D is unknown](/images/networking/switch-flood.png)
+
+With no idea which port D is on, the switch falls back to its only option: **flood** — send the frame out every port except the one it arrived on. That guarantees D receives it, wherever it happens to be. Every other host receives the flooded frame too, compares the destination MAC against its own, and — not being the owner — silently discards it. Only D keeps it.
+
+This is where the contrast with the hub becomes exact. A hub floods *every* frame, *always*, because it has no table and cannot learn. A switch floods only as a fallback, and only when it does not yet know the destination. Flood-always versus flood-only-when-unknown is the entire reason a switch contains traffic and a hub does not. (The proper name for this fallback is *unknown unicast flooding*.)
+
+## Forward — once it knows
+
+Host D receives the frame and sends a reply back to host A. When D's reply arrives on port 8, two things happen at once: the switch **learns** D is on port 8 (from the source, as always), and it looks up the destination, A — which it already learned in the very first step.
+
+![The switch forwarding D's reply out only host A's port](/images/networking/switch-forward.png)
+
+Because it now knows A's port, it **forwards** the reply out that one port only, with no flooding. From here on both directions are known, so all A-to-D traffic is delivered precisely, port to port, and no other host on the switch ever sees it.
+
+So switching "warms up" in essentially two messages. The first, A to D, floods and teaches the switch about A. The reply, D to A, teaches it about D and is already a precise forward. After those two, the conversation is fully contained:
+
+```
+message 1   A -> D, arrives on port 5:
+  table:  A -> port 5              (learned A from source)
+  D unknown  ->  FLOOD out all other ports
+
+message 2   D -> A, arrives on port 8:
+  table:  A -> port 5
+          D -> port 8              (learned D from source)
+  A known  ->  FORWARD out port 5 only
+```
+
+## Through the switch versus to the switch
+
+One subtlety closes the picture. When traffic passes *through* the switch (A to D), the switch's own address is completely uninvolved — it is a transparent middleman, forwarding based on *other* devices' MACs, and it does not even need an IP to do this.
+
+But if the goal is to talk *to* the switch itself — to log in and configure it — then the switch needs its own IP address, its own MAC comes into play, and in that moment it behaves like an ordinary host on the network.
+
+![To manage the switch directly, it needs its own IP address](/images/networking/switch-management-ip.png)
+
+![Addressed directly, the switch acts as another host on the network](/images/networking/switch-as-host.png)
+
+This is the difference between a **managed switch**, which has a management IP an administrator can log into, and an **unmanaged switch**, which has none and simply forwards. It also resolves the earlier point that a switch has essentially one MAC despite its many ports: the ports merely relay other hosts' frames, and the single management address is used only when the switch is itself the destination.
+
+Three actions and one table — that is a single switch, in full. But real networks rarely have just one switch, and they sometimes need to carve a single physical switch into several isolated ones. How learn-flood-forward behaves across multiple switches, and how VLANs slice one switch into independent pieces, is the next article.
+
+<NoteToSelf>
+The learning mechanism has a finite, exploitable weakness. The MAC address table has limited size, and its entries age out after a period of inactivity (commonly around five minutes) so the table can follow devices that move to new ports. An attacker abuses both facts with a **MAC flooding** attack: blast the switch with frames bearing thousands of fake source MACs until the table overflows. A full table cannot learn new legitimate mappings, so the switch is forced to *flood* nearly everything out all ports — effectively degrading into a hub, which lets the attacker sniff traffic never meant for them. It is the exact sibling of the ARP-spoofing weakness from an earlier article: a convenience designed into Layer 2 (automatic learning) becomes an attack when nothing authenticates it.
+</NoteToSelf>

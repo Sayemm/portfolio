@@ -1,0 +1,92 @@
+---
+title: "Talking to a foreign network: the default gateway"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 10
+lead: 'When the destination is on a different network, a host cannot reach it directly — and does not even try. It hands the packet to one door out of its network, the default gateway, and lets the router take it from there.'
+---
+
+## Same start, different answer
+
+The previous article established a host's very first move: it has data, it knows the destination IP, and it checks its subnet mask to decide whether the destination is local or foreign. Last time the answer was *local*, and host A reached host B directly.
+
+This time host A wants to reach host C, and the subnet-mask check comes out the other way — host C is on a **foreign** network.
+
+![Host A, host C, and a router; host C sits on a different network from host A](/images/networking/foreign-setup.png)
+
+That single difference changes everything that follows.
+
+## The L3 header is the same; the L2 header is the problem
+
+Host A still builds the Layer 3 header exactly as before: source is host A, destination is host C's IP. That is end-to-end delivery, and it does not change — the *final* destination is host C no matter how many networks lie between them.
+
+![Host A's L3 header names host C, but the L2 next hop is the router](/images/networking/foreign-next-hop-router.png)
+
+The Layer 2 header is where it breaks. Layer 2 is hop-to-hop, and host C is not the next hop — it is not directly reachable at all. So whose MAC goes in the L2 header? Not host C's. The next hop is the **router**.
+
+This is the concrete payoff of the MAC-versus-IP split from the OSI article. The Layer 3 destination is the *final* host (host C), while the Layer 2 destination is only ever the *next device* on the path — and here that next device is the router, not the destination.
+
+## Why host A cannot simply ARP for host C
+
+The obvious question: why not just ARP for host C directly, the way host B was resolved last time? Because ARP works by **broadcast**, and broadcasts do not cross routers — a router breaks up broadcast domains, exactly as the hubs article foreshadowed. Host A's ARP request for host C would never leave the local network, so host C would never hear it and never reply.
+
+Host A therefore *cannot* resolve a MAC on a different network. That is not a limitation to work around — it is the entire reason default gateways exist. Foreign traffic has to be handed to something that can reach beyond the local network, and that something is the router.
+
+## The default gateway: the one door out
+
+To reach a foreign network, host A sends the frame to its router, and the router's IP is stored on host A as its **default gateway**. (The router's near-side interface sits inside host A's own network — it shares the subnet — which is exactly why host A *can* ARP for it locally even though it leads everywhere else.)
+
+![The three settings a host needs, shown in ipconfig output: IP, subnet mask, default gateway](/images/networking/foreign-ipconfig.png)
+
+This is why connecting a computer to a network configures three things, not one — and each now has an obvious job:
+
+- **IP address** — host A's own identity.
+- **Subnet mask** — how host A decides whether a destination is local or foreign.
+- **Default gateway** — where host A sends anything that turns out to be foreign.
+
+The `ipconfig` (or `ip addr`) output shows exactly these three, and the reason for the trio is precisely the decision this article is built around.
+
+## ARP — but for the router this time
+
+Host A knows the gateway's IP but not its MAC, so it performs the same ARP exchange as before, with one change: the target is the router, not host C. It broadcasts an ARP request for the gateway's IP, the router replies with its MAC, and host A caches the mapping.
+
+![Host A resolving the router's MAC via ARP for the default gateway](/images/networking/foreign-arp-gateway.png)
+
+Now host A completes the Layer 2 header with the *router's* MAC as the destination — wrapped around a packet whose Layer 3 destination is still host C.
+
+![Host A building the L2 header addressed to the router, L3 still addressed to host C](/images/networking/foreign-build-l2.png)
+
+It sends the frame to the router. The router receives it, strips the Layer 2 header, and takes over the job of moving the packet closer to host C — the start of routing, which is a whole chapter ahead. Host A's part is finished.
+
+![The frame delivered to the router, which now takes over](/images/networking/foreign-data-to-router.png)
+
+## One gateway MAC serves every foreign host
+
+There is a neat efficiency here. Host A only ever needs the router's MAC *once*. From host A's point of view, the entire rest of the internet is reachable through a single door — the router — so the same gateway ARP entry is reused for every foreign destination it will ever contact.
+
+![The gateway mapping in host A's cache, reusable for any foreign destination](/images/networking/foreign-local-vs-foreign-rule.png)
+
+## The universal first step
+
+Both articles now collapse into one rule that a host applies to *every* packet it ever sends:
+
+```
+host A has data for some destination IP:
+
+  is the destination on my network?   (check with the subnet mask)
+      |
+      +-- LOCAL    -> ARP for the destination's own MAC, send directly
+      |
+      +-- FOREIGN  -> ARP for the default gateway's MAC, send to the router
+```
+
+Local or foreign, the Layer 3 header always names the final destination; only the Layer 2 header — the next-hop MAC — differs between the two paths.
+
+![The complete local-versus-foreign decision, summarised](/images/networking/foreign-summary.png)
+
+Host A has now handed a foreign-bound frame to the router. What the router does with it — how it decides where to send it next, and how this ARP-and-forward dance repeats hop by hop across the internet — is the subject of the router chapters, which the coming articles begin.
+
+<NoteToSelf>
+This article explains one of the most common real-world symptoms there is: "local network works, but the internet doesn't." Trace it through the rule. Reaching another device on the *same* network only needs the IP and subnet mask, and uses direct ARP — so file shares, printers, and the router's own login page all keep working. Reaching anything *foreign* needs the default gateway — so if the gateway is missing, wrong, or unreachable, every off-network destination silently fails while the LAN looks perfectly healthy. Whenever a machine can ping its neighbours but not the internet, the default gateway is the first thing to check, because it is the single setting that separates the two cases.
+</NoteToSelf>
