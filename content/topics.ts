@@ -65,6 +65,10 @@ export const topics: Topic[] = [
         label: "Networking Fundamentals: How data moves through the Internet",
         href: "https://www.practicalnetworking.net/index/networking-fundamentals-how-data-moves-through-the-internet/",
       },
+      {
+        label: "Why do we need the MAC address when the IP can serve its purpose?",
+        href: "https://www.quora.com/Why-do-we-need-the-MAC-address-when-the-IP-can-serve-its-purpose-In-LANs-that-don-t-have-routers-why-do-we-need-to-assign-IPs-that-arent-MAC-sufficient-locally",
+      }
     ],
   },
   {

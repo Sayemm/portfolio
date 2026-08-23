@@ -1,0 +1,234 @@
+---
+title: "Field-backed Properties"
+date: "2026-08-22"
+status: "written"
+minutes: 11
+order: 74
+lead: "The field keyword exposes the compiler's synthesized backing field, so one accessor can carry custom logic while the other stays automatic. Getting there means being precise about what a property, a getter, a setter, and value actually are."
+---
+
+## What a property actually is
+
+A **field** is a plain variable that stores data inside an object:
+
+```csharp
+private string _name = "";   // storage: an actual slot that holds a string
+```
+
+A **property** looks like a field from the outside but is something different underneath: it is up to two little methods, a **getter** and a **setter**, wrapped around some storage. The getter runs when the property is *read*; the setter runs when the property is *assigned to*.
+
+```csharp
+public class Person
+{
+    private string _name = "";     // the field: real storage
+
+    public string Name             // the property: controlled access to _name
+    {
+        get { return _name; }      // reading Name  -> run this, return _name
+        set { _name = value; }     // writing Name  -> run this, store the incoming data
+    }
+}
+```
+
+The one piece of magic is `value`. Inside a setter, `value` is an implicit parameter holding whatever is on the right-hand side of the assignment. There is no need to declare it — the compiler supplies it.
+
+```csharp
+var p = new Person();
+
+p.Name = "Ada";              // calls the SETTER, with value == "Ada"; stores it in _name
+Console.WriteLine(p.Name);   // calls the GETTER, which returns _name -> "Ada"
+```
+
+```text
+read:  p.Name                 write:  p.Name = "Ada"
+          |                             |
+          v                             v
+      get accessor                  set accessor   (value == "Ada")
+          |                             |
+          +---------> backing field <---+
+                       (the storage: _name)
+```
+
+So a getter answers "what value comes out when this is read," and a setter answers "what happens to the incoming `value` when this is written." A property is the pair, sitting over a field.
+
+## Auto-implemented properties
+
+The manual version above is almost always the same shape: a getter that just returns the field, a setter that just stores `value`. That pattern is so common the compiler automates it. An **auto-implemented property** declares only `get;` and `set;` with no bodies:
+
+```csharp
+public string Name { get; set; } = "";
+```
+
+Behind the scenes the compiler synthesizes a hidden field — the *synthesized backing field* — plus the trivial getter and setter that read and write it. The `= ""` is a property initializer: it sets the initial value of that hidden field. Nothing about the storage is written by hand; the declaration above and the manual `Person` earlier behave identically.
+
+```text
+{ get; set; } = "";   -->   compiler writes:  hidden field (init "")
+                                              + getter returns it
+                                              + setter stores value into it
+```
+
+## The problem: adding logic used to mean going fully manual
+
+The moment either accessor needs real logic — say, refusing to store a blank name — the auto form is not enough. Before C# 14 the only option was to abandon the auto property entirely: declare an explicit backing field and write *both* accessors by hand.
+
+```csharp
+public class Person
+{
+    private string _name = "";        // must declare the field explicitly
+
+    public string Name
+    {
+        get => _name;                 // getter written by hand only because
+                                      //   it must name the same field the setter uses
+        set
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+                _name = value;        // store only non-blank values
+        }
+    }
+}
+```
+
+The setter genuinely needs custom logic. The getter does not — it only had to be spelled out so it could reference `_name`, the same field the setter writes. That is pure boilerplate, and it is what C# 14 removes.
+
+## C# 14: the field keyword
+
+C# 14 adds the contextual keyword `field`. Inside an accessor, `field` refers to the synthesized backing field — the same hidden storage an auto property uses. Writing `field` anywhere in an accessor tells the compiler to synthesize that backing field automatically, exactly as it would for an auto property.
+
+Because the hidden field is now reachable by name, only the accessor that needs logic has to be written. The other stays automatic, and the explicit `_name` field disappears.
+
+```csharp
+public class Person
+{
+    public string Name
+    {
+        get;                              // automatic: compiler's standard getter over `field`
+        set
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+                field = value;            // `field` = the synthesized backing field
+        }
+    } = "";                               // initializes that same backing field
+}
+```
+
+The auto `get;` and the custom `set` share one and the same synthesized field, so reads see what writes stored. This is the intended shape of the lesson's example: a name that refuses to accept blank values, with no hand-written getter and no explicit backing field.
+
+```text
+Name
+  |
+  +-- get;                     auto -> reads the synthesized field
+  +-- set { ... field = value }custom -> writes the synthesized field
+  |
+  +-- = ""                     initial value of the synthesized field
+        (get and set touch the SAME field -> consistent)
+```
+
+## value vs field — the distinction to burn in
+
+Two identifiers appear inside a setter and they are not the same thing. Confusing them is the most common way a field-backed property misbehaves.
+
+```text
+set
+{
+    ... value ...   -> the INCOMING data being assigned (the right-hand side)
+    ... field ...   -> the STORED backing field (its current / previous value)
+}
+```
+
+The difference is easiest to see by getting it wrong. This setter guards on `field` instead of `value`:
+
+```csharp
+public string Name
+{
+    get;
+    set
+    {
+        if (!string.IsNullOrWhiteSpace(field))   // checks the STORED value, not the incoming one
+        {
+            field = value;
+        }
+    }
+} = "";
+```
+
+Trace it against the intent "store the value when the new value is not blank":
+
+```text
+new Person()      -> field == ""   (from the initializer)
+p.Name = "Ada"    -> setter runs, value == "Ada"
+                     check IsNullOrWhiteSpace(field) -> IsNullOrWhiteSpace("") -> true
+                     so !true -> false -> body skipped -> nothing stored
+p.Name            -> still ""     (the assignment silently did nothing)
+```
+
+The guard asks "is the *already stored* value non-blank?" — and since it starts blank, the property can never accept a first value. It is stuck at `""` forever. The fix is one word: guard on `value`, the incoming data, which is what "the new value is not empty" actually means.
+
+<NoteToSelf>
+Rule of thumb inside a setter: `value` is the thing arriving, `field` is the thing already kept. Validation almost always looks at `value` (should this incoming data be accepted?). Only reach for `field` when the decision depends on the previous state — for example, ignoring a write that equals the current value, or enforcing a value that may only increase.
+</NoteToSelf>
+
+## Custom getter, automatic setter
+
+The same freedom runs the other direction. A property can hand-write the getter and leave the setter automatic — again sharing the one synthesized `field`.
+
+```csharp
+public string Name
+{
+    get => string.IsNullOrEmpty(field) ? "(unnamed)" : field;  // custom read
+    set;                                                       // automatic store
+}
+```
+
+Reading returns a friendly default when the stored value is blank; writing just stores whatever comes in. Either accessor can be the custom one; the other stays out of the way.
+
+## Pitfall: a member already named field
+
+`field` is a *contextual* keyword, which means it only takes on its special meaning inside a property accessor. That creates a trap for code that already has a variable literally named `field`.
+
+```csharp
+public class Widget
+{
+    private string field = "legacy";   // a real member happening to be named `field`
+
+    public string Label
+    {
+        get => field;   // C# 14: this `field` now means the SYNTHESIZED backing field,
+                        //        NOT the member above -> the compiler warns
+    }
+}
+```
+
+Inside the accessor, bare `field` resolves to the keyword, not the old member, and the compiler raises a warning because that is rarely intended. Three ways out:
+
+- Rename the old member to something that is not `field` — the cleanest fix, and the one to prefer.
+- Write `@field` to force the identifier reading, telling the compiler the plain member is meant.
+- Write `this.field` (for an instance member), which likewise refers to the actual member rather than the keyword.
+
+## Pitfall: the two accessors touching different storage
+
+C# 14 allows one automatic accessor beside one custom accessor. An automatic accessor always uses the synthesized field. If the custom accessor is written against a *different*, explicit field, the two ends of the property stop agreeing.
+
+```csharp
+public class Person
+{
+    private string _name = "";
+
+    public string Name
+    {
+        get;                    // automatic -> reads the SYNTHESIZED field
+        set => _name = value;   // custom    -> writes the EXPLICIT _name
+    }
+}
+```
+
+```text
+p.Name = "Ada"   -> setter writes "Ada" into _name
+p.Name           -> getter reads the SYNTHESIZED field, which _name never touched -> ""
+```
+
+The getter reads one slot, the setter writes another, and assignments appear to vanish on read. When one accessor is automatic and the other is custom, the custom one has to use `field` — the synthesized slot — so both ends share the same storage.
+
+<NoteToSelf>
+The whole feature in one line: `field` names the compiler-synthesized backing field, so a property can keep one accessor automatic while the other carries logic — no explicit backing field, no boilerplate getter. Keep `value` (incoming) and `field` (stored) straight, keep both accessors on the same storage, and rename any legacy member called `field`.
+</NoteToSelf>

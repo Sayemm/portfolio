@@ -1,0 +1,202 @@
+---
+title: "Static Extension Methods, Extension Properties, and Operators"
+date: 2026-08-22
+status: "written"
+minutes: 8
+order: 72
+lead: "The extension block groups members by receiver, and that unlocks three member kinds the old this-parameter form never could reach: static methods on the type, computed properties, and operator overloads."
+---
+
+## Beyond instance methods
+
+An instance extension method uses the receiver — the instance the member hangs off. But three other member kinds have no instance to work with, or read more naturally as something other than a method: static members, properties, and operators. The extension block expresses all three.
+
+The full example this note dissects:
+
+```csharp
+// StringExtensions.cs
+namespace CsharpDemo;
+
+public static class StringExtensions
+{
+    extension(string str)
+    {
+        public void Printing()
+        {
+            Console.WriteLine(str);
+        }
+
+        public int WordCount =>
+            str.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+    }
+
+    extension(string)
+    {
+        public static bool IsUnknown(string input)
+        {
+            return string.IsNullOrWhiteSpace(input);
+        }
+
+        public static string operator -(string input, string value) =>
+            input.Replace(value, string.Empty);
+    }
+}
+```
+
+```text
+static class StringExtensions
+|
++-- extension(string str)            named receiver -> instance members
+|      |
+|      +-- Printing()                uses str
+|      +-- WordCount                 uses str   (property)
+|
++-- extension(string)                unnamed -> static members only
+       |
+       +-- IsUnknown(string input)   static method
+       +-- operator -(a, b)          static operator
+```
+
+## Static extension methods
+
+A static member belongs to the **type**, not to an instance. There is no instance in play, so the receiver parameter is meaningless to it — a static member cannot read `str`. Instead it takes its own parameters.
+
+```csharp
+extension(string)
+{
+    public static bool IsUnknown(string input)
+    {
+        return string.IsNullOrWhiteSpace(input);
+    }
+}
+```
+
+At the call site it is invoked on the type, exactly like a method that shipped on `string`:
+
+```csharp
+bool isUnknown = string.IsUnknown("Hello, World!"); // False
+```
+
+`string.IsUnknown(s)` reads the same as `string.IsNullOrWhiteSpace(s)`. The type gains a static method it never declared, and the call site cannot tell the difference.
+
+<NoteToSelf>
+Why the receiver name disappears. A static member cannot access the receiver instance, so its name is dead weight in a static-only block. The compiler therefore accepts `extension(string)` with the type alone and no name. A static member declared inside a *named* block still compiles, but it still cannot touch that name — the name simply goes unused. Dropping it is both cleaner and a signal of intent.
+</NoteToSelf>
+
+## Splitting instance and static members
+
+Instance and static members are allowed in the same block, but mixing them blurs which members need an instance and which do not. The clearer arrangement is two blocks: a **named** block for instance members, and an **unnamed** block for static members.
+
+```csharp
+public static class StringExtensions
+{
+    extension(string str)   // named -> instance members that read `str`
+    {
+        public void Printing() => Console.WriteLine(str);
+        public int WordCount =>
+            str.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+    }
+
+    extension(string)       // unnamed -> static members only
+    {
+        public static bool IsUnknown(string input) =>
+            string.IsNullOrWhiteSpace(input);
+    }
+}
+```
+
+The unnamed second block reads as a declaration that these members extend the type itself, not any one string.
+
+## Extension properties
+
+A characteristic of a value — a count, a flag, a derived value — is more naturally a property than a method. The old form could only offer a method such as `GetWordCount()`. The block allows a property.
+
+```csharp
+extension(string str)
+{
+    // method form — reads like an action, needs parentheses
+    public int GetWordCount() =>
+        str.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+
+    // property form — reads like a trait, no parentheses
+    public int WordCount =>
+        str.Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
+}
+```
+
+Both members live in the same named block and both read the receiver `str`. They coexist — one is a method, the other a property:
+
+```csharp
+"the quick brown fox".GetWordCount(); // 4  (method call, parentheses)
+"the quick brown fox".WordCount;      // 4  (property access, no parentheses)
+```
+
+A word count is a trait of the string, so `WordCount` states it more plainly than `GetWordCount()`. Several members sharing one receiver is the point of the block.
+
+<NoteToSelf>
+Extension properties can declare a setter, but an extension cannot add fields — there is nowhere to store a value. So a set accessor has no backing storage of its own; its body must act through the receiver (mutating something the receiver already exposes). Read-only computed properties, expression-bodied against the receiver, are the natural and common case.
+</NoteToSelf>
+
+## Extension operators
+
+An operator overload is a static method with a reserved name. Because it is static, it belongs in the unnamed block, and it is written like any operator overload declared inside a type.
+
+```csharp
+extension(string)
+{
+    public static string operator -(string input, string value) =>
+        input.Replace(value, string.Empty);
+}
+```
+
+This defines subtraction for strings: remove all occurrences of the right operand from the left. The call site uses the operator directly.
+
+```csharp
+string name    = "John Doe";
+string newName = name - "Doe"; // "John "  (note the trailing space)
+```
+
+The only difference from an ordinary operator overload is location: the declaration sits in a static class outside `string`, rather than inside the type. Resolution still works off the operand types.
+
+<NoteToSelf>
+Operators are static by nature, which is exactly why they land in the unnamed block alongside other static extension members. All the familiar operator-overload rules carry over — the shift is purely that the operator now lives on an extension instead of on the type's own definition. This is genuinely new reach: an operator can be given to a type whose source cannot be edited, `string` included.
+</NoteToSelf>
+
+## The full picture
+
+The four members together, and their call sites:
+
+```text
+s.Printing()             instance method    -> needs an instance
+s.WordCount              instance property  -> needs an instance
+string.IsUnknown(s)      static method      -> called on the type
+name - "Doe"             operator           -> static, resolved by operands
+```
+
+```csharp
+// Program.cs
+using CsharpDemo;
+
+var s = "Hello, World!";
+s.Printing();
+
+var isUnknown = string.IsUnknown(s);
+var count = s.WordCount;
+var name = "John Doe";
+var newName = name - "Doe";
+
+Console.WriteLine($"Is Unknown: {isUnknown}");
+Console.WriteLine($"Word Count: {count}");
+Console.WriteLine($"New Name: {newName}");
+```
+
+Output:
+
+```text
+Hello, World!
+Is Unknown: False
+Word Count: 2
+New Name: John 
+```
+
+`Printing()` and `WordCount` reach through an instance; `IsUnknown` is called on the type; `-` is resolved from its operands. One static class, one receiver type, four member kinds — none of which the `this`-parameter form could have expressed together.

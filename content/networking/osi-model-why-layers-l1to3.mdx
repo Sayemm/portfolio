@@ -1,0 +1,103 @@
+---
+title: "The OSI model: why networking has layers"
+date: 2026-08-23
+status: written
+minutes: 10
+order: 6
+lead: 'Getting data between two hosts is not one problem — it is several, stacked on top of each other. The OSI model splits them into seven layers so each can be solved once and reused. The bottom three are where addressing and delivery live.'
+---
+
+## The rules come in layers
+
+Networking exists to let two hosts share data without a human carrying a drive across the room. To automate that, every host has to follow the same set of rules — and those rules are organised into seven layers, together called the **OSI model**.
+
+Why split them into layers at all? Because moving data is not a single problem. Getting bits onto a wire is one problem. Getting a frame to the *next* device is a different problem. Getting a packet across the whole internet to a *final* destination is a third. Getting it to the right *program* on that destination is a fourth. Each layer owns exactly one of these problems and leans on the layer beneath it.
+
+The payoff of that arrangement is **modularity**. Because each layer depends only on the one below, a layer's technology can be swapped without disturbing the rest — replace copper cable with fibre or with Wi-Fi at the bottom, and everything above keeps working unchanged. That separation of concerns is the entire reason the model is worth learning. This chapter walks the layers that matter most for how data actually flows, starting at the bottom.
+
+## Layer 1 — Physical — moving bits
+
+Computer data is ultimately just bits, ones and zeroes, and something has to physically carry those bits from one host to another. Anything that contributes to moving ones and zeroes is a **Layer 1** technology: cables, Wi-Fi radio, repeaters, and hubs.
+
+Those last two are familiar — the repeater and hub from earlier articles live exactly here. They move signals and understand nothing about them, which is precisely what Layer 1 is: pure transport of bits, no addresses, no decisions.
+
+## Layer 2 — Data Link — hop to hop
+
+**Layer 2** is what actually touches the wire. It puts bits onto the physical medium and retrieves bits from it, so whatever the wire plugs into on the host is a Layer 2 component. The classic example is the **NIC** (Network Interface Card) — or a Wi-Fi access card, which counts as Layer 2 because it interacts with the radio waves. Its job is to take ones and zeroes from one NIC and move them to another NIC.
+
+![A NIC and a Wi-Fi access card — Layer 2 hardware](/images/networking/nic.png)
+
+Layer 2's addressing scheme is the **MAC address**: 48 bits, written as 12 hexadecimal digits, like `94-65-9C-3B-8A-E5`. Every NIC has a unique one, and MAC addresses are what let data move from one NIC to the next.
+
+Two details the notes leave out are worth adding, because they explain everything that follows:
+
+- A MAC address is **burned into the NIC by its manufacturer**. The first half identifies the maker (the OUI, an organisation identifier), the second half is a per-device serial — which is how they stay globally unique.
+- A MAC address is **flat**. It has no hierarchy. `94-65-9C-3B-8A-E5` tells you *which* device it is but nothing about *where* it is. Contrast the IP address from the first article, which is hierarchical and pinpoints location. That flatness is the whole reason MAC cannot be used to deliver across the internet — and it sets up the central question of this article.
+
+One clarification prevents a common confusion: **a MAC address belongs to an interface, not to a whole device.** Each NIC has exactly one, so a device has *as many MAC addresses as it has network interfaces*.
+
+And "interface" is more physical than it sounds — **an interface is one port you plug a cable into** (or one radio, for Wi-Fi). Look at the back of the box: each jack is an interface, each with its own NIC behind it, so each has its own MAC. That makes the count concrete — MAC count simply tracks interface count:
+
+```
+device               interfaces           MACs
+------               ----------           ----
+simple host          1 NIC                1
+laptop               Wi-Fi + Ethernet     2
+2-port router        2 ports              2
+8-port router        8 ports              8
+big core router      dozens               dozens
+```
+
+So a laptop with Wi-Fi and Ethernet has two MACs, not one shared "laptop MAC." Plug in a USB-to-Ethernet dongle or run virtual machines, and each new interface adds another. And a router can have *many* — one per port — because its whole job is to sit between networks, which means a port (and therefore a MAC) plugged into each network it connects. Two things keep that from being confusing:
+
+- **Each MAC is only used on its own network.** A router with eight MACs is not announcing all eight everywhere. The interface facing network A only ever speaks on network A; the interface facing network B only on B. Only the interface actually sending or receiving on a given network uses its MAC there.
+- **The switch is the exception.** A switch has many ports too, yet usually just *one* MAC for the whole box. That is because a switch does its job by *reading other devices'* MAC addresses to forward frames — it is not itself a sender or receiver in the path. Its single MAC is only used when talking *to* the switch (for management), never for the traffic passing *through* it. A router is different: it is a real hop in the path, an actual sender and receiver on each network, so it genuinely needs a MAC on every side.
+
+A quick way to see all of this on a real machine: run `ipconfig` on Windows, or `ip addr` on macOS or Linux. Each interface prints as its own block with its own MAC and IP — that list *is* the interfaces, made visible.
+
+The Layer 2 device, of course, is the switch, which forwards by MAC address.
+
+## Layer 3 — Network — end to end
+
+If Layer 2 gets a frame from one device to the *next* one, what makes sure data travels all the way from the original source to the final destination? That is **Layer 3**.
+
+![Data crossing several hops between two endpoints](/images/networking/l3-end-to-end-hops.png)
+
+Layer 3's goal is end-to-end delivery, and its addressing scheme is the **IP address**. Every host is identified by its IP, and anything with an IP address — routers and hosts — lives at Layer 3. And because IP is hierarchical, as the first article showed, it is the address that makes routing across networks possible at all.
+
+## Why both MAC and IP? Hop-to-hop versus end-to-end
+
+Here is the question that trips up almost everyone: if Layer 3 already has IP addresses, why does Layer 2 also need MAC addresses — and the other way around?
+
+They solve two genuinely different problems:
+
+- **IP (Layer 3) is end-to-end.** The source and destination IP addresses name the *final* two hosts of the whole journey, and they stay constant the entire way across the internet.
+- **MAC (Layer 2) is hop-to-hop.** At each individual step — host to switch, host to router, router to router — the MAC addresses name only the *next device* on the path, and they are rewritten at every single hop.
+
+![The frame at hop one — its Layer 2 header names the first next-device](/images/networking/l3-1.png)
+
+![The same frame mid-journey — the Layer 2 header has been rewritten, the IP header has not](/images/networking/l3-2.png)
+
+![Further along — Layer 2 rewritten again, the end-to-end IP addresses unchanged throughout](/images/networking/l3-3.png)
+
+This is also where the per-interface rule from earlier pays off. When a frame reaches a router, the router **receives** it on the interface facing the sender and **sends** it out the interface facing the next hop — two different interfaces, two different MACs. So a single router in these diagrams shows up with two MAC addresses (say `b2b2` on the side facing the source and `b3b3` on the side facing the next router): it received on one and is forwarding out the other. That is not a device with two names — it is two interfaces on one device, exactly as expected.
+
+A shipping analogy makes it concrete. Mailing a package across the country, the final delivery address written on the box never changes — that is the IP address. But at each sorting facility, the label directing the box to the *next* facility is peeled off and replaced — that is the MAC address. The destination is fixed for the whole trip; the next-hop instruction is rewritten at every stop.
+
+And the flatness point from earlier is what forces this division. IP's hierarchy lets routers narrow down the destination network across the entire internet — perfect for the long haul. MAC's flatness is fine for a single hop between directly connected devices but useless for global delivery. So each address does the job the other cannot: IP for end-to-end, MAC for each leg.
+
+## ARP ties the two together
+
+There is one gap left. To send a frame to the next hop, a host needs that next hop's *MAC* address — but it usually only knows the *IP* address it is aiming at. Something has to translate an IP address into the MAC address of the device that holds it.
+
+That something is **ARP**, the Address Resolution Protocol. Its entire job is to link a Layer 3 (IP) address to a Layer 2 (MAC) address.
+
+![Layers 1 through 3 — physical bits, hop-to-hop MAC, end-to-end IP, tied by ARP](/images/networking/osi-part1.png)
+
+Exactly how a host wields ARP — the request, the broadcast, the reply, and the cache that remembers the answer — gets a dedicated article once the whole model is in place.
+
+For now the bottom three layers are covered: Layer 1 moves bits, Layer 2 moves frames hop-to-hop by MAC, Layer 3 moves packets end-to-end by IP. But something none of them solves remains. A single host runs many programs at once — a browser, a game, a chat app — all sending and receiving over the same connection. When data arrives, which program is it for? Answering that is the job of Layer 4, and it is the next article.
+
+<NoteToSelf>
+The seven-layer OSI model is a teaching model, not quite the one the internet actually runs on. Real-world networking follows the **TCP/IP model**, which has four layers and folds OSI's top three (session, presentation, application) into a single **Application** layer. So the crisp seven-layer stack is best treated as a conceptual map — useful for reasoning about *where* a problem lives — rather than a literal description of the software. Layers 1 through 4, the ones with clear addressing and delivery jobs, map cleanly between both models and are where nearly all the useful thinking happens; the upper layers blur together in practice, which is exactly why the next chapter spends its time down here.
+</NoteToSelf>

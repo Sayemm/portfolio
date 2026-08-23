@@ -93,7 +93,7 @@ export const jobs = [
     role: "Software Developer · Permanent full-time",
     dates: "May 2026 — ongoing",
     place: "Regina, SK, Canada",
-    stack: ".NET · Azure · SQL Server",
+    stack: "C# · .NET · Azure · SQL Server · GitHub Actions · Redis",
     points: [
       "Developing AI-powered workforce management software for employee scheduling, time tracking and labor optimization.",
       "Building scalable backend services and integrations with C#, .NET, Azure Service Bus, Azure Functions and SQL Server.",

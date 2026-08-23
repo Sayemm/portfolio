@@ -1,0 +1,73 @@
+---
+title: "Routers"
+date: 2026-08-23
+status: written
+minutes: 10
+order: 5
+lead: 'A switch moves traffic within one network and cannot see past it. The instant a host needs to reach a different network, an entirely different device takes over — one that understands networks themselves. That device is the router.'
+---
+
+## Where the switch stops
+
+The switch article ended on a hard boundary: a switch works only *within* a single network, using MAC addresses, blind to IP addresses and to the very existence of other networks.
+
+Real setups are rarely one network. Picture a school. Each classroom is its own network, deliberately kept separate because different rooms have different connectivity needs — a biology classroom may only need internet access, while a computer-science classroom needs internet *and* access to internal cloud resources. Separate requirements, separate networks.
+
+![A school where each classroom is its own network](/images/networking/classroom.png)
+
+So what happens when a host in one network needs to reach a host in a *different* one? A switch cannot help — it has no concept of another network to aim at. This calls for a new device.
+
+## The router connects networks
+
+A **router's** primary purpose is to facilitate communication *between* networks. Where a switch is *within*, a router is *between*.
+
+The reason it can do what a switch cannot comes down to which address it reads. A switch is a Layer 2 device that decides using MAC addresses. A router is a **Layer 3** device that decides using **IP addresses** — and an IP address, unlike a MAC address, encodes *which network* a host belongs to (the hierarchy from the first article). That is the whole difference: a router operates on the addresses that describe networks, so it can reason about networks; a switch operates on addresses that do not, so it cannot.
+
+![A router joining two separate networks](/images/networking/router.png)
+
+To reach every other network in existence, a router connects to the ultimate network of networks — the internet from the earlier article.
+
+![A router connecting local networks up to the internet](/images/networking/internet2.png)
+
+And because routers sit exactly at the boundary between networks, they are the natural place to enforce security policy. This is why firewalls and access rules live at the network edge — the router is the chokepoint every cross-network packet must pass through.
+
+## A router knows the networks it is attached to
+
+A router has an IP address in *every* network it is attached to. One interface might sit in the `172.16.20.x` network with the address `172.16.20.1`; another sits in `172.16.30.x`; another points toward the internet.
+
+![A router with an interface, and an IP address, in each network it connects](/images/networking/identity.png)
+
+The router's knowledge of each attached network is called a **route**. All the routes a router knows live in its **routing table** — in effect, the router's map of every network it can reach and how to get there. When a packet arrives, the router looks up the destination's network in that table and sends the packet out the matching interface. (How routes get into the table, and how the router chooses among them, is a whole topic later in this series.)
+
+## The gateway: a host's way out
+
+The router's IP address inside a given network plays a special role for the hosts there. It is their **gateway** — a host's way out of its local network.
+
+![The router's local IP serving as the default gateway for hosts on that network](/images/networking/defaultgateway.png)
+
+When a host wants to reach another host on a *different* network, it cannot send there directly — direct communication only works within its own network. So it hands the packet to its router instead, and the IP address of that router is stored on the host as its **default gateway**.
+
+This raises a question the notes leave implicit: how does a host know whether a destination is local or foreign in the first place? It compares the destination address against its own network, using its subnet mask. If the destination is on its own network, it sends directly, through the switch. If it is not, it hands the packet to the default gateway. That same-versus-foreign decision gets a full article of its own further on; for now, the default gateway is simply "where a host sends anything that is not local."
+
+## The internet is a mesh of routers
+
+Zoom out. The internet, from the networks article, is a network of networks — and the thing doing the interconnecting is routers. So the internet is, quite literally, an enormous number of routers passing packets between networks, hop by hop, toward their destination.
+
+![The internet as many networks joined by routers](/images/networking/inter.png)
+
+Two statements are worth committing to memory:
+
+- **Switches facilitate communication *within* networks. Routers facilitate communication *between* networks.**
+- **Switching** is the *process* of moving data within a network; a switch is a device whose primary purpose is switching. **Routing** is the *process* of moving data between networks; a router is a device whose primary purpose is routing. The process and the device are not the same thing.
+
+![Switches within, routers between — the whole picture](/images/networking/overall.png)
+
+## The home router, decoded
+
+A home "router" ties all of this together. Every device connects to it and lands in one local network, say `192.168.1.x`. The router's own address, `192.168.1.1`, is the default gateway for every device. It also hands out the local addresses (`192.168.1.2`, `.3`, and so on) automatically — the mechanism for that is DHCP, a protocol covered later. Whenever a device needs to reach something outside the local network, it sends the packet to the router, which forwards it on toward the internet.
+
+That is the last device in the tour: repeater, hub, bridge, switch, and now router. What is still missing is the *rules* that make all of it actually cooperate — how a host decides between the switch and the gateway, how addresses at different layers work together, how data is wrapped so it can travel. Those rules are organised into layers, and that model — the OSI model — is where the next chapter begins.
+
+<NoteToSelf>
+The box on the shelf labelled "router" is a small lie of convenience. Inside one home appliance are several distinct devices: a **router** (the part that connects the home network to the internet — the *between* function), a **switch** (the LAN ports the wired devices plug into — the *within* function), a **Wi-Fi access point** (the wireless equivalent of those switch ports), a **DHCP server** (handing out the local addresses), and **NAT** plus a **firewall** at the boundary. That is why a single box appears to do everything in this entire chapter at once. Pulling the functions apart in the mind — which part is switching within, which part is routing between — makes an otherwise mysterious appliance completely legible.
+</NoteToSelf>

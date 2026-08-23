@@ -1,0 +1,156 @@
+---
+title: "C# and Modern .NET: The Big Picture"
+date: "2026-08-22"
+status: "written"
+minutes: 15
+order: 1
+lead: "C# is a language; modern .NET is the unified platform that runs it. Seeing that split — and the runtime, libraries, tooling, and history around it — is what turns C# from a pile of syntax into a strategic choice."
+---
+
+## Language is only the surface
+
+C# is easy to mistake for nothing more than its syntax. It follows C-style conventions — curly braces for blocks, semicolons to end statements, `if` statements and loops for control flow — so anyone coming from Java, C++, or JavaScript finds the shape familiar. But syntax is the surface. What makes C# code *useful* is the platform underneath it: modern .NET. Developers write C#; .NET is the runtime that turns that code into something a machine actually executes, across operating systems and across wildly different kinds of application.
+
+Understanding C# as part of a unified platform, rather than as a standalone language, changes how it is evaluated, designed with, and reasoned about strategically.
+
+## What modern .NET is made of
+
+Modern .NET is not one thing. It is four parts that ship and evolve together:
+
+```text
+modern .NET  (one unified platform)
+|
++-- language          C#  (and also F#, Visual Basic)
++-- runtime           executes the code (the CLR, its JIT compiler, the garbage collector)
++-- base class libs   core functionality: collections, file access, networking, and much more
++-- tooling           build, test, publish, deploy (the .NET CLI, editors, debuggers)
+```
+
+The runtime is not tied to a single language. C# is the focus here, but F# and Visual Basic target the same runtime and share the same base class libraries. Code compiled from different .NET languages interoperates freely.
+
+```text
+   C#          F#          Visual Basic
+    \          |          /
+     \         |         /
+      +--------+--------+
+               |
+     the same runtime + the same base class libraries
+```
+
+Different applications reference different libraries depending on what they do — a web app pulls in one set, a desktop app another. The *surface area* changes with the workload, but the language and the runtime foundation stay constant. That is why two C# projects can look nothing alike yet rest on identical principles.
+
+## What can be built
+
+The honest short answer is "almost anything." The specifics matter more, because each workload is really a matter of which libraries get referenced on top of the same core.
+
+- **Console apps** — plain .NET console; good for learning, and for real workers and scheduled background jobs.
+- **Web backends / APIs** — ASP.NET Core: business logic, data access, auth; exposes REST/SOAP endpoints, with SignalR to push updates to clients.
+- **Full-stack web** — Razor Pages (pages and reusable components), MVC (model-view-controller, for larger apps), and Blazor (interactive UI, C# running in the browser).
+- **Windows desktop** — Windows Forms, or WPF with XAML markup; common in enterprise apps.
+- **Cross-platform apps** — .NET MAUI with XAML: one codebase for iOS, Android, Windows, and macOS.
+- **Games** — Unity uses C# as its scripting language; other engines support it too.
+- **IoT / embedded** — runtimes for sensors and devices, from constrained boards up to full-OS hardware.
+
+A backend service built with ASP.NET Core is designed to run continuously and serve many clients at once, and those clients need not be .NET at all — because it speaks web standards, it can back a single-page app written in Angular or React just as easily as a .NET mobile client.
+
+<NoteToSelf>
+The product names are not the lesson. The lesson is the shape: one language, one runtime, and a library set chosen per workload. Learning a new "app stack" (ASP.NET Core, MAUI, Blazor) is mostly learning a new set of libraries and conventions on top of a core that is already familiar. That is why a C# developer can move between domains without relearning the language.
+</NoteToSelf>
+
+## How the code actually runs
+
+C# is not compiled straight to machine code. The compiler produces **intermediate language** (IL) — a platform-independent instruction set — packaged into *assemblies* (the `.dll` and `.exe` files). Because IL is language-neutral, an application can be assembled from parts written in several .NET languages.
+
+Native code appears later. Just before execution, the runtime compiles IL into native instructions for whatever operating system it is running on. This is handled by the **Common Language Runtime** (CLR), which provides a *managed execution* environment.
+
+```text
+C# source
+   |  compiler
+   v
+IL  (intermediate language, platform independent, inside an assembly: .dll / .exe)
+   |  CLR + JIT compiler, at run time
+   v
+native code for the target OS   (Windows / Linux / macOS)
+```
+
+Managed execution is one of .NET's defining traits. Raw memory is not managed by hand, as it is in some lower-level languages. The runtime allocates memory and, through the **garbage collector**, automatically reclaims what is no longer in use. That removes a whole category of memory-leak and corruption bugs and gives running code a baseline of safety and stability.
+
+## The type system and productivity
+
+Safety is not only a runtime concern; much of it comes from catching mistakes before the program ever runs.
+
+C# is **statically typed**: the type of every value is known at compile time and does not change at runtime.
+
+```csharp
+int count = 5;
+count = "five";   // compile error — count is an int and stays an int
+```
+
+Because types are fixed and known early, the compiler and editors like Visual Studio and VS Code can flag errors while the code is still being written, long before it executes.
+
+Beyond the built-in types, developers define their own types with **classes** and **structs** to model data and behaviour. That is object-oriented programming — and it is how the runtime and libraries themselves are built. The **base class library** supplies ready-made types for common needs, reached by referencing the right namespace:
+
+```csharp
+using System.Net.Http;   // pull in networking types
+
+var client = new HttpClient();      // no need to write networking from scratch
+```
+
+**LINQ** (Language Integrated Query) extends this further with a single declarative way to query data — in-memory collections, XML, databases, JSON, and more. Instead of hand-writing loops and conditionals, the intent is described and the library handles the mechanics:
+
+```csharp
+var evens = numbers.Where(n => n % 2 == 0);   // "the even ones" — not a manual loop
+```
+
+LINQ is one of the ways C# supports a functional style: say *what* is wanted, not *how* to compute it.
+
+## Performance
+
+Two things keep .NET fast. First, JIT compilation means IL is turned into native code tuned for the specific operating system it lands on, rather than a lowest-common-denominator binary. Second, the language itself has performance features — most importantly **async/await**, which lets code run without blocking:
+
+```csharp
+string html = await httpClient.GetStringAsync(url);   // wait without freezing
+```
+
+Rather than sitting idle while an operation completes, the application keeps doing useful work. That keeps user interfaces responsive and lets server applications handle large numbers of concurrent requests.
+
+## Cross-platform and cloud-first
+
+.NET is open source and runs on Windows, Linux, and macOS, which shapes how modern applications are shipped.
+
+- **Develop anywhere, deploy anywhere.** An app written and debugged on a Windows laptop can run on a Linux container in the cloud. Where the target lacks a preinstalled runtime, the app can be published as a **self-contained** bundle — code plus runtime for a specific OS — which drops cleanly into a container.
+- **Configuration is separated from code.** Settings that differ per environment (database connection strings and the like) come from JSON files, command-line arguments, or environment variables. The configuration classes in the base class library merge these sources so the code reads one consistent view.
+- **Designed to scale out.** Cloud apps add more instances rather than one bigger server, so application state is externalized — into databases, distributed caches, or messaging systems (all with library support) — letting instances start, stop, and multiply without changing behaviour.
+- **Automated build and release.** CI/CD systems such as GitHub Actions build, test, and package automatically, cutting human error. The **.NET CLI** is the tool that makes this automation possible.
+
+None of these capabilities are unique to .NET. What is notable is that they come integrated into the core platform rather than assembled from separate pieces.
+
+## How it got here
+
+The language, tooling, and runtime have always moved together. A compressed history:
+
+- **2002** — .NET Framework 1.0 with C# 1.0: Windows-only, a managed OO alternative to Java; GC, a unified runtime, and a large BCL (all still with us).
+- **2005** — C# 2.0 / .NET Framework 2.0: generics.
+- **2007** — .NET Framework 3.5: LINQ.
+- **2012** — C# 5: async/await as a first-class language feature.
+- **2016** — .NET Core: open source and cross-platform; VS Code emerges; .NET Standard defines a shared API contract so code targets both Framework and Core.
+- **2019** — .NET Standard 2.1 (Core only); .NET Framework 4.8 is the last Framework release, still supported today.
+- **2020** — .NET 5 unifies everything: no more "Framework vs Core", just modern .NET.
+- **2025** — .NET 10 with C# 14: the current baseline, cross-platform and cloud-ready.
+
+The application stacks evolved alongside the core, and older ones largely remain supported rather than being removed:
+
+```text
+Desktop :  Windows Forms  ->  WPF  ->  .NET MAUI          (all still supported)
+Web     :  ASP  ->  ASP.NET  ->  ASP.NET Core             (several UI/back-end options)
+Mobile  :  .NET Compact Framework  ->  Xamarin (acquired 2016)  ->  .NET MAUI (in .NET 6)
+Embedded:  .NET Micro Framework  ->  nanoFramework (community) + full-OS IoT runtimes
+```
+
+## The part that stays constant
+
+Frameworks come and go; the foundation does not. Managed execution, the static type system, and deep integration with the development tools have stayed consistent across every era above. That consistency is the practical payoff: once the C# fundamentals are in place, moving across application domains — web to desktop to mobile to cloud — is mostly a matter of learning a new set of libraries, not a new way of thinking.
+
+<NoteToSelf>
+The mental model to hold before writing any code: C# is the language, modern .NET is the platform (runtime + libraries + tooling), and everything specific — the app type, the frameworks, the deployment target — is a layer chosen on top of that shared core. Strengths follow directly: safety and stability from managed execution, productivity from the type system and BCL, performance from JIT and async, and reach from cross-platform, cloud-first design.
+</NoteToSelf>

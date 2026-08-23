@@ -1,0 +1,299 @@
+---
+title: "Extension Members and Generics"
+date: 2026-08-22
+status: "written"
+minutes: 13
+order: 73
+lead: "The extension keyword takes a type parameter, so one extension block can serve every element type at once. Understanding that first needs two ideas from scratch: what a generic type parameter is, and what yield does."
+---
+
+## What this note has to cover first
+
+Generic extension blocks combine three things: the new `extension` syntax, generics, and — in the interesting examples — iterators built with `yield`. The syntax was covered already. Generics and `yield` are the parts that make the code look cryptic on first read, so both are built up from nothing here before the extension examples arrive.
+
+## Generics from zero
+
+Generics exist to remove a specific kind of duplication: writing the same logic once per type.
+
+Consider a method that returns the first element of an array, or a fallback when the array is empty. Without generics, each element type needs its own copy:
+
+```csharp
+public static int    FirstOrDefault(int[] items)    => items.Length > 0 ? items[0] : 0;
+public static string FirstOrDefault(string[] items) => items.Length > 0 ? items[0] : "";
+public static double FirstOrDefault(double[] items)  => items.Length > 0 ? items[0] : 0d;
+// ...and one more for every future type
+```
+
+The logic is identical; only the type changes. A generic method writes it once, with a **type parameter** standing in for the type:
+
+```csharp
+// T is a placeholder for "some type", chosen later at the call site
+public static T? FirstOrDefault<T>(T[] items) =>
+    items.Length > 0 ? items[0] : default;
+```
+
+`T` is not a real type. It is a slot. The real type is filled in when the method is called — usually inferred from the argument:
+
+```csharp
+FirstOrDefault(new[] { 1, 2, 3 });       // T becomes int
+FirstOrDefault(new[] { "a", "b" });      // T becomes string
+FirstOrDefault<double>(new double[0]);   // T given explicitly -> double
+```
+
+```text
+without generics                with generics
+----------------                -------------
+FirstOrDefault(int[])           FirstOrDefault<T>(T[])
+FirstOrDefault(string[])           |
+FirstOrDefault(double[])           +-- T := int      chosen per call
+   ...                             +-- T := string
+one method per type                +-- T := double
+                                   one method, T filled in each time
+```
+
+The compiler still checks types fully. Inside the generic method `T` behaves like whatever type was supplied, and mismatches are caught at compile time — generics are not a way to switch off type safety, they are a way to write one type-safe version that adapts.
+
+<NoteToSelf>
+`default` returns the zero value for whatever `T` turns out to be: `0` for `int`, `null` for reference types like `string`, an all-zero struct for value types. `T?` on the return type marks that the result may be that default/null case. Type parameters are conventionally single capital letters (`T`), or `T`-prefixed names when there are several (`TKey`, `TValue`, `TArg`).
+</NoteToSelf>
+
+## A sequence type worth naming: IEnumerable&lt;T&gt;
+
+The extension examples all extend `IEnumerable<T>`, so it needs a one-line meaning: `IEnumerable<T>` is *a sequence of `T` that can be walked with `foreach`*. A `List<int>`, a `string[]`, and the result of most LINQ operations are all `IEnumerable<T>` for some element type `T`. Extending `IEnumerable<T>` means the extension applies to all of them at once.
+
+## Generic extension blocks
+
+The `extension` keyword accepts a type parameter, written right after it. That parameter is then usable everywhere in the block — including in the receiver type itself.
+
+```csharp
+namespace CsharpDemo;
+
+public static class EnumerableExtensions
+{
+    extension<T>(IEnumerable<T> source)
+    {
+        public bool IsEmpty => !source.Any();
+    }
+}
+```
+
+The `<T>` on `extension` is the whole point. The receiver is `IEnumerable<T>`, not `IEnumerable<string>` — so this single block, and the single `IsEmpty` property inside it, work for every element type:
+
+```csharp
+new List<int>().IsEmpty;         // True
+new[] { "a", "b" }.IsEmpty;      // False
+new List<double> { 3.14 }.IsEmpty; // False
+```
+
+`IsEmpty` itself never mentions `T`. It only needs to know there is *a* sequence to check. Because `T` lives on the block, the member does not have to declare or care about it.
+
+```text
+extension<T>(IEnumerable<T> source)     T = element type, supplied at the call site
+   |
+   +-- IsEmpty                          works for any T: int, string, double, ...
+```
+
+## Constraints: restricting what T can be
+
+By default `T` can be any type at all. That is a problem the moment the code inside needs `T` to *support* something. Addition, comparison, a zero value — none of these exist for an arbitrary `T`. A **constraint**, written with `where`, narrows which types `T` may be, and in exchange the code gains access to what those types guarantee.
+
+`INumber<T>` (from generic math, added in C# 11, in `System.Numerics`) is the constraint that means "`T` is a number type" — `int`, `double`, `decimal`, and so on. It unlocks arithmetic and comparison inside generic code.
+
+```csharp
+using System.Numerics;
+
+namespace CsharpDemo;
+
+public static class EnumerableExtensions
+{
+    extension<T>(IEnumerable<T> numbers) where T : INumber<T>
+    {
+        public T Total
+        {
+            get
+            {
+                T sum = T.Zero;          // T.Zero exists only because of INumber
+                foreach (var n in numbers)
+                    sum += n;            // + exists only because of INumber
+                return sum;
+            }
+        }
+    }
+}
+```
+
+Without the constraint, `T.Zero` and `sum += n` would not compile — an arbitrary `T` has no zero and no `+`. The constraint is what makes the generic body legal.
+
+```csharp
+new[] { 1, 2, 3 }.Total;          // 6   (T = int)
+new[] { 1.5, 2.5 }.Total;         // 4.0 (T = double)
+new[] { "a", "b" }.Total;         // compile error — string is not INumber<string>
+```
+
+Multiple members can share one constrained block; every member in it sees both `T` and the guarantees the constraint brings.
+
+<NoteToSelf>
+A constraint restricts *and* enables — fewer types allowed in, more operations available inside. Worth pairing with the source code's own first block, which places `IsEmpty` inside a `where T : INumber<T>` block. That compiles, but it quietly limits `IsEmpty` to number sequences only, even though checking emptiness needs no arithmetic. A member should sit in a constrained block only when it actually uses the constraint. `IsEmpty` belongs in an unconstrained block so it stays usable on any sequence; `Total` belongs in the constrained one.
+</NoteToSelf>
+
+## Iterators and yield from zero
+
+The next example returns sequences, so `yield` has to be clear first.
+
+One way to return a sequence is to build a whole `List<T>`, fill it, and return it. `yield` offers a different model: a method that produces items **one at a time, on demand**, without ever building a collection. Such a method is an *iterator*.
+
+```csharp
+public static IEnumerable<int> CountTo(int n)
+{
+    for (int i = 1; i <= n; i++)
+    {
+        yield return i;   // hand back i, then PAUSE right here
+    }
+}
+```
+
+The key behaviour is the pause. `yield return i` gives one value to the caller and freezes the method exactly at that line. When the caller asks for the next value, the method resumes on the line after the `yield`, keeps its loop variable and all local state, and runs until the next `yield` — or until the method ends, which finishes the sequence.
+
+```text
+CountTo(3), consumed by a foreach
+   |
+   ask for value  -> run until `yield return 1`  -> PAUSE, hand back 1
+   ask for value  -> resume after yield, loop, `yield return 2` -> PAUSE, hand back 2
+   ask for value  -> resume, loop, `yield return 3` -> PAUSE, hand back 3
+   ask for value  -> resume, loop ends -> sequence finished
+```
+
+```csharp
+foreach (var x in CountTo(3))
+    Console.Write(x);        // 123
+```
+
+Two consequences matter. First, no list is allocated — values are generated as they are pulled. Second, the work is **deferred**: the body of an iterator does not run at all until something starts enumerating it. Calling `CountTo(3)` builds the machinery; the first loop iteration is what actually starts it.
+
+<NoteToSelf>
+An iterator method's return type must be `IEnumerable<T>` (or `IEnumerator<T>`, or the non-generic forms). The compiler rewrites the method into a hidden state machine that remembers where it paused. Deferred execution is the sharp edge: exceptions and side effects inside the iterator fire during enumeration, not at the call that returned it.
+</NoteToSelf>
+
+## Generics and yield together: Append and Prepend
+
+Now the source file's harder example reads cleanly. It is a generic extension block whose members are iterators — and whose members declare their *own* type parameter on top of the block's.
+
+```csharp
+namespace CsharpDemo;
+
+public static class GenericExtensions
+{
+    extension<T>(IEnumerable<T> source)
+    {
+        public IEnumerable<T> Append<TArg>(
+            IEnumerable<TArg> second,
+            Func<TArg, T> converter)
+        {
+            foreach (var item in source)
+                yield return item;                 // items are already T
+
+            foreach (var item in second)
+                yield return converter(item);      // convert each TArg into a T
+        }
+
+        public IEnumerable<T> Prepend<TArg>(
+            IEnumerable<TArg> second,
+            Func<TArg, T> converter)
+        {
+            foreach (var item in second)
+                yield return converter(item);
+
+            foreach (var item in source)
+                yield return item;
+        }
+    }
+}
+```
+
+Three separate type roles are in play. Keeping them apart is the whole trick:
+
+```text
+extension<T>(IEnumerable<T> source)      T    = element type of `source`      (from the block)
+   Append<TArg>(                         TArg = element type of `second`      (from the method)
+       IEnumerable<TArg> second,
+       Func<TArg, T> converter)          converter turns one TArg into one T
+   -> IEnumerable<T>                     output element type is T
+```
+
+- **`T`** comes from the block and is the element type of `source`. `Append` returns `IEnumerable<T>`, and it never re-declares `T` — the block already provides it.
+- **`TArg`** is the method's own type parameter. The second sequence can hold a *different* element type, and `TArg` names it. Members are free to declare type parameters beyond the block's.
+- **`Func<TArg, T> converter`** is the bridge. This needs one more concept.
+
+### Func: a method passed as a value
+
+`Func<TArg, T>` is a **delegate type** — a reference to a method. Read it as "a function that takes a `TArg` and returns a `T`". The last type in the angle brackets is always the return type; the ones before it are the parameters. Passing a `Func` as a parameter lets the caller supply *behaviour*, not just data — here, the rule for turning a `TArg` into a `T`.
+
+A `Func` is usually supplied as a lambda — `argument => result`:
+
+```csharp
+Func<int, string> toLabel = id => $"#{id}";
+toLabel(7);   // "#7"
+```
+
+### Reading Append end to end
+
+With all three roles named, the body is short. `Append` yields every element of `source` unchanged (they are already `T`), then yields every element of `second` after running it through `converter` to make it a `T`. Because both halves use `yield`, the result is a single lazy `IEnumerable<T>`.
+
+```csharp
+IEnumerable<string> names = new[] { "Alice", "Bob" };
+IEnumerable<int>    ids   = new[] { 1, 2, 3 };
+
+// T = string (from names), TArg = int (from ids), converter: int -> string
+IEnumerable<string> combined = names.Append(ids, id => $"#{id}");
+
+foreach (var x in combined)
+    Console.Write(x + " ");   // Alice Bob #1 #2 #3
+```
+
+```text
+source: names (IEnumerable<T=string>)     second: ids (IEnumerable<TArg=int>)
+   |                                          |
+   |                                          +-- converter: int -> string   (id => $"#{id}")
+   v                                          v
+   yield "Alice", "Bob"  .................... yield "#1", "#2", "#3"
+        \_______________________  ________________________/
+                                \/
+                    one combined IEnumerable<string>
+```
+
+`Prepend` is the same parts in the other order: converted `second` first, then `source`.
+
+<NoteToSelf>
+LINQ already ships `Append` and `Prepend` on `IEnumerable<T>`, but those take a single element (`source.Append(oneItem)`). These custom overloads take a whole second sequence plus a converter, so their signatures differ and overload resolution keeps them separate. Same names, different shapes.
+</NoteToSelf>
+
+## Why the block form reads better
+
+The identical behaviour before C# 14 had to declare every type parameter on the method and mark the receiver with `this`:
+
+```csharp
+// Pre-C# 14 — same logic, heavier signature
+public static class GenericExtensions
+{
+    public static IEnumerable<T> Append<T, TArg>(
+        this IEnumerable<T> source,
+        IEnumerable<TArg> second,
+        Func<TArg, T> converter)
+    {
+        foreach (var item in source)  yield return item;
+        foreach (var item in second)  yield return converter(item);
+    }
+}
+```
+
+The old signature carries `<T, TArg>` and `this IEnumerable<T> source` on every method, mixing the block-level type with the method-level one in a single list. The block form declares `T` once, up front, so each method states only what is genuinely its own — here, just `TArg`. Most modern IDEs will offer to convert old-style extension methods into an extension block automatically.
+
+## Extension members, summarized
+
+The whole feature, gathered in one place:
+
+- The extension block is a new way to declare extensions, sitting inside a static class.
+- Methods and properties are supported, as either instance or static members; operators are supported too.
+- Every member in a block shares the one receiver parameter, which also names the type being extended.
+- A block can be generic, with `where` constraints, and its type parameter is shared by all its members.
+- Static and non-static members read best in separate blocks — and the static-only block may omit the receiver name, since static members cannot use it.

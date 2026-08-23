@@ -1,0 +1,90 @@
+---
+title: "Repeaters and hubs"
+date: 2026-08-22
+status: written
+minutes: 8
+order: 3
+lead: 'A signal fades as it travels, and wiring every host to every other host does not scale. Repeaters fix the first problem and hubs fix the second — but the hub creates a new problem that shapes every device after it.'
+---
+
+## The wire has a limit
+
+A signal sent down a wire does not travel forever unchanged. It **attenuates** — weakens — as it goes, and if it fades too far before reaching the far end, the receiving host can no longer make sense of it. When that happens, the two hosts simply cannot share data. This is why every cable type has a maximum usable length: past it, the signal is too degraded to read.
+
+## The repeater regenerates the signal
+
+The fix is a **repeater**, placed partway along a long run. Whatever arrives on one side leaves the other side restored to full strength, so two hosts can span a distance longer than a single cable allows.
+
+One distinction matters here. A repeater does not merely *amplify* the signal — amplifying would boost the accumulated noise right along with it. A digital repeater **regenerates**: it reconstructs the clean bits and retransmits them fresh, noise discarded.
+
+And a repeater understands nothing about what it is carrying. It reads no addresses and makes no decisions — it moves bits, not meaning. It is the simplest possible network device, operating purely at the physical level (a point the OSI article will make formal).
+
+![A repeater partway along a link, regenerating the signal](/images/networking/repeater.png)
+
+## Connecting hosts directly does not scale
+
+So far every connection has been one host wired straight to another. Watch what happens as hosts are added. A third host must be wired to both existing hosts. A fourth must be wired to all three. Every new host has to connect to every host already there.
+
+That cost is not linear — it is quadratic. Wiring N hosts directly to each other (a *full mesh*) needs N × (N − 1) / 2 separate links:
+
+```
+hosts   direct links needed
+  2        1
+  3        3
+  4        6
+  10       45
+  50       1,225      (links = N x (N-1) / 2)
+```
+
+Fifty hosts would need over twelve hundred cables, and every single new host makes it worse. This is what "does not scale" means, concretely.
+
+![Hosts wired directly to each other — a tangle that grows with every host](/images/networking/mesh-full-connection.png)
+
+## Put one device in the middle
+
+The escape is to stop connecting hosts to each other and instead connect every host *once* to a central device. Adding a host is then a single cable to that device, and it immediately has reach to everyone already attached. This shape is a **star topology**:
+
+```
+  A --+
+  B --+-- [ central device ]
+  C --+
+  D --+
+
+add host E  =  one new cable to the device
+```
+
+![Every host connected once to a single central device](/images/networking/central-device.png)
+
+Now N hosts need N cables, not N × (N − 1) / 2. The growth is linear instead of quadratic — the scaling problem is solved. The only question left is what that central device should actually do.
+
+## The hub is a multi-port repeater
+
+The first answer was the **hub**, and it is exactly what it sounds like: a repeater with many ports. Whatever arrives on one port is regenerated and sent out *all the other ports*.
+
+```
+A sends one frame:
+
+  A --> [ HUB ] --> B   (copy)
+                --> C   (copy)
+                --> D   (copy)
+```
+
+![A hub with hosts on each port, flooding an incoming frame to all others](/images/networking/hub.png)
+
+So a hub delivers the star-topology scaling of a central device while remaining a pure physical-layer signal regenerator that understands nothing about the data. It is cheap, simple, and — as it turns out — deeply flawed.
+
+## The problem the hub creates
+
+Because the hub copies every frame out to every port, **every host receives every other host's data**. That single fact has three serious consequences:
+
+- **No privacy.** Every host on the hub sees all the traffic. A host is expected to ignore frames not addressed to it, but nothing prevents it from listening to everything.
+- **Collisions.** All hosts share one signal space. If two of them transmit at the same instant, their signals collide and both are corrupted. A hub places every attached host into a single **collision domain**, so they must effectively take turns — and the more hosts there are, the more often they collide. This forces the network to be half-duplex, with hosts listening before they send and backing off after a collision.
+- **Shared bandwidth.** The hub's total capacity is divided across everyone, because only one host can successfully transmit at a time.
+
+None of these are minor annoyances. Together they are why hubs are effectively extinct today, replaced by the smarter device the next article builds toward.
+
+What everyone actually wanted was the scaling of a central device *without* the everybody-hears-everybody cost — a device that sends each frame only where it needs to go. Reaching that took two steps, first the bridge and then the switch, and that is the next article.
+
+<NoteToSelf>
+"Collision domain" is worth holding onto, because it becomes a way to tell these devices apart. A hub puts every host into **one** collision domain — one shared space where transmissions can collide. A switch (coming up) gives each port its *own* collision domain, which is most of why it is so much better. Neither, however, changes the **broadcast domain**: a broadcast still reaches every host on the network. Splitting *broadcast* domains is the router's job, further along. Three devices, three different effects on these two kinds of domain — keeping the pair straight makes the whole device hierarchy click into place.
+</NoteToSelf>

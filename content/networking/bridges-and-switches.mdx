@@ -1,0 +1,78 @@
+---
+title: "Bridges and switches"
+date: 2026-08-23
+status: written
+minutes: 9
+order: 4
+lead: 'A hub floods every frame to everyone. The fix is a device that learns where each host is and sends a frame only there. That single idea — learn, then forward — is what turns a hub into a switch.'
+---
+
+## The problem to solve
+
+The repeaters-and-hubs article ended on the hub's flaw: it scales the wiring, but it floods every frame to every host, which brings no privacy, constant collisions, and bandwidth shared across everyone.
+
+The goal now is to keep the convenience of one central device while stopping traffic from going where it does not belong. That requires something a hub fundamentally lacks — knowledge of *where each host is*. The first device to have it was the bridge.
+
+## The bridge learns which side a host is on
+
+A **bridge** sits between two sets of hub-connected hosts. It has only two ports, one facing each side.
+
+Its new ability is to **learn which hosts are on which side**, simply by watching the traffic that passes through it. (The exact learning mechanism — reading the source address of every frame — is the switch's core trick, taken apart in a later article.)
+
+Knowing which side each host is on lets the bridge *contain* traffic:
+
+- when two hosts on the **same** side talk, the bridge sees the frame but does not forward it across — the other side never hears it,
+- when two hosts on **different** sides talk, the bridge knows the frame must cross, and lets it.
+
+![A bridge between two sets of hub-connected hosts, containing traffic to the side that needs it](/images/networking/bridge.png)
+
+This is a genuine turning point. A repeater and a hub are **address-blind** — they move signals with no idea who those signals are for. A bridge is the first device to read a frame's Layer 2 (MAC) address and *make a decision* based on it. That is the jump from moving *signals* to moving *frames based on their destination*.
+
+It also pays off in a way the collision-domain idea from the previous article predicted: by refusing to forward same-side traffic, the bridge splits one collision domain into two. Each side now only collides within itself, so collisions drop. That reduction is the bridge's real reward.
+
+## The switch is a bridge with a port for every host
+
+A **switch** is the bridge idea generalized. Instead of two ports separating two sides, it has many ports — and it learns which host is on *each individual port*.
+
+So a switch combines both earlier devices: like a hub, many hosts plug into it; like a bridge, it learns where hosts are and contains traffic. The difference is granularity — per **port**, not per side.
+
+When two hosts communicate, the switch knows exactly which two ports they sit on and passes the frame only between those two. Every other port sees nothing at all.
+
+![A switch with a host on each port, forwarding a frame only to the destination port](/images/networking/switch.png)
+
+That per-port precision unlocks three things a hub could never offer:
+
+- **Its own collision domain per port.** With a single host on a dedicated port, there is nothing for its traffic to collide with — so the link can run **full-duplex**, sending and receiving at the same time.
+- **Dedicated bandwidth per port.** Each host gets the full speed of its own link, rather than a slice of one shared pipe.
+- **Privacy.** A frame reaches only the port it is meant for, so hosts no longer see each other's traffic.
+
+Private, collision-free, full-speed links to every host — that is why the switch completely displaced the hub.
+
+## The evolution, in one view
+
+These four devices are not four unrelated inventions. They are one idea, refined step by step:
+
+```
+device     layer  ports   what it does with a frame
+------     -----  -----   -------------------------
+repeater     1      2      regenerate, send on
+hub          1     many    regenerate, flood to all
+bridge       2      2      learn side, forward only if needed
+switch       2     many    learn per port, forward to one
+```
+
+Each row adds intelligence: first more ports, then the ability to read addresses, then per-port precision. The switch is where that line arrives.
+
+## A switch facilitates communication within a network
+
+Here is the switch's role stated exactly: **a switch facilitates communication within a single network.** Every host connected to one switch belongs to the same network — they share one IP address space, as the networks article described, and they can reach one another directly.
+
+![Hosts on one switch, all in the 192.168.1.x address space — one network](/images/networking/ip-address-space.png)
+
+A handful of hosts on one switch, all addressed within `192.168.1.x`, is precisely a typical home Wi-Fi network: same switch, same network, direct communication between every device on it.
+
+But that is the switch's hard boundary. It works *only* within one network. A switch makes every decision using MAC addresses and never so much as looks at an IP address or a network. So when a host in one network needs to reach a host in a *different* network, a switch is helpless — it has no concept of "another network" to send toward. Crossing that boundary needs a different device entirely. That device is the router, and it is the next article.
+
+<NoteToSelf>
+In the real world, "bridge" is a word from the past — nobody buys a standalone bridge today. The reason is simply that a switch *is* a multi-port bridge: it implements the exact same learn-and-forward logic (standardised as 802.1D bridging), just with many ports instead of two. So when documentation calls a switch a "bridging device," or a hypervisor exposes a "network bridge" to connect virtual machines, that is not a different technology — it is this same idea wearing its original name. Bridge and switch are one concept at two scales.
+</NoteToSelf>
