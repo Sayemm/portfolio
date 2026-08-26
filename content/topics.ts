@@ -92,4 +92,12 @@ export const topics: Topic[] = [
     order: .5,
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
+  {
+    id: "misc",
+    name: "Miscellaneous",
+    blurb: "Everything else worth writing down — tools, shell, odds and ends.",
+    // Deliberately last: it is the catch-all, so it should sink on a tie.
+    order: 99,
+    chip: { bg: "#eceaea", fg: "#4a4545" },
+  },
 ];

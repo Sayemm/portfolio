@@ -1,0 +1,417 @@
+---
+title: "C# Records: data that is defined by its values"
+date: "2026-08-25"
+status: "written"
+minutes: 14
+order: 1
+lead: "A record is a type whose identity is its data. Two ways to declare one, one big reason to reach for it, and a set of behaviours the compiler writes so the class never has to."
+---
+
+The main question: **when should a type be a `record` instead of a `class`, and what does the compiler hand over for free once that choice is made?**
+
+A `class` answers "is this the same object?" A `record` answers "do these hold the same values?" That single shift — identity by reference versus identity by value — drives every other difference below.
+
+## Two declarations, one shape
+
+There are two ways to write a record. They compile to nearly the same thing.
+
+**Property-style** — every member is spelled out:
+
+```csharp
+public record Employee
+{
+    public int Id { get; init; }
+    public string FullName { get; init; }
+    public decimal HourlyRate { get; init; }
+}
+```
+
+Construction goes through an object initializer:
+
+```csharp
+var employee = new Employee
+{
+    Id = 1,
+    FullName = "John Smith",
+    HourlyRate = 25.50m
+};
+```
+
+**Positional** — the members live in the header:
+
+```csharp
+public record Employee(int Id, string FullName, decimal HourlyRate);
+```
+
+Construction goes through the generated constructor:
+
+```csharp
+var employee = new Employee(1, "John Smith", 25.50m);
+```
+
+The positional form is shorthand. The compiler expands it into roughly this:
+
+```csharp
+public record Employee
+{
+    public int Id { get; init; }
+    public string FullName { get; init; }
+    public decimal HourlyRate { get; init; }
+
+    public Employee(int id, string fullName, decimal hourlyRate)
+    {
+        Id = id;
+        FullName = fullName;
+        HourlyRate = hourlyRate;
+    }
+
+    public void Deconstruct(out int id, out string fullName, out decimal hourlyRate)
+    {
+        id = Id;
+        fullName = FullName;
+        hourlyRate = HourlyRate;
+    }
+}
+```
+
+Two things the positional form adds that the property-style form does **not**: a constructor and a `Deconstruct` method. That `Deconstruct` is why positional records tear apart so cleanly (see below).
+
+<NoteToSelf>
+A positional record header looks identical to a class with a *primary constructor* (`public class Employee(int Id, ...)`, C# 12). They are not the same. A class primary constructor creates constructor *parameters* — not auto-properties, no value equality, no `Deconstruct`, no `with`. The `record` keyword is what turns those parameters into init-only public properties and pulls in the whole equality machinery. Read the keyword, not the parentheses.
+</NoteToSelf>
+
+## Equality by value, not by reference
+
+This is the headline. A record compares field by field.
+
+```csharp
+var e1 = new Employee(1, "John", 25m);
+var e2 = new Employee(1, "John", 25m);
+
+Console.WriteLine(e1 == e2);        // True
+Console.WriteLine(e1.Equals(e2));   // True
+```
+
+The same shape written as a `class` compares references:
+
+```csharp
+public class EmployeeClass
+{
+    public int Id { get; set; }
+    public string FullName { get; set; }
+    public decimal HourlyRate { get; set; }
+}
+
+var c1 = new EmployeeClass { Id = 1, FullName = "John", HourlyRate = 25m };
+var c2 = new EmployeeClass { Id = 1, FullName = "John", HourlyRate = 25m };
+
+Console.WriteLine(c1 == c2);        // False — two different objects
+```
+
+To get value equality out of a class, all of this has to be written by hand. The record generates every line of it:
+
+```csharp
+// Compiler-generated for a record, roughly:
+public virtual bool Equals(Employee? other) =>
+    other is not null
+    && EqualityContract == other.EqualityContract
+    && Id == other.Id
+    && FullName == other.FullName
+    && HourlyRate == other.HourlyRate;
+
+public override int GetHashCode() =>
+    HashCode.Combine(EqualityContract, Id, FullName, HourlyRate);
+
+public static bool operator ==(Employee? left, Employee? right) =>
+    (object)left == right || (left?.Equals(right) ?? false);
+
+public static bool operator !=(Employee? left, Employee? right) => !(left == right);
+```
+
+Value equality also means a record works correctly as a dictionary key or set member without extra effort — the generated `GetHashCode` lines up with the generated `Equals`.
+
+```csharp
+var seen = new HashSet<Employee>();
+seen.Add(new Employee(1, "John", 25m));
+Console.WriteLine(seen.Contains(new Employee(1, "John", 25m))); // True
+```
+
+## Value equality, but still a reference type
+
+Value equality is about *comparison*, not *storage*. A `record` — meaning `record class` — is a reference type, exactly like a `class`: the variable holds a reference, the object lives on the heap, and two variables can point at the **same** object.
+
+```csharp
+var a = new Employee(1, "John", 25m);
+var b = a;                                 // same reference — one object, two names
+
+Console.WriteLine(ReferenceEquals(a, b));  // True — literally the same heap object
+```
+
+Contrast that with two *separate* objects that merely hold equal values:
+
+```csharp
+var a = new Employee(1, "John", 25m);
+var c = new Employee(1, "John", 25m);      // a different object, identical values
+
+Console.WriteLine(ReferenceEquals(a, c));  // False — two objects
+Console.WriteLine(a == c);                 // True  — value equality
+```
+
+So `==` returning `True` does not prove two variables share an object; it proves their fields match. `ReferenceEquals` asks the other question — "same object?" — which is the one a plain `class` answers with `==`.
+
+Why this rarely bites: a well-formed record is immutable (`init`-only), so aliasing is harmless — there is no setter through which one name could mutate what the other sees. The moment a record carries a mutable member (a `List`, a `set` property, a `record struct` with `set`), aliasing matters again: a change made through one reference is visible through every reference to that object.
+
+## Copy-and-change, without mutation
+
+Because a record leans on immutability, the language gives it a copy operator: `with`. It produces a new instance with selected members changed and everything else copied.
+
+```csharp
+var employee1 = new Employee(1, "John", 25m);
+
+var employee2 = employee1 with { HourlyRate = 30m };
+
+// employee1 -> (1, "John", 25)   unchanged
+// employee2 -> (1, "John", 30)   new instance
+```
+
+`with` performs a *shallow* copy — it clones the record and reassigns the named members. Nothing on the original moves.
+
+```csharp
+Console.WriteLine(employee1.HourlyRate); // 25 — original untouched
+Console.WriteLine(employee2.HourlyRate); // 30
+```
+
+This is the pattern that makes records pleasant for state that flows through a pipeline: each stage returns a modified copy instead of mutating shared data.
+
+```csharp
+var raised   = employee with { HourlyRate = employee.HourlyRate * 1.05m };
+var renamed  = raised   with { FullName = "John A. Smith" };
+```
+
+<NoteToSelf>
+Where `with` pays off against EF Core: query results used as read models or DTOs. If those are immutable records, nothing can quietly mutate them and have that edit flushed to the database on the next `SaveChanges`. The classic bug is handing a *tracked* entity to code that mutates it as if it were a throwaway copy — EF then persists the change. Records make "throwaway copy" literal: `with` yields a new, untracked object and leaves the tracked one untouched. The flip side: entities EF actually *tracks* are usually mutable classes, because change tracking works by mutating them. Records fit the read side; not, as a rule, the entity side.
+</NoteToSelf>
+
+## A readable `ToString` for free
+
+Records override `ToString` to print the type name and every member. Useful in logs and test output.
+
+```csharp
+var e = new Employee(1, "John Smith", 25.50m);
+Console.WriteLine(e);
+// Employee { Id = 1, FullName = John Smith, HourlyRate = 25.50 }
+```
+
+A class prints its type name only, which is rarely what a log needs.
+
+## Deconstruction: pulling a record apart
+
+Positional records generate `Deconstruct`, so they split into locals in one line — the same syntax tuples use.
+
+```csharp
+var employee = new Employee(1, "John", 25m);
+
+var (id, name, rate) = employee;
+// id = 1, name = "John", rate = 25
+```
+
+That plays directly into pattern matching:
+
+```csharp
+string Describe(Employee e) => e switch
+{
+    (_, _, > 50m)          => "senior rate",
+    (_, "John", _)         => "it's John",
+    var (_, n, r)          => $"{n} at {r:C}",
+};
+```
+
+Property-style records do not get `Deconstruct` unless it is written out manually.
+
+## `record class` versus `record struct`
+
+`record` on its own means `record class` — a reference type. Since C# 10 there is also `record struct`, a value type.
+
+```csharp
+public record class Money(decimal Amount, string Currency);   // reference type
+public record struct Point(int X, int Y);                     // value type
+```
+
+One trap: the positional members of a `record struct` are `get; set;` — **mutable** — by default, the opposite of `record class`, whose members are `get; init;`. To make a value-type record immutable, add `readonly`:
+
+```csharp
+public record struct MutablePoint(int X, int Y);          // X, Y are get; set;
+public readonly record struct FixedPoint(int X, int Y);   // X, Y are get; init;
+```
+
+Both still get value equality, `with`, and `ToString`. Reach for `readonly record struct` for small immutable values (coordinates, money, ids); reach for `record class` for everything else.
+
+A quick mental model: read `record` (or `record class`) as "a class with value-based equality and copy-with," and `record struct` as "a struct with those same record features." The `record` keyword adds behaviour; the `class` / `struct` half decides reference versus value storage.
+
+## Where a record can be declared: nested types and top-level files
+
+A record is a type, and a type can be declared almost anywhere another type can — including *inside* another type. This is nesting, and it works the same whether the inner type is a `class`, `record`, `struct`, or `enum`.
+
+```csharp
+public class Company
+{
+    public record Employee(int Id, string Name);   // nested inside Company
+}
+```
+
+The nested record is reached through the outer type's name:
+
+```csharp
+var employee = new Company.Employee(1, "John");
+```
+
+Nesting is about *scope*, not *ownership*. Declaring `Employee` inside `Company` does not make an `Employee` a member or a part of any `Company` instance — no `Company` object exists anywhere in `new Company.Employee(...)`. It only means the `Employee` type lives inside `Company`'s namespace and follows its accessibility rules. `Company.Employee` reads like a path to the type, and that is all it is.
+
+The relationship most code actually wants is *composition* — a class whose property is *of* a record type. There the record is a separate top-level type and the class merely refers to it:
+
+```csharp
+public class Company
+{
+    public Employee Ceo { get; set; }   // property whose type is Employee
+}
+
+public record Employee(int Id, string Name);
+```
+
+Two different questions: nesting asks "where is this type declared?"; composition asks "what types does this object hold?"
+
+<NoteToSelf>
+This clears up a classic first-file confusion. In a `Program.cs` that uses top-level statements, the executable lines are compiled into a `Main` method inside a generated `Program` class. A `record` (or `class`) declared in that same file, after the statements, is *not* dropped inside `Main` and *not* nested inside `Program` — the compiler emits it as its own top-level type, a **sibling** of `Program` in the same namespace. So a record sitting under top-level statements is just an ordinary type declaration that happens to share a file with some executable code: the statements become `Main`, the type declarations stand on their own. Type declarations and executable statements are separate worlds that only coexist in the file. (Nesting a type inside a class, above, is a deliberate, different act — not what top-level files do automatically.)
+</NoteToSelf>
+
+## Immutability is only skin-deep
+
+`init` locks a property after construction. It does **not** freeze what the property points at.
+
+```csharp
+public record Team(string Name, List<Employee> Members);
+
+var team = new Team("Platform", new List<Employee>());
+team.Members.Add(new Employee(1, "John", 25m)); // allowed — the list itself is mutable
+```
+
+Worse, value equality compares the `List` member by *reference*, so two teams with identical contents in different list instances are not equal:
+
+```csharp
+var a = new Team("Platform", new List<Employee> { new(1, "John", 25m) });
+var b = new Team("Platform", new List<Employee> { new(1, "John", 25m) });
+
+Console.WriteLine(a == b); // False — different list references
+```
+
+For genuinely value-comparable collections, use an immutable, value-comparing type (or a custom `Equals`). `ImmutableArray<T>` still compares by reference; a small wrapper or a sequence-equality check is needed for deep semantics.
+
+<NoteToSelf>
+Rule of thumb: a record is only as immutable and only as value-equal as its *members*. Records of records of primitives behave perfectly. Drop a mutable collection or a plain `class` inside and both guarantees leak. Keep record members to primitives, strings, other records, and immutable value types.
+</NoteToSelf>
+
+## Validation without losing the record
+
+An init-only property can still guard its input. The compiler-generated backing field is reachable through the `field` keyword, so no manual field declaration is needed:
+
+```csharp
+public record Employee
+{
+    public int Id { get; init; }
+    public string FullName { get; init; }
+
+    public decimal HourlyRate
+    {
+        get;
+        init
+        {
+            if (value < 0)
+                throw new ArgumentException("Rate cannot be negative");
+            field = value;
+        }
+    }
+}
+```
+
+For a *positional* record, validation goes in the property body the parameter maps to, or in the constructor:
+
+```csharp
+public record Employee(int Id, string FullName, decimal HourlyRate)
+{
+    public decimal HourlyRate { get; init; } =
+        HourlyRate >= 0
+            ? HourlyRate
+            : throw new ArgumentException("Rate cannot be negative");
+}
+```
+
+<NoteToSelf>
+`field` is a recent contextual keyword (stabilised around C# 14 / .NET 10; earlier it was preview). Before it existed, adding validation meant declaring a private backing field by hand — which is exactly the boilerplate records were meant to remove. Confirm the project's `<LangVersion>` before relying on it.
+</NoteToSelf>
+
+## Inheritance and the equality contract
+
+Records can inherit from records. The generated equality respects the runtime type through a hidden `EqualityContract` property, so a derived record never equals its base even when every shared value matches.
+
+```csharp
+public record Person(string Name);
+public record Employee(string Name, decimal HourlyRate) : Person(Name);
+
+Person p = new Person("John");
+Person e = new Employee("John", 25m);
+
+Console.WriteLine(p == e); // False — different EqualityContract
+```
+
+That is the behaviour that hand-written class equality almost always gets wrong.
+
+## When record, when class
+
+Use a **record** when the type *is data* — its values define it:
+
+```csharp
+public record Address(string City, string Province);
+public record Customer(int Id, string Name);
+public record OrderItem(int ProductId, int Quantity);
+public record EmployeeResponse(int Id, string FullName, decimal HourlyRate);
+```
+
+Natural fits: DTOs, API request/response models, configuration objects, messages and events, value objects, and anything where equality should depend on contents.
+
+Use a **class** when identity and behaviour matter more than the values it happens to hold right now:
+
+```csharp
+public class Employee
+{
+    public int Id { get; }
+    public string FullName { get; private set; }
+    public decimal HourlyRate { get; private set; }
+
+    public void GiveRaise(decimal amount) => HourlyRate += amount;
+}
+```
+
+Here the question is "is this the same employee?", not "do these two hold the same numbers?" The object has a lifecycle, mutating behaviour, and an identity independent of its current field values. That is a class.
+
+| | Record | Class |
+|---|---|---|
+| Storage | Reference type, on the heap (unless `record struct`) | Reference type, on the heap |
+| Identity | Its values | The object reference |
+| Equality | By value (generated) | By reference (default) |
+| Mutation | Copy with `with` | Mutate in place |
+| `ToString` | All members, generated | Type name only |
+| Best for | DTOs, values, messages, events | Entities, services, behaviour |
+
+## Gotchas worth remembering
+
+- **Same-shape ≠ same record.** Two different record types with identical members are never equal to each other; equality is per declared type.
+- **Mutable members defeat the point.** A `set` property or a mutable collection member breaks both immutability and value equality. Prefer `init` and value-like members.
+- **`record struct` is mutable by default.** Add `readonly` for an immutable value type.
+- **`with` is shallow.** Reference-typed members are shared between the original and the copy.
+- **Property-style records have no `Deconstruct`.** Only the positional form generates it.
+- **Nesting is scope, not ownership.** `Company.Employee` names a type declared inside `Company`; it does not make an employee part of any company instance.
+- **String case matters.** `FullName` and `Fullname` are two different members — C# is case-sensitive, and a mismatched cast or member name is a silent bug, not an error.
+
+## Handoff
+
+A record is the compiler writing the tedious, error-prone parts of a value type — equality, hashing, `ToString`, copy-with-change — so the declaration stays one line. The choice is not stylistic: pick a record when a type is defined by *what it holds*, a class when it is defined by *what it is and does*. The next note builds on this by looking at where these value types live in memory versus reference types, and why `record struct` and `record class` land in different places.

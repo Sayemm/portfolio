@@ -1,0 +1,328 @@
+---
+title: "C# IEnumerable<T>: the one contract everything iterable agrees to"
+date: "2026-08-25"
+status: "written"
+minutes: 17
+order: 3
+lead: "IEnumerable<T> is not a collection. It is a promise with a single method behind it — hand over elements one at a time — and that promise is what foreach, LINQ, yield, and lazy streaming are all built on. This note takes it apart from the interface down."
+---
+
+The main question: **what is `IEnumerable<T>` actually, why does the language hang iteration and LINQ off it instead of off `List<T>`, and what does producing or consuming one really involve?**
+
+The short version, then the depth: `IEnumerable<T>` is an *interface* — a contract — not a data structure. `List<T>`, arrays, `HashSet<T>`, dictionary views, and sequences conjured at runtime all sign that contract. Everything downstream (`foreach`, all of LINQ, deferred/streaming evaluation) is written against the contract, so it works on every signer at once.
+
+## One method — that is the entire contract
+
+Stripped down, this is `IEnumerable<T>`:
+
+```csharp
+public interface IEnumerable<out T> : IEnumerable
+{
+    IEnumerator<T> GetEnumerator();
+}
+```
+
+That is it. A single method that produces an *enumerator*. `IEnumerable<T>` itself has no `Count`, no indexer, no `Add`, no way to look at element five without walking through one to four first. It promises exactly one thing: *"a cursor over my elements can be requested."*
+
+Contrast the contracts:
+
+```
+List<T>           "I store items; add, remove, index, count them."   — large contract
+IEnumerable<T>    "I can hand you my items, one at a time."          — minimal contract
+```
+
+The smallness is the point. The fewer things a contract demands, the more types can satisfy it.
+
+## The real worker: `IEnumerator<T>`
+
+`GetEnumerator()` returns an `IEnumerator<T>` — the object that actually does the walking. It is a stateful cursor:
+
+```csharp
+public interface IEnumerator<out T> : IEnumerator, IDisposable
+{
+    T Current { get; }          // the element the cursor sits on
+}
+
+public interface IEnumerator          // the non-generic base
+{
+    bool MoveNext();            // advance; false when there is nothing left
+    object Current { get; }
+    void Reset();               // rarely implemented meaningfully
+}
+```
+
+So an enumerator offers: `MoveNext()` to step forward, `Current` to read where it stands, and `Dispose()` (via `IDisposable`) to release anything held. A fresh enumerator starts *before* the first element — the first `MoveNext()` moves onto element one.
+
+Two roles, kept separate on purpose:
+
+```
+IEnumerable<T>   the sequence         — "iteration is possible"
+IEnumerator<T>   the cursor over it   — "here is the current position, and a way to advance"
+```
+
+That separation is why one sequence can be enumerated by several independent cursors at the same time — each `GetEnumerator()` call returns its own position.
+
+## `foreach` is just enumerator calls
+
+`foreach` is syntax sugar. This loop:
+
+```csharp
+foreach (var item in source)
+    Handle(item);
+```
+
+compiles to roughly this:
+
+```csharp
+IEnumerator<T> e = source.GetEnumerator();
+try
+{
+    while (e.MoveNext())        // advance until exhausted
+    {
+        var item = e.Current;   // read current
+        Handle(item);
+    }
+}
+finally
+{
+    e.Dispose();               // always release, even on exception/break
+}
+```
+
+Understanding this desugaring explains several behaviours at once: why an exception mid-loop still disposes the enumerator, why a `break` is clean, and why implementing the interface is all it takes to make a custom type loopable.
+
+<NoteToSelf>
+`foreach` does not strictly require `IEnumerable<T>`. It is *pattern-based*: the compiler is happy with any type that exposes a public `GetEnumerator()` returning something with a `MoveNext()` and a `Current`. That is how `foreach` over `Span<T>` works with a `ref struct` enumerator that could never be boxed into the interface. Implementing `IEnumerable<T>` is the general, LINQ-compatible way to be iterable; the duck-typed pattern is the escape hatch for high-performance cases.
+</NoteToSelf>
+
+## Why an interface, and not extensions on `List<T>`
+
+This is the design question behind the whole feature. Imagine LINQ's `Where` written for the concrete type:
+
+```csharp
+// Hypothetical, and a dead end:
+public static List<T> Where<T>(this List<T> source, Func<T, bool> predicate) { ... }
+```
+
+It would serve `List<T>` and nothing else. Arrays, sets, dictionary values, generated sequences, and database results would each need their own copy. Instead LINQ targets the contract:
+
+```csharp
+public static IEnumerable<T> Where<T>(this IEnumerable<T> source, Func<T, bool> predicate) { ... }
+```
+
+Written once, it works on every type that implements `IEnumerable<T>`:
+
+```
+IEnumerable<T>   "you can enumerate my elements"
+|
++- List<T>                     array-backed, growable, indexable
++- T[]                         fixed-size array
++- HashSet<T>                  unique elements
++- Dictionary<K,V>.Values      a view over the values
++- (yield return ...)          a generated sequence, nothing stored
++- IQueryable<T>               a database query, run on enumeration
+```
+
+`list.Where(...)` compiles even though `Where` is not defined on `List<T>` — it is an extension method whose receiver is `IEnumerable<T>`, and `List<T>` *is* an `IEnumerable<T>`. This is the practical face of a core principle: **depend on the abstraction (enumeration) when that is all the code needs, not on a concrete collection.** A method that only iterates should take `IEnumerable<T>`, so any caller with any collection can pass it in.
+
+## The family: `IEnumerable<T>`, `ICollection<T>`, `IList<T>`
+
+`IEnumerable<T>` sits at the base of a hierarchy that adds capability step by step:
+
+```
+IEnumerable<T>              GetEnumerator only — walk forward, once per cursor
+|
++- ICollection<T>          + Count, Add, Remove, Clear, Contains, CopyTo
+|  |
+|  +- IList<T>             + this[index], Insert, RemoveAt   (List<T>, arrays)
+|
++- IReadOnlyCollection<T>  + Count                          (no mutation)
+   |
+   +- IReadOnlyList<T>     + this[index]                    (indexed, read-only)
+```
+
+Each level is a bigger promise. Choosing the right one is an API-design decision:
+
+- **Parameter types** — accept the *weakest* type the method actually uses. A method that only loops should ask for `IEnumerable<T>`; one that needs a count should ask for `IReadOnlyCollection<T>`; one that indexes should ask for `IReadOnlyList<T>`. Asking for `List<T>` when only iteration is needed rejects arrays and every other collection for no reason.
+- **Return types** — `IEnumerable<T>` signals "a sequence, possibly lazy, walk it." `IReadOnlyList<T>` signals "already materialized, safe to index and enumerate repeatedly." The choice communicates intent (see the multiple-enumeration trap below).
+
+## The quiet superpower: deferred execution
+
+`IEnumerable<T>` does not have to hold its elements. It can *compute* them on demand. Most LINQ operators exploit this: they build a description of work and run nothing until something enumerates.
+
+```csharp
+IEnumerable<int> query = numbers
+    .Where(x => { Console.WriteLine($"testing {x}"); return x > 2; })
+    .Select(x => x * 10);
+
+Console.WriteLine("query defined");   // prints first — nothing has run
+foreach (var n in query)              // NOW the Where/Select actually execute
+    Console.WriteLine(n);
+```
+
+Output order proves it: `"query defined"` appears before any `"testing"` line. The query is a recipe; enumeration is cooking. This enables pipelines that never build intermediate lists, and sequences with no backing storage at all — including infinite ones:
+
+```csharp
+IEnumerable<int> Naturals()
+{
+    int i = 0;
+    while (true) yield return i++;   // never ends
+}
+
+var firstTen = Naturals().Take(10).ToList();   // pulls exactly 10, then stops
+```
+
+`Take(10)` stops asking after ten elements, so the infinite producer only ever runs eleven `MoveNext` steps. Nothing tries to store infinity.
+
+## `yield return`: an enumerator without the boilerplate
+
+Writing an `IEnumerator<T>` by hand is fiddly. `yield return` lets a method *become* a sequence — the compiler builds the state machine:
+
+```csharp
+public IEnumerable<int> EvensUpTo(int max)
+{
+    for (int i = 0; i <= max; i += 2)
+        yield return i;      // pause here, hand out i, resume on next MoveNext
+}
+```
+
+Each `MoveNext()` runs the method until the next `yield return`, hands back that value as `Current`, and freezes all local state until the following `MoveNext()`. `yield break` ends the sequence early. Behind the scenes the compiler generates a class implementing both `IEnumerable<int>` and `IEnumerator<int>`, turning the locals into fields and the control flow into a resumable state machine — roughly what the next section writes out by hand.
+
+## Implementing `IEnumerable<T>` directly
+
+A custom type becomes iterable by implementing the interface. The easy way delegates to `yield`:
+
+```csharp
+public class IntRange : IEnumerable<int>
+{
+    private readonly int _start, _count;
+    public IntRange(int start, int count) { _start = start; _count = count; }
+
+    public IEnumerator<int> GetEnumerator()
+    {
+        for (int i = 0; i < _count; i++)
+            yield return _start + i;
+    }
+
+    // Required: IEnumerable<T> inherits the non-generic IEnumerable.
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+foreach (var n in new IntRange(10, 3)) Console.Write($"{n} ");   // 10 11 12
+```
+
+The explicit `IEnumerator IEnumerable.GetEnumerator()` is mandatory boilerplate: `IEnumerable<T>` extends the old non-generic `IEnumerable`, so both methods must exist. It is implemented explicitly and simply forwards to the generic one.
+
+To see what `yield` hides, the same cursor written manually:
+
+```csharp
+public class IntRangeEnumerator : IEnumerator<int>
+{
+    private readonly int _start, _count;
+    private int _index = -1;                 // start "before" the first element
+
+    public IntRangeEnumerator(int start, int count) { _start = start; _count = count; }
+
+    public int Current => _start + _index;   // read current position
+    object IEnumerator.Current => Current;
+
+    public bool MoveNext() => ++_index < _count;   // advance; false when done
+    public void Reset() => _index = -1;
+    public void Dispose() { }                       // nothing held here
+}
+```
+
+`_index` is the entire state; `MoveNext` advances it; `Current` projects it. `yield return` generates a more elaborate version of exactly this.
+
+## The trap deferred execution sets: enumerating twice
+
+Because a lazy `IEnumerable<T>` re-runs its pipeline on every enumeration, touching one twice does the work twice:
+
+```csharp
+IEnumerable<int> q = source.Where(Expensive);   // deferred — nothing yet
+
+int count = q.Count();     // enumeration #1 — runs Expensive over the whole source
+int first = q.First();     // enumeration #2 — runs Expensive AGAIN from the start
+```
+
+Worse when the source itself is one-shot (a network stream, a `yield` reading a file), where the second pass may yield different results or fail outright. The fix is to *materialize* once:
+
+```csharp
+List<int> results = source.Where(Expensive).ToList();   // run the pipeline one time
+int count = results.Count;        // O(1), no re-run
+int first = results[0];           // no re-run
+```
+
+<NoteToSelf>
+"Possible multiple enumeration of IEnumerable" is the analyzer warning that names this bug. Rule of thumb: an `IEnumerable<T>` parameter that will be read more than once, or read then checked for count, gets `ToList()` (or `ToArray()`) at the top of the method. Returning `IEnumerable<T>` from a method quietly passes this hazard to callers — return `IReadOnlyList<T>` when the result is already materialized, so the type itself says "safe to enumerate repeatedly."
+</NoteToSelf>
+
+## Covariance: `IEnumerable<out T>`
+
+The `out` in `IEnumerable<out T>` makes it *covariant* — a sequence of a derived type is usable as a sequence of a base type:
+
+```csharp
+IEnumerable<string> strings = new List<string> { "a", "b" };
+IEnumerable<object> objects = strings;      // legal — every string is an object
+```
+
+This is safe precisely because the contract only ever *produces* `T` and never *accepts* one; a producer of strings is a valid producer of objects. A mutable `List<T>` is not covariant, because it also takes `T` in (via `Add`), where the substitution would be unsound.
+
+## Count is not free, and other cost realities
+
+`IEnumerable<T>` makes no performance promises beyond "forward, once per cursor." Consequences worth internalizing:
+
+- **No O(1) count.** `Enumerable.Count()` walks the whole sequence — unless the concrete type is an `ICollection<T>` (like `List<T>` or an array), in which case LINQ shortcuts to its `.Count` property. So the same `Count()` call is O(1) on a list and O(n) on a `yield` sequence.
+- **No indexing.** `ElementAt(5)` on a bare `IEnumerable<T>` walks five steps; on an `IList<T>` LINQ shortcuts to the indexer.
+- **Enumerator allocation.** Each `foreach` allocates an enumerator. `List<T>` returns a *struct* enumerator to avoid that when looped directly, but casting the list to `IEnumerable<T>` boxes it back onto the heap — a real cost in hot loops.
+
+The lesson is not "avoid `IEnumerable<T>`" but "know that its guarantees are minimal, and reach for a richer type when count, indexing, or repeated cheap access matters."
+
+## Mutation during enumeration is forbidden
+
+Enumerating a standard collection while structurally modifying it throws:
+
+```csharp
+var list = new List<int> { 1, 2, 3 };
+foreach (var n in list)
+    if (n == 2) list.Remove(n);      // InvalidOperationException: collection was modified
+```
+
+The built-in enumerators track a version stamp and fail fast rather than skip or double-visit elements. Collect the changes and apply them after the loop, or iterate a copy (`foreach (var n in list.ToList())`), or loop an index backward for in-place removal.
+
+## The non-generic ancestor, and the async successor
+
+Two neighbours worth placing:
+
+- **`IEnumerable` (non-generic)** predates generics. Its `Current` is `object`, so iterating value types through it *boxes* every element. It survives only because `IEnumerable<T>` inherits from it for backward compatibility. New code targets the generic form exclusively.
+- **`IAsyncEnumerable<T>`** (C# 8) is the streaming counterpart for asynchronous sources — its `MoveNextAsync()` returns a task, and it is consumed with `await foreach`. It is the same idea (pull one element at a time, lazily) extended to sequences whose next element requires awaiting I/O.
+
+```csharp
+await foreach (var line in ReadLinesAsync(path))   // pulls each line as it arrives
+    Process(line);
+```
+
+## Empty is not null
+
+A method returning `IEnumerable<T>` should return an empty sequence, never `null` — callers expect to `foreach` the result without a guard. `Enumerable.Empty<T>()` provides a cached, allocation-free empty sequence:
+
+```csharp
+public IEnumerable<Order> FindOrders(int customerId) =>
+    _cache.TryGetValue(customerId, out var orders)
+        ? orders
+        : Enumerable.Empty<Order>();   // not null
+```
+
+## Gotchas worth remembering
+
+- **Deferred means re-run.** A lazy sequence executes its pipeline every time it is enumerated; materialize with `ToList()`/`ToArray()` before reading it twice.
+- **`Count()` can be O(n).** It is only cheap when the underlying type carries a count; a bare `IEnumerable<T>` does not.
+- **Returning `IEnumerable<T>` exports laziness.** The caller inherits both the streaming benefit and the multiple-enumeration hazard; pick the return type deliberately.
+- **The non-generic `GetEnumerator` is required** when implementing `IEnumerable<T>` — implement it explicitly and forward to the generic one.
+- **Do not mutate a collection mid-`foreach`** — it throws by design.
+- **`foreach` is pattern-based**, so a type can be loopable without implementing the interface, but only the interface makes it LINQ-able.
+- **Return empty, not `null`**, from sequence-producing methods.
+
+## Handoff
+
+`IEnumerable<T>` is a one-method contract — *give me a cursor* — and that minimalism is its power: every collection and every generated sequence can honour it, so `foreach`, LINQ, and lazy streaming are written once against the contract and work everywhere. Its cursor, `IEnumerator<T>`, is the small state machine that `yield return` generates automatically. Its deferred nature is both the feature (pipelines, infinite sequences, no wasted materialization) and the trap (multiple enumeration). The next note follows the sequence one layer up — into LINQ itself: how the operators chain, which ones defer and which force execution, and why `ToList()` is the boundary between the two.

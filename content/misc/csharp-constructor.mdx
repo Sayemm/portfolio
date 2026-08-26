@@ -1,0 +1,354 @@
+---
+title: "C# Constructors and properties: how an object gets built and holds its state"
+date: "2026-08-25"
+status: "written"
+minutes: 14
+order: 2
+lead: "Every new runs a constructor, whether one is written or not. What the constructor sets, a property stores — behind a backing field, guarded by value. This note covers both halves: how objects come into being, and how their state is kept."
+---
+
+The main question: **what actually happens when `new` runs, and how do properties store and protect the values a constructor puts into them?**
+
+Two mechanisms sit under every stateful object. A **constructor** decides how the object starts. A **property** decides how each piece of that state is read, written, and guarded afterward. They are usually taught apart; in practice they are one story.
+
+## Every `new` calls a constructor
+
+There is no way to use `new` without a constructor running. The syntax varies; the mechanism does not.
+
+```csharp
+class Person
+{
+    public string Name { get; set; }
+    public int Age { get; set; }
+
+    public Person() { }
+    public Person(string name) => Name = name;
+}
+```
+
+```csharp
+var a = new Person();                              // parameterless constructor
+var b = new Person("John");                        // parameterized constructor
+var c = new Person { Name = "John", Age = 25 };    // parameterless ctor, then initializer
+var d = new Person("John") { Age = 25 };           // parameterized ctor, then initializer
+Person e = new("John");                            // target-typed new (C# 9), same ctor
+```
+
+An **object initializer** — the `{ Name = ... }` block — is not a separate creation path. It runs *after* a constructor. The last two lines are shorthand for:
+
+```csharp
+var c = new Person();
+c.Name = "John";
+c.Age = 25;
+```
+
+So the honest picture:
+
+```text
+new Person()                   -> parameterless constructor
+new Person("John")             -> parameterized constructor
+new Person { Name = "John" }   -> parameterless ctor, then object initializer
+new("John")                    -> parameterized, target-typed
+```
+
+"Creating an object without a constructor" via `new` is not a thing. Bypassing the constructor entirely requires *not* using `new` — covered at the end.
+
+## The free constructor disappears the moment one is written
+
+A class with no constructor gets an implicit parameterless one from the compiler.
+
+```csharp
+class Person { }              // usable as new Person()
+// is roughly:
+class Person { public Person() { } }
+```
+
+Define **any** constructor and that free one is gone.
+
+```csharp
+class Person
+{
+    public Person(string name) => Name = name;
+    public string Name { get; }
+}
+
+var p = new Person();     // COMPILE ERROR — no parameterless constructor exists
+var q = new Person("John"); // fine
+```
+
+To keep both, declare both. This is a common surprise: adding a parameterized constructor silently removes the ability to write `new Person()`.
+
+## Overloading and chaining: one constructor calling another
+
+Multiple constructors can coexist as long as their parameter lists differ. To avoid repeating setup, one constructor delegates to another with `this(...)`.
+
+```csharp
+class Person
+{
+    public string Name { get; }
+    public int Age { get; }
+
+    public Person(string name, int age)
+    {
+        Name = name;
+        Age = age;
+    }
+
+    // Delegates to the constructor above, supplying a default age.
+    public Person(string name) : this(name, 0) { }
+
+    public Person() : this("Unknown") { }
+}
+```
+
+`new Person()` now runs `this("Unknown")`, which runs `this("Unknown", 0)`, which sets both fields — one real body, reused three ways.
+
+For inheritance, `base(...)` calls the parent constructor:
+
+```csharp
+class Employee : Person
+{
+    public decimal HourlyRate { get; }
+
+    public Employee(string name, int age, decimal rate) : base(name, age)
+    {
+        HourlyRate = rate;
+    }
+}
+```
+
+If `base(...)` is omitted, the compiler inserts a call to the parameterless base constructor. When the base has no parameterless constructor, the call must be explicit or the code will not compile.
+
+## What runs, and in what order
+
+For a single class, construction is two steps:
+
+1. **Field initializers** run, top to bottom.
+2. The **constructor body** runs.
+
+```csharp
+class Widget
+{
+    public int A = 1;            // (1) initializer
+    public int B;
+
+    public Widget()
+    {
+        B = A + 1;               // (2) body — A is already 1 here
+    }
+}
+```
+
+With inheritance the order is easy to get wrong. Creating a `Derived`:
+
+1. `Derived` field initializers run.
+2. `base(...)` is entered → `Base` field initializers run → `Base` constructor body runs.
+3. `Derived` constructor body runs.
+
+<NoteToSelf>
+Consequence: derived field initializers run *before* the base constructor body. So a `virtual` method called from a base constructor will hit the derived override while the derived *constructor body* has not run yet. Derived field *initializers* have run, but anything the derived constructor was going to set is still at its default. Never call virtual/overridable methods from a constructor for exactly this reason.
+</NoteToSelf>
+
+## Constructors that only run once, per type
+
+A **static constructor** initializes the type itself, not an instance. It runs a single time, automatically, before the first use of the type. No access modifier, no parameters.
+
+```csharp
+class Config
+{
+    public static readonly string Environment;
+
+    static Config()   // runs once, before Config is first touched
+    {
+        Environment = ReadEnvironmentOrDefault();
+    }
+}
+```
+
+Use it for expensive one-time setup or to initialize `static readonly` fields that need logic. It cannot be called manually and its timing is controlled by the runtime.
+
+## Primary constructors: parameters in the header (C# 12)
+
+Since C# 12, a plain class or struct can declare constructor parameters inline. These parameters are in scope for the whole body.
+
+```csharp
+class Person(string name, int age)
+{
+    public string Name { get; } = name;   // initialize a property from the parameter
+    public int Age { get; } = age;
+
+    public string Describe() => $"{name} is {age}";  // params usable in methods too
+}
+```
+
+<NoteToSelf>
+A class primary constructor is *not* a positional record. It creates constructor *parameters*, not public auto-properties, and brings no value equality, no `with`, no `Deconstruct`. `Person(string name, int age)` on a `class` and the same on a `record` look identical and behave completely differently. The `record` keyword is what upgrades the parameters into init-only properties plus the equality machinery.
+</NoteToSelf>
+
+## Properties: an auto-property is a field plus two methods
+
+A constructor sets values; a property is how those values are stored and exposed. The shortest form is an **auto-property**:
+
+```csharp
+public string Name { get; set; }
+```
+
+The compiler expands this into a hidden **backing field** and two accessor methods:
+
+```csharp
+private string <Name>k__BackingField;          // generated, not nameable in code
+public string Name
+{
+    get { return <Name>k__BackingField; }
+    set { <Name>k__BackingField = value; }
+}
+```
+
+`get` and `set` are methods. `Name` is not a variable — it is a pair of method calls dressed up as one. That is why a property can validate, compute, or log while a plain public field cannot.
+
+## `value`: the implicit parameter of a setter
+
+Inside a `set` (or `init`) accessor, the incoming assignment is available as a contextual keyword: **`value`**. It is the argument passed to the setter method.
+
+```csharp
+public decimal HourlyRate
+{
+    get => _hourlyRate;
+    set
+    {
+        if (value < 0)                 // "value" = whatever was assigned
+            throw new ArgumentException("Rate cannot be negative");
+        _hourlyRate = value;
+    }
+}
+private decimal _hourlyRate;
+```
+
+When code writes `employee.HourlyRate = 25m`, the compiler calls the setter with `value` bound to `25m`. Its type is always the property's type. There is no way to rename it — `value` is fixed.
+
+## The explicit backing field, and the `field` keyword that replaces it
+
+The example above declared `_hourlyRate` by hand because the setter needed logic. That manual field is boilerplate. A recent language feature, the **`field` keyword**, exposes the compiler-generated backing field directly inside an accessor:
+
+```csharp
+public decimal HourlyRate
+{
+    get;
+    set
+    {
+        if (value < 0)
+            throw new ArgumentException("Rate cannot be negative");
+        field = value;     // "field" = the auto-generated backing field
+    }
+}
+```
+
+No `_hourlyRate` declaration, same behaviour. `field` and `value` are the two contextual keywords that make a property body work: `value` is what is coming in, `field` is where it is stored.
+
+<NoteToSelf>
+`field` stabilised around C# 14 / .NET 10 (preview before that). Check `<LangVersion>` before using it. Until then, a validating setter still needs a hand-declared backing field. Also: if the type already has a member literally named `field`, the keyword is shadowed — the classic reason to prefix backing fields with `_`.
+</NoteToSelf>
+
+## The mutability ladder: `set`, `init`, get-only
+
+Three ways to control when a property can be written:
+
+```csharp
+public string A { get; set; }   // writable any time
+public string B { get; init; }  // writable only in a constructor or object initializer
+public string C { get; }        // writable only in a constructor (or its own initializer)
+```
+
+```csharp
+var p = new Person { B = "x" };   // fine — init during initializer
+p.B = "y";                        // COMPILE ERROR — init is closed after construction
+```
+
+A get-only auto-property (`C`) has a backing field the compiler will let the constructor assign, and nothing else. `init` widens that slightly to also allow object initializers. This is the mechanism records lean on for immutability.
+
+## Access modifiers can differ per accessor
+
+The two accessors can have different visibility. Common pattern: readable everywhere, writable only inside the class.
+
+```csharp
+public decimal HourlyRate { get; private set; }
+
+public void GiveRaise(decimal amount) => HourlyRate += amount;  // ok, inside the class
+// outside: employee.HourlyRate = 50m;  // COMPILE ERROR — setter is private
+```
+
+The accessor modifier must be *more* restrictive than the property's own.
+
+## Computed properties store nothing
+
+A property need not have a backing field at all. An expression-bodied getter computes a value on each read.
+
+```csharp
+public string FirstName { get; init; }
+public string LastName  { get; init; }
+
+public string FullName => $"{FirstName} {LastName}";   // no storage, recomputed each access
+```
+
+`FullName` is a getter method and nothing else — there is no setter and no field. Useful for derived values that should never drift out of sync with their inputs.
+
+## `required`: forcing the caller to set a property (C# 11)
+
+A property marked `required` must be assigned in an object initializer (or set by a constructor annotated to satisfy it), which lets a type demand values without writing a big constructor.
+
+```csharp
+class Person
+{
+    public required string Name { get; init; }
+    public int Age { get; init; }
+}
+
+var p = new Person { Name = "John" };  // ok
+var q = new Person { Age = 25 };       // COMPILE ERROR — Name is required
+```
+
+This pairs naturally with `init`: immutable *and* mandatory, without a hand-written constructor.
+
+## Creating an object without a constructor
+
+Using `new` always runs a constructor. Some mechanisms sidestep `new` — and some sidestep the constructor too:
+
+```csharp
+// 1. Activator — reflection; still calls a constructor.
+var p1 = (Person)Activator.CreateInstance(typeof(Person), "John")!;
+
+// 2. MemberwiseClone — shallow copy; no constructor runs.
+class Person
+{
+    public string Name { get; set; }
+    public Person Copy() => (Person)MemberwiseClone();
+}
+
+// 3. Deserialization — behaviour depends on the serializer.
+//    System.Text.Json uses a constructor; some formatters bypass it entirely.
+var p2 = JsonSerializer.Deserialize<Person>(json);
+
+// 4. Dependency injection — the container calls a constructor for you.
+//    (still a constructor, just not written at the call site)
+
+// 5. default(T) for a struct — zeroes every field, no constructor.
+Point origin = default;   // struct: all fields 0
+```
+
+<NoteToSelf>
+`RuntimeHelpers.GetUninitializedObject` (formerly `FormatterServices.GetUninitializedObject`) creates an instance with **no** constructor and **no** field initializers — every field left at its default. Serializers use it; application code almost never should, because it can produce an object in a state the class's own invariants say is impossible.
+</NoteToSelf>
+
+## Gotchas worth remembering
+
+- **Defining a constructor removes the free parameterless one.** Re-add it explicitly if `new T()` must still work.
+- **`value` and `field` are contextual keywords**, not variables to declare — `value` is the setter's input, `field` is its storage.
+- **Auto-properties always have a backing field**, even the get-only ones; the field just isn't nameable.
+- **Field initializers run before the constructor body**, and in inheritance, derived initializers run before the base body.
+- **Never call virtual methods from a constructor** — the override runs against a half-built object.
+- **`init` closes after construction**; it is not "set once ever," it is "set until the object is done being built."
+- **A computed property has no setter and no storage** — assigning to it is a compile error, by design.
+
+## Handoff
+
+A constructor is the one guaranteed entry point for `new`, running field initializers then its body, chaining through `this` and `base`, and — since C# 12 — able to live in the type header. A property is the guarded gate to each value it sets: an auto-property hides a backing field; `value` names the input; `field` names the storage; `set` / `init` / get-only decide when writes are allowed. Together they answer *how an object is built* and *how it keeps what it was built with*. The next note looks at where that state lives once construction finishes — stack versus heap, and how `struct` and `class` split along that line.
