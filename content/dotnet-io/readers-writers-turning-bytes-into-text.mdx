@@ -1,0 +1,160 @@
+---
+title: "Readers and writers: turning bytes into text"
+date: 2026-08-27
+status: written
+minutes: 12
+order: 3
+lead: 'Streams move bytes, but code wants lines and whole strings. Readers and writers are the layer that translates between the two — StreamReader and StreamWriter for byte streams, StringReader and StringWriter for in-memory strings. This is the layer the original CSV code was actually using.'
+---
+
+Part 2 ended on a cliffhanger: a stream deals in bytes only, and working with text through raw bytes is miserable. This part adds the layer that fixes that. It is also the part where the `StringReader` and `StreamWriter` from the CSV code stop being mysterious.
+
+## The job: characters, lines, and strings
+
+A stream hands over bytes. A program wants to call `ReadLine()` and get back `"Dune,Frank Herbert,Sci-Fi"`, or call `WriteLine("...")` and have it turned into bytes correctly. The gap between those two is the reader/writer layer.
+
+Its one responsibility is the **bytes-to-characters translation**, in both directions:
+
+<Diagram title="StreamReader turns a byte stream into text">
+  <DiagramRow>
+    <DiagramNode title="FileStream" sub="bytes" />
+    <DiagramArrow label="StreamReader" />
+    <DiagramNode title="text" sub="ReadLine(), ReadToEnd()" />
+  </DiagramRow>
+</Diagram>
+
+<Diagram title="StreamWriter turns text into a byte stream">
+  <DiagramRow>
+    <DiagramNode title="text" sub="Write(), WriteLine()" />
+    <DiagramArrow label="StreamWriter" />
+    <DiagramNode title="MemoryStream" sub="bytes" />
+  </DiagramRow>
+</Diagram>
+
+Turning bytes into characters requires knowing the **encoding** — the rule for which byte patterns mean which letters. Readers and writers over a stream carry an encoding (UTF-8 by default) to do exactly that. Encoding gets a full part of its own later; for now, "UTF-8 by default" is enough.
+
+## TextReader and TextWriter: the shared shape
+
+Just as `Stream` is the abstract base for all byte streams, **`TextReader`** and **`TextWriter`** are the abstract bases for all *character* readers and writers. They define the character-level operations that every concrete reader or writer supports:
+
+| Method | Side | What it does |
+|---|---|---|
+| `ReadLine()` | reader | read one line of text; returns `null` at the end |
+| `ReadToEnd()` | reader | read all remaining text into a single string |
+| `Read()` | reader | read the next single character (as an `int`; `-1` at the end) |
+| `Write(value)` | writer | write text, no line break added |
+| `WriteLine(value)` | writer | write text followed by a line terminator |
+| `Flush()` | writer | push buffered characters down into the underlying stream |
+
+This shared shape is the key to the whole layer. Anything that needs to *read text* can ask for a `TextReader` and not care where the characters come from. That is the promise the CSV parser relies on, as the last section shows.
+
+## StreamReader and StreamWriter: text over a byte stream
+
+These are the workhorses. A **`StreamReader`** wraps a `Stream` and reads characters out of it; a **`StreamWriter`** wraps a `Stream` and writes characters into it.
+
+Reading a file line by line:
+
+```csharp
+using var stream = new FileStream("books.csv", FileMode.Open);
+using var reader = new StreamReader(stream);   // bytes -> characters (UTF-8 by default)
+
+string? line;
+while ((line = reader.ReadLine()) != null)     // one line at a time; null ends the loop
+{
+    Console.WriteLine(line);
+}
+```
+
+`StreamReader` also has a shortcut constructor that takes a path and opens the file itself, so the `FileStream` does not have to be created by hand:
+
+```csharp
+using var reader = new StreamReader("books.csv");
+string everything = reader.ReadToEnd();        // the whole file as one string
+```
+
+Writing text into a `MemoryStream` — the shape the CSV write side uses:
+
+```csharp
+using var stream = new MemoryStream();
+using var writer = new StreamWriter(stream);    // characters -> bytes into the stream
+
+writer.WriteLine("title,author,genre");
+writer.WriteLine("Dune,Frank Herbert,Sci-Fi");
+writer.Flush();                                 // push buffered characters into the stream
+
+byte[] bytes = stream.ToArray();                // the finished text, as bytes
+```
+
+That `Flush()` before `ToArray()` is not optional, and Part 4 explains why in full. For now, notice that the writer and the stream are two different objects: the writer holds characters that have not reached the stream yet until it is flushed.
+
+## StringReader and StringWriter: text over a string
+
+The stream-based pair translates bytes to characters. The **string-based** pair skips bytes entirely, because a string is *already* characters. No stream, no encoding — just an in-memory source or sink of text.
+
+**`StringReader`** wraps an existing string and presents it as a `TextReader`:
+
+```csharp
+var csvText = "title,author,genre\nDune,Frank Herbert,Sci-Fi";
+using var reader = new StringReader(csvText);   // present the string as a TextReader
+
+string header = reader.ReadLine();   // "title,author,genre"
+string first  = reader.ReadLine();   // "Dune,Frank Herbert,Sci-Fi"
+```
+
+**`StringWriter`** collects written text and hands it back as a string:
+
+```csharp
+using var writer = new StringWriter();
+writer.WriteLine("title,author,genre");
+writer.WriteLine("Dune,Frank Herbert,Sci-Fi");
+
+string result = writer.ToString();   // the whole thing as a string, no bytes involved
+```
+
+Because there are no bytes, there is nothing to encode and nothing to flush to disk. `StringReader` and `StringWriter` are the in-memory conveniences that let string data ride the same rails as file data.
+
+## The whole family at a glance
+
+| Class | Direction | Wraps | Encoding? | Reach for it when |
+|---|---|---|---|---|
+| `StreamReader` | read text | a `Stream` (bytes) | yes | reading text from a file or any byte stream |
+| `StreamWriter` | write text | a `Stream` (bytes) | yes | writing text to a file or any byte stream |
+| `StringReader` | read text | a `string` (chars) | no | feeding an in-memory string to something that wants a reader |
+| `StringWriter` | write text | a `StringBuilder` (chars) | no | collecting written text back into a string |
+
+Left column is what to use; the deciding question is simply whether the data is a byte stream (Stream pair) or already an in-memory string (String pair).
+
+## Why the CSV code wanted a TextReader, not a string
+
+Now the original line makes complete sense:
+
+```csharp
+using var reader = new StringReader(csvContent);
+using var csv = new CsvReader(reader, configuration);
+```
+
+`CsvReader`'s constructor asks for a **`TextReader`** — because its job is text-to-objects, and text is what a `TextReader` provides. It does not ask for a `string`, a `Stream`, or a file path. It asks for the *abstraction*.
+
+`StringReader` is a `TextReader`. So is `StreamReader`. That single fact is what makes the parser flexible:
+
+- CSV sitting in a string in memory? Wrap it in a `StringReader` and pass that.
+- CSV sitting in a file on disk? Wrap the file's stream in a `StreamReader` and pass that instead.
+
+Either way, the `CsvReader` line is identical — it only ever sees a `TextReader`. The write side mirrors this exactly: `CsvWriter` takes a `TextWriter`, and both `StreamWriter` and `StringWriter` are `TextWriter`s, so the same writer code can target a file, a `MemoryStream`, or a plain string.
+
+> **The pattern to keep:** parsers accept the abstraction (`TextReader` / `TextWriter`), never the concrete source. To use a parser with a new kind of source, the only thing that changes is which reader or writer is wrapped around it. This is the same "depend on the abstraction" idea that runs through the whole framework — the parser is written once and works against files, memory, and strings without a single change.
+
+## A note on cleanup
+
+Both `StreamReader` and `StreamWriter` hold onto the stream they wrap, and by default they **dispose that stream** when they themselves are disposed. That is usually convenient — one `using` on the reader cleans up the file underneath too — but it occasionally surprises, when the underlying stream needs to outlive the reader. There is a `leaveOpen` option for exactly that case. Disposal, ordering, and `leaveOpen` are the subject of Part 5; this is just a flag to file away.
+
+## What this part covered
+
+- Readers and writers translate **bytes and characters**, the job a bare stream refuses to do.
+- **`TextReader`** and **`TextWriter`** are the abstract bases that define character operations like `ReadLine` and `WriteLine`.
+- **`StreamReader` / `StreamWriter`** wrap a byte stream and carry an encoding; **`StringReader` / `StringWriter`** wrap an in-memory string and need no encoding.
+- A parser like `CsvReader` accepts a `TextReader`, which is why the same parser serves a file or an in-memory string unchanged.
+
+## What comes next
+
+**Part 4** zooms in on the `Flush()` that keeps appearing: **buffering**. Why a `StreamWriter` holds characters back instead of writing them through immediately, why `ToArray()` before a flush can return half a file, and what `AutoFlush` and disposal do about it. This is the concept behind the ordering rules in the CSV write code.

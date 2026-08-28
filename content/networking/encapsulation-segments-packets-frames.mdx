@@ -53,7 +53,7 @@ The receiving host does the exact reverse, called **de-encapsulation**. The bits
 
 So the full journey is symmetric — one layer adds a header on the way down, and the *same* layer removes it on the way up:
 
-```
+```text
 sending host  (encapsulate, top -> down):
 
   [ data ]                              application data
@@ -73,7 +73,7 @@ With encapsulation understood, the entire OSI model collapses into a single summ
 
 ![The OSI model summarised — PDU, function, addressing, and devices per layer](/images/networking/osi-summary.png)
 
-```
+```text
 layer          PDU       function           addressing      devices
 -----          ---       --------           ----------      -------
 4 Transport    segment   service to service  TCP/UDP ports   hosts

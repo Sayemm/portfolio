@@ -1,0 +1,132 @@
+---
+title: "Streams: the universal pipe of bytes"
+date: 2026-08-27
+status: written
+minutes: 11
+order: 2
+lead: 'A stream is the layer at the bottom of the I/O stack — a cursor over a sequence of bytes, with a tiny set of operations that never changes no matter where the bytes live. Learn it once and a file, a socket, and an in-memory buffer all become the same thing.'
+---
+
+Part 1 drew the whole stack. This part goes to the bottom of it: the `Stream`. Everything else in the series — readers, writers, the CSV parser — sits on top of a stream, so this is the layer to get solid first.
+
+## What a stream actually is
+
+A **stream** is an abstraction over a sequence of bytes that can be read from, written to, or both — one chunk at a time, in order. The mental image is a pipe: bytes flow through it, and a **cursor** (called the *position*) marks where in the sequence the next read or write will happen.
+
+Three ideas make up the whole concept:
+
+- **Bytes, not meaning.** A stream moves raw bytes. It has no idea whether those bytes are text, an image, or a CSV. Interpreting them is a job for the layers above.
+- **A moving cursor.** The stream remembers a current position. Reading or writing advances it. This is what makes a stream *sequential* — it walks forward through the bytes rather than seeing them all at once.
+- **One shape, many backings.** `Stream` is an abstract base class. Concrete streams fill in *where* the bytes actually live, but they all expose the identical set of operations.
+
+That last point is the reason streams exist. Code written against `Stream` does not care what is underneath it:
+
+<Diagram title="The same read code, any source">
+  <DiagramRow>
+    <DiagramNode title="your code" sub="talks to a Stream" />
+    <DiagramArrow label="Read(...)" />
+    <DiagramNode title="Stream" sub="any implementation" />
+  </DiagramRow>
+</Diagram>
+
+Whether that `Stream` is a file, a network socket, or a block of memory, the calling code is byte-for-byte the same. Only the object handed in at the start changes.
+
+## The cursor: position moves as bytes flow
+
+A fresh stream sits at position 0. Each read or write advances the position by however many bytes were moved. Picture a small stream holding the bytes for `"Hi!"`:
+
+```text
+Position 0
+ v
+[ 72 | 105 | 33 ]
+  H     i    !
+```
+
+After reading two bytes, the cursor has moved forward, and the next read starts where the last one stopped:
+
+```text
+             Position 2
+              v
+[ 72 | 105 | 33 ]
+  H     i    !     <- the next Read() begins here, returning just 33
+```
+
+This forward-only-by-default behaviour is why a stream is a *stream* and not an array. An array lets any element be touched at any time; a stream is walked. Some streams also allow *seeking* — jumping the cursor to an arbitrary position — but not all do (a live network connection cannot rewind time).
+
+## The operations every stream shares
+
+The entire `Stream` contract is small. These are the members that matter:
+
+| Member | What it does |
+|---|---|
+| `Read(buffer, offset, count)` | copy up to `count` bytes into `buffer`; returns how many were actually read (0 means the end) |
+| `Write(buffer, offset, count)` | write `count` bytes from `buffer` into the stream, advancing the position |
+| `Position` | the current byte offset of the cursor; can be set on seekable streams |
+| `Length` | the total number of bytes, when the stream knows it |
+| `Seek(offset, origin)` | move the cursor relative to the start, current position, or end |
+| `Flush()` | push any bytes still held in an internal buffer down to the backing store |
+| `Dispose()` | release the underlying resource (file handle, socket) when finished |
+
+Notice that `Read` and `Write` deal in `byte[]` — raw bytes. There is no `ReadString`, no `ReadLine`, no notion of characters at all. That is deliberate, and it is exactly why the next layer up exists.
+
+## Streams speak bytes, not text
+
+Working with a stream directly means working with byte arrays, which is painful for text. Reading a line of a CSV as raw bytes would mean scanning for the newline byte, then decoding the bytes into characters by hand.
+
+Nobody does that. Instead a stream gets wrapped in a **reader** or **writer** (Part 3) that handles the byte-to-character translation. The stream's job ends at "move these bytes"; turning them into `"The Hobbit"` is someone else's job. Keeping the stream ignorant of text is what lets the same stream carry a CSV, a JPEG, or a database backup without change.
+
+## MemoryStream: a stream with no file
+
+The write side of this series lives inside a `MemoryStream`, so it is worth understanding on its own. A `MemoryStream` is a stream whose backing store is a `byte[]` held in memory — no disk, no socket. It grows automatically as bytes are written, which makes it the natural place to *build* output before deciding what to do with it.
+
+```csharp
+var stream = new MemoryStream();      // empty, position 0
+
+byte[] data = { 72, 105 };            // the bytes for "Hi"
+stream.Write(data, 0, data.Length);   // write 2 bytes; position is now 2
+
+byte[] result = stream.ToArray();     // copies out { 72, 105 }
+```
+
+`ToArray()` is the method that lifts the collected bytes out as a fresh `byte[]`. It copies the stream's *entire* contents regardless of where the cursor currently sits — which is important, because after writing, the cursor is parked at the end.
+
+That parked cursor causes a classic first-time bug. Writing leaves the position at the end of the data, so an immediate `Read` finds nothing after it:
+
+```csharp
+var stream = new MemoryStream();
+stream.Write(data, 0, data.Length);   // position is now at the end
+
+var buffer = new byte[10];
+int read = stream.Read(buffer, 0, buffer.Length);   // read == 0, nothing left ahead
+
+stream.Position = 0;                  // rewind the cursor to the start
+read = stream.Read(buffer, 0, buffer.Length);        // now it reads the 2 bytes
+```
+
+> **Remember the difference:** `ToArray()` ignores the cursor and copies everything; `Read()` respects the cursor and only sees what is ahead of it. "I wrote data but reading gives me nothing" almost always means the position is still at the end — rewind with `stream.Position = 0` first. In the CSV write code later in this series, `ToArray()` is used precisely so the cursor position never has to be thought about.
+
+## FileStream and NetworkStream: same shape, different backing
+
+The other two common streams prove the point that the contract does not change. A `FileStream` is backed by a file handle from the operating system; a `NetworkStream` is backed by a socket. Both are used through the exact same `Read` / `Write` / `Position` members — but what they *can* do differs, because their backings differ:
+
+| Stream | CanRead | CanWrite | CanSeek | Length known | Backed by |
+|---|---|---|---|---|---|
+| MemoryStream | yes | yes | yes | yes | a `byte[]` in memory |
+| FileStream | depends on mode | depends on mode | yes | yes | a file on disk |
+| NetworkStream | yes | yes | no | no | a network socket |
+
+A `NetworkStream` cannot seek and has no known length, because bytes arrive live from the other end — there is nothing to rewind to and no way to know how many are still coming. A `MemoryStream` can do everything, because its whole contents already sit in memory. The capability flags (`CanRead`, `CanWrite`, `CanSeek`) exist so code can ask a stream what it supports before assuming.
+
+`FileStream` gets its own full treatment in Part 5, alongside file modes and paths. For now it is enough that it is *just another stream*.
+
+## What this part covered
+
+- A **stream** is a cursor over a sequence of bytes, read or written one chunk at a time.
+- `Stream` is an **abstract base**; `FileStream`, `MemoryStream`, and `NetworkStream` share one identical set of operations.
+- The **position** advances as bytes move; seekable streams can jump it, non-seekable ones cannot.
+- Streams deal in **bytes only** — turning bytes into text is the reader/writer layer's job.
+- `MemoryStream` builds output in memory; `ToArray()` copies it out and ignores the cursor, while `Read()` respects the cursor.
+
+## What comes next
+
+**Part 3** adds the layer that makes streams usable for text: **readers and writers**. `StreamReader` and `StreamWriter` wrap a stream and translate bytes to and from characters, and `StringReader` and `StringWriter` do the same for an in-memory string. This is where the `StringReader` from the original CSV code — and the `StreamWriter` from the write side — finally get explained directly.

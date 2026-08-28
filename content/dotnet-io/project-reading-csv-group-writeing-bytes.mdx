@@ -1,0 +1,246 @@
+---
+title: "Capstone: reading a CSV, grouping it, and writing bytes back"
+date: 2026-08-27
+status: written
+minutes: 15
+order: 8
+lead: 'Everything the series built comes together here: read a book CSV, sort its rows into one CSV per genre, and pull the finished bytes out — the full read, transform, and write pipeline in a single program, with the dictionary-of-writers pattern, Flush, ToArray, and dispose-order all in one place.'
+---
+
+This is where the whole series pays off. Every layer built across the previous seven parts appears in one real task: take a CSV of books, split it by genre, and produce a separate CSV — as bytes — for each genre. The code that looked like a wall of unfamiliar objects at the start should now read as a sequence of decisions, each one traceable to a part of this series.
+
+The task, concretely. Given this input:
+
+```text
+title,author,genre
+The Hobbit,J.R.R. Tolkien,Fantasy
+Dune,Frank Herbert,Sci-Fi
+Mistborn,Brandon Sanderson,Fantasy
+Foundation,Isaac Asimov,Sci-Fi
+```
+
+produce two CSVs in memory — a Fantasy one (The Hobbit, Mistborn) and a Sci-Fi one (Dune, Foundation), each with its own header — and return them as a genre-to-bytes map.
+
+<Diagram title="Read one CSV, write one CSV per genre">
+  <DiagramRow>
+    <DiagramNode title="books.csv" sub="all rows" />
+    <DiagramArrow label="read + route" />
+    <DiagramNode title="per-genre writers" sub="in memory" />
+    <DiagramArrow label="finalize" />
+    <DiagramNode title="genre -> byte[]" sub="results" />
+  </DiagramRow>
+</Diagram>
+
+## The shape: two dictionaries
+
+The whole program hinges on keeping two maps, with two different lifetimes:
+
+```text
+writers  (working objects, discarded at the end)
+  Fantasy -> (MemoryStream, StreamWriter, CsvWriter)
+  Sci-Fi  -> (MemoryStream, StreamWriter, CsvWriter)
+
+groups   (final results, what the method returns)
+  Fantasy -> byte[]   (the finished Fantasy.csv)
+  Sci-Fi  -> byte[]   (the finished Sci-Fi.csv)
+```
+
+`writers` holds the live, in-progress writer stacks — one per genre — while rows are being routed. `groups` holds the finished output. The program builds up `writers`, then in a final pass converts each one into a `byte[]` in `groups` and tears the writers down. Keeping working state and results in separate maps is the pattern that makes the finalization step clean.
+
+## Reading the input
+
+Reading is the front half of the stack from Parts 2, 3, and 6. Open the file, wrap it in a `CsvReader`, and read the header:
+
+```csharp
+using CsvHelper;
+using CsvHelper.Configuration;
+using System.Globalization;
+
+var config = new CsvConfiguration(CultureInfo.InvariantCulture);   // Part 7: culture, not encoding
+
+using var reader = new StreamReader("books.csv");   // Part 6 file + Part 3 reader
+using var csv = new CsvReader(reader, config);      // Part 3: parser over a TextReader
+
+csv.Read();                        // advance to the first row
+csv.ReadHeader();                  // treat that row as the header
+string[] header = csv.HeaderRecord; // ["title", "author", "genre"]
+```
+
+`Read()` advances the cursor to a row; `ReadHeader()` tells the parser to treat the current row as column names. They are two steps because reading a row and interpreting it as a header are two different actions — a data-only file could `Read()` successfully with no header to speak of. After this, `csv.GetField("genre")` can fetch a column by name on every subsequent row.
+
+## The working dictionary: a tuple as the value
+
+Each genre needs three live objects kept together — the `MemoryStream` collecting bytes, the `StreamWriter` encoding text into it, and the `CsvWriter` formatting rows. A **tuple** groups them under one value, with names so the elements read clearly:
+
+```csharp
+var writers = new Dictionary<string, (MemoryStream Stream, StreamWriter Writer, CsvWriter Csv)>(
+    StringComparer.OrdinalIgnoreCase);
+```
+
+Two things to notice. The value type `(MemoryStream Stream, StreamWriter Writer, CsvWriter Csv)` is a named tuple: an entry retrieved from the dictionary exposes `.Stream`, `.Writer`, and `.Csv` instead of the anonymous `.Item1`, `.Item2`, `.Item3`. And `StringComparer.OrdinalIgnoreCase` makes the genre keys case-insensitive, so `"Fantasy"` and `"fantasy"` land in the same group rather than creating two.
+
+## Get-or-create, then route the row
+
+For every data row, the program needs the writer stack for that row's genre — creating it the first time a genre appears. That is the `TryGetValue` pattern:
+
+```csharp
+while (csv.Read())                                  // loop every remaining row
+{
+    string genre = csv.GetField("genre");
+
+    if (!writers.TryGetValue(genre, out var target))
+    {
+        // first time this genre appears: build its in-memory writer stack
+        var stream = new MemoryStream();              // Part 2: the byte sink
+        var writer = new StreamWriter(stream);        // Part 3: text -> bytes
+        var csvWriter = new CsvWriter(writer, config);// Part 3: values -> CSV text
+
+        foreach (var column in header)                // write the header row first
+            csvWriter.WriteField(column);
+        csvWriter.NextRecord();
+
+        target = (stream, writer, csvWriter);         // pack the three into the tuple
+        writers[genre] = target;                      // store for reuse next time
+    }
+
+    // route this row into its genre's CSV
+    target.Csv.WriteField(csv.GetField("title"));
+    target.Csv.WriteField(csv.GetField("author"));
+    target.Csv.WriteField(csv.GetField("genre"));
+    target.Csv.NextRecord();
+}
+```
+
+`TryGetValue(genre, out var target)` does two jobs at once: it returns `true`/`false` for whether the key exists, and, through the `out` parameter, hands back the value if it does. The `!` flips the result, so `if (!writers.TryGetValue(...))` means "if this genre is *not* already known." Inside that block the writer stack is built once, its header written, and the tuple stored. Below the block — whether the group was just created or already existed — the row's fields are written into `target.Csv`. `WriteField` adds a field; `NextRecord` ends the row.
+
+## Finalize: flush, extract, dispose
+
+When every row has been routed, each genre's `MemoryStream` holds a complete CSV — but the bytes are not safe to read until the writers are flushed, and everything must be cleaned up afterward. This is the loop from Parts 4 and 5, exactly:
+
+```csharp
+var groups = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+foreach (var entry in writers)
+{
+    entry.Value.Writer.Flush();                       // Part 4: buffered text -> stream
+    groups[entry.Key] = entry.Value.Stream.ToArray(); // Part 2: copy bytes out, all still alive
+
+    entry.Value.Csv.Dispose();                        // Part 5: dispose top layer first
+    entry.Value.Writer.Dispose();
+    entry.Value.Stream.Dispose();
+}
+
+// groups now holds one finished CSV, as bytes, per genre
+```
+
+The order is the whole lesson of the series in five lines. **Flush** first (Part 4), so the writer's buffer reaches the stream. **`ToArray`** next (Part 2), copying the complete bytes out while every object is still open. Only then **dispose**, top layer down — `Csv`, then `Writer`, then `Stream` (Part 5) — because each layer flushes into the one below on the way out, so the lower layers must still be alive. Reorder any of this and the output truncates or throws.
+
+## The whole program
+
+Assembled, the entire task is short — which is the point. Every object in it now has a known job:
+
+```csharp
+using CsvHelper;
+using CsvHelper.Configuration;
+using System.Globalization;
+
+var config = new CsvConfiguration(CultureInfo.InvariantCulture);
+
+var writers = new Dictionary<string, (MemoryStream Stream, StreamWriter Writer, CsvWriter Csv)>(
+    StringComparer.OrdinalIgnoreCase);
+
+using (var reader = new StreamReader("books.csv"))
+using (var csv = new CsvReader(reader, config))
+{
+    csv.Read();
+    csv.ReadHeader();
+    string[] header = csv.HeaderRecord;
+
+    while (csv.Read())
+    {
+        string genre = csv.GetField("genre");
+
+        if (!writers.TryGetValue(genre, out var target))
+        {
+            var stream = new MemoryStream();
+            var writer = new StreamWriter(stream);
+            var csvWriter = new CsvWriter(writer, config);
+
+            foreach (var column in header)
+                csvWriter.WriteField(column);
+            csvWriter.NextRecord();
+
+            target = (stream, writer, csvWriter);
+            writers[genre] = target;
+        }
+
+        target.Csv.WriteField(csv.GetField("title"));
+        target.Csv.WriteField(csv.GetField("author"));
+        target.Csv.WriteField(csv.GetField("genre"));
+        target.Csv.NextRecord();
+    }
+}
+
+var groups = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+foreach (var entry in writers)
+{
+    entry.Value.Writer.Flush();
+    groups[entry.Key] = entry.Value.Stream.ToArray();
+    entry.Value.Csv.Dispose();
+    entry.Value.Writer.Dispose();
+    entry.Value.Stream.Dispose();
+}
+```
+
+To write the results to disk instead of keeping them in memory, add the Part 6 step:
+
+```csharp
+foreach (var group in groups)
+{
+    string path = Path.Combine("output", group.Key + ".csv");
+    File.WriteAllBytes(path, group.Value);   // Part 6: byte[] straight to a file
+}
+```
+
+## Doing it asynchronously
+
+In a web API, the reads and writes above should not block a thread while the disk works. CsvHelper and the `File` helpers have async forms, and the routing logic is unchanged — only the I/O calls gain `await`:
+
+```csharp
+await csv.ReadAsync();
+csv.ReadHeader();
+
+while (await csv.ReadAsync())
+{
+    // identical routing logic
+}
+
+// in the finalize loop:
+await entry.Value.Writer.FlushAsync();
+
+// writing out:
+await File.WriteAllBytesAsync(path, group.Value);
+```
+
+The shape of the program is the same; async only changes *how* each I/O step waits, not *what* the layers do. Reach for it when the code runs inside a request handler or otherwise needs to stay responsive under load.
+
+## What the whole series built
+
+Every part maps onto a piece of that final program:
+
+| Part | Concept | Where it appears in the capstone |
+|---|---|---|
+| 1 | the layered I/O stack | the read and write pipelines end to end |
+| 2 | streams and `MemoryStream` | the byte sink per genre; `ToArray()` |
+| 3 | readers and writers | `StreamReader`, `StreamWriter`, `CsvReader`, `CsvWriter` |
+| 4 | buffering and `Flush` | `Flush()` before `ToArray()` |
+| 5 | `IDisposable` and order | `using` on the read side, manual dispose loop |
+| 6 | `File` and `Path` | opening the input, writing output files |
+| 7 | encoding and culture | UTF-8 text, `InvariantCulture` config |
+
+The code that opened this series — `using var reader = new StringReader(...)`, `new CsvReader(...)`, `TryGetValue(..., out var target)`, `Flush()`, `ToArray()`, three disposes in order — is now fully accounted for. None of it is ceremony. Each line is one layer of a stack doing its single job, in the one order that works.
+
+## Where to go from here
+
+The I/O stack is now solid ground. Natural next steps that build on it: streaming large files with `IAsyncEnumerable` instead of loading them whole, serializing to and from JSON (the same reader/writer layering, a different parser), and returning these `byte[]` results from a web API as file downloads. All of them reuse the exact mental model this series built — a source, a stream, a reader or writer, and a parser, cleaned up in reverse.

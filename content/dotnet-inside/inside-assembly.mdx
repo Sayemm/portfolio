@@ -11,7 +11,7 @@ lead: 'Open a DLL and there is no C# inside, and no machine code either. There a
 
 The assemblies article ended at the doorway: open the DLL. Inside the PE container are three logical parts — and, tellingly, not one of them is C# and not one is machine code:
 
-```
+```text
 MyApi.dll  (a PE container)
 |
 +-- IL         the instructions    (what to do)
@@ -27,7 +27,7 @@ IL is the portable instruction set introduced back in the "why .NET exists" arti
 
 The reason it can stay portable is a design choice worth seeing. The very first article showed the CPU using named **registers** (`eax`, `ebx`) whose count and names differ from one architecture to the next. IL refuses to name any register. It is **stack-based**: instructions push operands onto an evaluation stack and pop results back off it. The same `2 + 3` that became register moves in the first article becomes this in IL:
 
-```
+```text
 ldc.i4  2     ; push the constant 2
 ldc.i4  3     ; push the constant 3
 add           ; pop two, push their sum

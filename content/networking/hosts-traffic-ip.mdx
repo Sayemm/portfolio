@@ -42,7 +42,7 @@ To send or receive anything, a host needs an address, the same way sending mail 
 
 Crucially, the IP address is stamped on *everything* a host sends. Every packet carries two of them: a **source** and a **destination**.
 
-```
+```text
 a packet on the wire:
 
   [ src IP 10.1.1.22 | dst IP 3.3.3.3 | ...the data... ]
@@ -54,7 +54,7 @@ When a client sends a request, it stamps the source as its own address and the d
 
 An IP address is just **32 bits**. To make 32 bits readable, they are broken into **4 chunks** called **octets**, and each octet is written as a decimal number from **0 to 255**:
 
-```
+```text
    10    .    30    .    55    .   127
  [8 bits] [8 bits] [8 bits] [8 bits]      = 32 bits
   0-255    0-255    0-255    0-255

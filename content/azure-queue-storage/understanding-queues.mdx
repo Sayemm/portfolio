@@ -1,0 +1,352 @@
+---
+title: "Queues, Azurite, and the local development environment"
+date: 2026-08-25
+status: written
+minutes: 12
+order: 1
+lead: 'A queue is a to-do list for a system. One side pushes work in, the other side picks it up — and neither has to wait for the other. Before any C# gets written, this part builds the mental model and gets a full local Azure environment running without an Azure account.'
+---
+
+This is a project-based series. By the end of it, a fully working .NET 10 Web API that pushes and checks messages in an Azure Queue will exist — built completely from scratch, with every decision and every line of code explained.
+
+This first part does not touch code at all. That is intentional. The single biggest mistake when learning a new technology is jumping straight into code without understanding what it actually does and why. Spending time here makes every part that follows feel obvious instead of mysterious.
+
+## What is a Queue?
+
+Before talking about Azure specifically, it helps to understand what a queue actually is as a concept — because it is one of those ideas that shows up everywhere in software once you know it exists.
+
+A queue is a **to-do list for a system**. Items go in at one end and come out the other. The rule is simple: the first item in is the first item out. This is called **FIFO — First In, First Out**.
+
+Think about a ticket machine at a deli counter. A customer walks up, takes a number (let's say ticket 42), and waits. The worker behind the counter calls "42!", processes that customer, and moves on to 43. Nobody jumps the line. Nobody skips ahead. Everything happens in order.
+
+In software, a queue works the same way:
+
+<Diagram title="A queue decouples the two sides">
+  <DiagramRow>
+    <DiagramNode title="Producer" sub="your API" />
+    <DiagramArrow label="pushes" />
+    <DiagramNode title="Queue" sub="first in, first out" items="msg3, msg2, msg1" />
+    <DiagramArrow label="reads" />
+    <DiagramNode title="Consumer" sub="background worker" />
+  </DiagramRow>
+</Diagram>
+
+The **producer** adds work to the queue. The **consumer** picks up that work and processes it. These two sides can run completely independently — the producer does not need to wait for the consumer to finish, and the consumer does not need to be running at the same moment the producer pushes a message. This decoupling is the whole point of a queue.
+
+### A Real Example to Make It Concrete
+
+Imagine an e-commerce site. A customer clicks "Place Order". The order needs to:
+
+1. Save to the database
+2. Send a confirmation email
+3. Notify the warehouse
+4. Update inventory
+
+If all of this happens synchronously, the customer stares at a loading spinner for seconds. Instead, the API saves the order and immediately pushes a message to a queue: `"order-123 placed"`. The customer gets an instant response. Then background workers pick up the message and handle the email, warehouse notification, and inventory update at their own pace.
+
+This is why queues exist. Speed, reliability, and separation of concerns.
+
+## What is Azure Queue Storage?
+
+Building a queue from scratch is possible but painful. You would need to think about storage, message ordering, multiple consumers, failure recovery, and more.
+
+**Azure Queue Storage** is Microsoft's managed queue service. Instead of building queue infrastructure, it handles everything: storing messages, delivering them to consumers, managing failures, and scaling automatically. The job becomes just calling the right SDK methods — Azure does the rest.
+
+Azure Queue Storage is part of a broader Azure product called **Azure Storage**, which also includes:
+
+- **Blob Storage** — for storing files (images, PDFs, documents)
+- **Table Storage** — for storing structured NoSQL data
+- **Queue Storage** — for storing messages ← this is what this series covers
+- **File Storage** — for managed file shares
+
+All four live under the same Azure Storage account and share the same connection string.
+
+### Key Properties of Azure Queue Storage
+
+- Messages can be up to **64 KB** in size
+- A queue can hold a virtually unlimited number of messages
+- Messages have a default **time-to-live of 7 days** (configurable)
+- A single queue can handle thousands of messages per second
+
+## Key Terms — Explained Simply
+
+These terms appear constantly in queue storage code and documentation. Understanding them now prevents confusion later.
+
+### Queue
+
+A named container that holds messages. Think of it like a named list — `job-queue`, `email-queue`, `payment-queue`. One Azure Storage account can hold many different queues.
+
+### Message
+
+The actual data stored in the queue. A message is just a string — typically JSON. In this project, messages look like this:
+
+```json
+{ "Id": "3fa85f64-5717-4562-b3fc-2c963f66afa6" }
+```
+
+Azure does not care what the string contains. It stores and delivers whatever is put in.
+
+### Enqueue (Push)
+
+Adding a message to the queue. The message goes to the back of the line.
+
+```text
+Before:  [ msg2, msg1 ]
+Enqueue: [ msg3, msg2, msg1 ]  ← msg3 added to the back
+```
+
+### Peek
+
+Looking at messages **without removing them**. Like reading the ticket numbers without calling any customers. The messages stay exactly where they are after a peek.
+
+This is how the duplicate check in this project works — peek the queue, scan for the ID, return true or false. Nothing is consumed.
+
+### Dequeue (Receive)
+
+Reading a message AND making it invisible to other consumers. This is different from peek. When a message is dequeued, it does not disappear immediately — it becomes **temporarily invisible** for a set period while the consumer processes it. Once processing is done, the consumer explicitly deletes it.
+
+```text
+Before:   [ msg3, msg2, msg1 ]
+Dequeue:  [ msg3, msg2 ] ← msg1 is now invisible (being processed)
+Delete:   [ msg3, msg2 ] ← msg1 permanently gone
+```
+
+### Visibility Timeout
+
+The duration a dequeued message stays hidden from other consumers. Default is 30 seconds.
+
+This is one of the most important concepts in queue storage. Here is why it exists:
+
+Imagine a worker dequeues a message and starts processing it. Halfway through, the worker crashes. Without a visibility timeout, that message would be gone forever — lost. With the visibility timeout, the message reappears in the queue after the timeout expires, and another worker can pick it up and try again.
+
+```text
+Worker A dequeues msg1 → msg1 invisible for 30s
+Worker A crashes after 10s
+After 30s → msg1 becomes visible again
+Worker B dequeues msg1 → processes successfully → deletes it
+```
+
+This is the built-in retry mechanism. Messages are never permanently lost just because a consumer fails.
+
+### DequeueCount
+
+Every message tracks how many times it has been dequeued. If a message has been picked up and not deleted five times, something is probably wrong with it — it is a **poison message**. Real applications check this count and handle poison messages separately (log them, move them elsewhere, alert someone). This is covered in a later part of the series.
+
+## What is Azurite?
+
+Azure Queue Storage is a cloud service. To use it in production, an Azure account is needed. But during development, connecting to a live cloud service for every code change would be slow, cost money, and require internet access.
+
+**Azurite** solves this. It is a free, open-source local emulator that runs on the development machine and pretends to be Azure Storage. The code talks to Azurite exactly the same way it would talk to real Azure — same SDK, same methods, same connection patterns. The only difference is the connection string.
+
+Azurite runs three local services on different ports:
+
+| Port | Service |
+|---|---|
+| `10000` | Blob Storage |
+| `10001` | Queue Storage ← this project uses this |
+| `10002` | Table Storage |
+
+### Azurite vs Real Azure
+
+| Thing | Azurite | Real Azure |
+|---|---|---|
+| Cost | Free | Paid (very cheap, but still) |
+| Speed | Instant (local) | Network latency |
+| Internet required | No | Yes |
+| Data persistence | Local files | Cloud |
+| Suitable for | Development and learning | Production |
+
+### Installing Azurite
+
+Azurite is installed as a global npm package. Node.js must be installed first. To check:
+
+```bash
+node --version
+npm --version
+```
+
+If Node.js is not installed, download it from [nodejs.org](https://nodejs.org) (choose the LTS version).
+
+Once Node.js is ready, install Azurite globally:
+
+```bash
+npm install -g azurite
+```
+
+Verify the installation worked:
+
+```bash
+azurite --version
+```
+
+This should print something like `3.x.x`.
+
+### Starting Azurite
+
+Create a folder for Azurite's data files and start it:
+
+```bash
+mkdir .azurite
+azurite --silent --location .azurite --debug .azurite/debug.log
+```
+
+Breaking down those flags:
+
+- `--silent` — suppresses most console output so it does not clutter the terminal
+- `--location .azurite` — stores all queue/blob/table data in the `.azurite` folder instead of the current directory
+- `--debug .azurite/debug.log` — writes a debug log to a file, useful when something goes wrong
+
+> **Tip:** Keep Azurite running in a dedicated terminal tab throughout development. It needs to stay running while testing the API. Think of it as a local Azure server that must be on.
+
+### Verify Azurite is Running
+
+Open a second terminal and run:
+
+```bash
+curl http://127.0.0.1:10001/devstoreaccount1
+```
+
+The response will be some XML — it might look like an error, but that is expected. Any XML response means Azurite is alive and listening on port 10001.
+
+```xml
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<StorageServiceStats>
+  <GeoReplication>
+    <Status>unavailable</Status>
+    <LastSyncTime/>
+  </GeoReplication>
+</StorageServiceStats>
+```
+
+If the response is `curl: (7) Failed to connect` — Azurite is not running. Go back and start it.
+
+### The Magic Connection String
+
+When code needs to connect to Azurite instead of real Azure, this connection string is used:
+
+```ini
+UseDevelopmentStorage=true
+```
+
+This is a shorthand that the Azure SDK recognises. It automatically points to `127.0.0.1` on the default Azurite ports. There is nothing else to configure — this one string is everything needed for local development.
+
+In production, the connection string would look like this instead:
+
+```ini
+DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=abc123...;EndpointSuffix=core.windows.net
+```
+
+The code itself never changes — only the connection string in configuration changes between local and production.
+
+## What is Azure Storage Explorer?
+
+Azure Storage Explorer is a free desktop application from Microsoft that provides a visual interface for browsing and managing Azure Storage data — queues, blobs, tables, and files.
+
+During development, this tool is invaluable. Instead of guessing whether a message was actually pushed to the queue, it can be seen directly — sitting there in the queue as readable JSON.
+
+### Download and Install
+
+Download Azure Storage Explorer from the official Microsoft page:
+
+[Download Azure Storage Explorer](https://azure.microsoft.com/en-us/products/storage/storage-explorer)
+
+It is available for Windows, macOS, and Linux.
+
+### Connect Storage Explorer to Azurite
+
+After installing, connect it to the local Azurite emulator:
+
+1. Open Azure Storage Explorer
+2. Click the **plug icon** in the left sidebar (Connect to Azure Resources)
+3. Select **"Local emulator"** from the connection options
+4. Leave all settings as default — the ports match Azurite's defaults (10000, 10001, 10002)
+5. Click **Connect**
+
+In the left panel, a new entry should appear:
+
+```text
+Local & Attached
+  └── Emulator - Default Ports (Key)
+        ├── Blob Containers
+        ├── Queues          ← this is what will be used
+        └── Tables
+```
+
+### Create a Test Queue to Confirm Everything Works
+
+Before writing any code, create a queue manually to confirm the connection is working:
+
+1. In Storage Explorer, expand **Emulator → Queues**
+2. Right-click **Queues** → **Create Queue**
+3. Name it `test-queue`
+4. Click **OK**
+
+The `test-queue` should now appear in the list. Click into it — it is empty. This is exactly what will be seen once the API starts pushing messages in Part 5.
+
+> **What just happened?** The queue was created inside Azurite's local storage. It is not in Azure. It lives on the local machine in the `.azurite` folder. When Azurite is stopped and the `.azurite` folder is cleared, this queue disappears. That is fine for development — later parts of the series create queues automatically through code.
+
+## Understanding the Full Picture Before Writing Code
+
+Here is how all the pieces fit together, which will inform every decision made in the parts that follow:
+
+<Diagram title="Development machine">
+  <DiagramRow>
+    <DiagramNode title="Postman" sub="test tool" />
+    <DiagramArrow label="HTTP" />
+    <DiagramNode title=".NET 10 Web API" sub="the project" />
+  </DiagramRow>
+  <DiagramArrow down label="Azure SDK calls" align="end" />
+  <DiagramRow>
+    <DiagramNode title="Azure Storage Explorer" sub="visual tool" />
+    <DiagramArrow label="views" />
+    <DiagramNode title="Azurite" sub="local emulator · port 10001" />
+  </DiagramRow>
+</Diagram>
+
+- **Postman** sends HTTP requests to the API to trigger queue operations
+- **The .NET API** uses the Azure SDK to talk to the queue
+- **Azurite** receives those SDK calls and stores messages locally, pretending to be Azure
+- **Azure Storage Explorer** connects to Azurite and lets the queue and its messages be viewed visually in real time
+
+When this project eventually goes to production:
+- Azurite is replaced by a real Azure Storage account
+- The connection string in `appsettings.json` changes to the real Azure connection string
+- Every single line of code stays exactly the same
+
+That is the power of the emulator approach.
+
+## Common Questions at This Stage
+
+### Why not just use a database instead of a queue?
+
+A database stores data long-term. A queue stores work short-term. They solve different problems. A queue is optimised for passing messages between producers and consumers reliably, with built-in retry, ordering, and visibility management. Using a database as a queue means building all of that yourself — and getting it wrong in subtle ways.
+
+### What if Azurite data needs to persist across restarts?
+
+By default, Azurite persists data to the `.azurite` folder. As long as that folder is not deleted, messages and queues survive Azurite restarts. If the `.azurite` folder is deleted, everything starts fresh — useful when a clean slate is needed during development.
+
+### Can multiple queues exist?
+
+Yes. One Azure Storage account can have many queues with different names. In later parts of this series, a queue naming pattern using enums is used to manage multiple queue names cleanly — the same pattern used in production codebases.
+
+### What is the difference between peek and receive in plain terms?
+
+Peek is read-only. It is like looking at the menu at a restaurant without ordering. The menu does not change.
+
+Receive is read-and-lock. It is like ordering a dish — it is taken off the available list while being prepared, and if the order is cancelled (consumer crashes), it goes back on the menu after a timeout.
+
+## What Was Set Up in This Part
+
+By the end of this part, the local development environment should look like this:
+
+- ✅ Azurite installed and running on port 10001
+- ✅ `curl http://127.0.0.1:10001/devstoreaccount1` returns XML
+- ✅ Azure Storage Explorer installed and connected to Azurite
+- ✅ A test queue visible in Storage Explorer under Emulator → Queues
+- ✅ A solid mental model of what queues are, how they work, and what each key term means
+
+## What Comes Next
+
+**Part 2** creates the .NET 10 Web API project from scratch. Every file the template generates gets opened and explained line by line. The difference between Minimal APIs and Controller-based APIs is explained, the project folder structure is set up, the Azure SDK NuGet package is installed, and the app runs for the first time.
+
+No Azure knowledge is assumed — just the setup confirmed in this part and the understanding of what a queue is.

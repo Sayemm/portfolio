@@ -17,7 +17,7 @@ This reframes the coordinator from the build walk-through. MSBuild is an interpr
 
 An MSBuild program is built from four kinds of thing, and every build rule is some combination of them:
 
-```
+```text
 <Project>              the build program
 |
 +-- PropertyGroup      properties = single named values
@@ -56,7 +56,7 @@ Because evaluation reads imports in order, *position matters*. A property set af
 
 The default entry point is the `Build` target, and it does almost none of the work itself. It *depends on* a chain of other targets, and MSBuild reads those dependency declarations to compute an execution order:
 
-```
+```text
 Build
   depends on:
     ResolveReferences   locate framework / package / project refs

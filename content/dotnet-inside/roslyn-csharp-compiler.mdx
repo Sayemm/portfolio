@@ -13,7 +13,7 @@ The MSBuild article ended at a precise point: the `CoreCompile` target runs the 
 
 Roslyn is the C# compiler. Its job is narrow — turn `.cs` text into a single assembly of IL, metadata, and a manifest — and it does that job in four stages. Translation into IL is the *last* of them; three stages of understanding come first.
 
-```
+```text
 .cs source text
 |
 +-- 1. Lex     text -> tokens         (words and symbols)

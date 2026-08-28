@@ -93,6 +93,20 @@ export const topics: Topic[] = [
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
   {
+    id: "dotnet-io",
+    name: ".NET I/O",
+    blurb: "Files, streams, and everything that crosses a process boundary.",
+    order: 2.6,
+    chip: { bg: "#eae6f0", fg: "#4c3470" },
+  },
+  {
+    id: "azure-queue-storage",
+    name: "Azure Queue Storage",
+    blurb: "Messages, visibility timeouts and at-least-once delivery.",
+    order: 2.7,
+    chip: { bg: "#e0edf7", fg: "#0f5a86" },
+  },
+  {
     id: "misc",
     name: "Miscellaneous",
     blurb: "Everything else worth writing down — tools, shell, odds and ends.",

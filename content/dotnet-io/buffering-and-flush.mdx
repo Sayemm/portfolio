@@ -1,0 +1,138 @@
+---
+title: "Buffering and Flush: why your data is not where you think yet"
+date: 2026-08-27
+status: written
+minutes: 10
+order: 4
+lead: 'Write text to a StreamWriter, ask the stream for its bytes, and get back nothing. The data is not lost — it is waiting in a buffer. Buffering is why the CSV write code flushes before it copies bytes out, and this part explains both the rule and the reason behind it.'
+---
+
+Parts 2 and 3 kept mentioning `Flush()` and promising an explanation. This is it. Buffering is a small idea with an outsized ability to confuse, because it makes written data appear to vanish. Once the mechanism is clear, the ordering rules in the CSV write code stop looking like magic incantations.
+
+## The symptom: text written, bytes missing
+
+Here is code that looks correct and is not:
+
+```csharp
+using var stream = new MemoryStream();
+using var writer = new StreamWriter(stream);
+
+writer.WriteLine("title,author,genre");
+writer.WriteLine("Dune,Frank Herbert,Sci-Fi");
+
+byte[] bytes = stream.ToArray();   // very likely EMPTY
+```
+
+Two lines were clearly written, yet `ToArray()` comes back with little or nothing. The data was not dropped. It simply has not reached the `MemoryStream` yet — it is sitting in the `StreamWriter`.
+
+## What buffering is, and why it exists
+
+Writing to a real destination — a file, a socket, even a memory stream — has overhead per write. Pushing text down one tiny piece at a time, a few characters per call, is wasteful: many small handoffs are far slower than a few large ones.
+
+So a `StreamWriter` does not pass each `Write` straight through. It collects the outgoing characters in an internal **buffer** in memory, and only sends them down to the stream in bigger batches. Fewer, larger writes to the underlying stream means better performance. That buffer is the reason for the confusion — written data lives in the writer first, and reaches the stream later:
+
+<Diagram title="Written text waits in the writer's buffer">
+  <DiagramRow>
+    <DiagramNode title="WriteLine(...)" sub="your text" />
+    <DiagramArrow label="buffered" />
+    <DiagramNode title="StreamWriter" sub="holds text in memory" />
+    <DiagramArrow label="Flush()" />
+    <DiagramNode title="MemoryStream" sub="bytes land here" />
+  </DiagramRow>
+</Diagram>
+
+The `StreamWriter` and the `MemoryStream` are two separate objects. Writing puts text into the *writer*. Until a flush happens, the *stream* underneath may still be empty.
+
+## Flush: push the buffer down
+
+`Flush()` is the instruction "send everything in the buffer down to the stream, now." Before and after, the picture looks like this:
+
+```text
+Before Flush():
+  StreamWriter buffer:  [ title,author,genre\nDune,... ]
+  MemoryStream:         [ empty ]
+  stream.ToArray()  ->  byte[0]        (nothing)
+
+After Flush():
+  StreamWriter buffer:  [ empty ]
+  MemoryStream:         [ 74 69 74 6C 65 ... ]
+  stream.ToArray()  ->  the full CSV bytes
+```
+
+So the fix for the broken snippet is a single line, in the right place:
+
+```csharp
+using var stream = new MemoryStream();
+using var writer = new StreamWriter(stream);
+
+writer.WriteLine("title,author,genre");
+writer.WriteLine("Dune,Frank Herbert,Sci-Fi");
+writer.Flush();                    // push the buffered text into the stream
+
+byte[] bytes = stream.ToArray();   // now: the complete CSV
+```
+
+The order is the whole point: **finish writing, then flush, then read the bytes.** Reading the stream before flushing reads an incomplete picture.
+
+## Why the CSV code flushes before ToArray
+
+This is exactly the shape of the finalization loop in the CSV write code:
+
+```csharp
+foreach (var entry in writers)
+{
+    entry.Value.Writer.Flush();                       // 1. push buffered text into the stream
+    groups[entry.Key] = entry.Value.Stream.ToArray(); // 2. copy the finished bytes out
+    entry.Value.Csv.Dispose();                        // 3. clean up, top layer first
+    entry.Value.Writer.Dispose();
+    entry.Value.Stream.Dispose();
+}
+```
+
+Step 1 flushes the writer so every character reaches the `MemoryStream`. Step 2 copies the now-complete bytes out with `ToArray()`. Only then, in step 3, does cleanup begin. If `ToArray()` ran before the flush, each group's CSV could come out truncated or empty — the exact bug from the top of this part, multiplied across every group.
+
+> **The rule to carry:** whenever bytes are pulled out of a stream that a writer has been writing to — `ToArray()`, `GetBuffer()`, reading the file back — flush the writer first. The buffered data is not in the stream until it is flushed.
+
+## AutoFlush: flush after every write
+
+There is a way to avoid thinking about flushing: set `AutoFlush`. When it is on, the writer flushes automatically after every single `Write` or `WriteLine`, so the stream is always current.
+
+```csharp
+using var writer = new StreamWriter(stream) { AutoFlush = true };
+// every Write/WriteLine now reaches the stream immediately
+```
+
+It trades performance for convenience — the buffering optimisation is effectively switched off, since nothing is batched. For a few writes that is fine. For a loop writing thousands of rows, leaving `AutoFlush` off (the default) and flushing once at the end, as the CSV code does, is the better choice.
+
+## Disposing also flushes
+
+There is a second way flushing happens: **disposing** a `StreamWriter` flushes it automatically as part of cleanup. So this is safe even with no explicit `Flush()`:
+
+```csharp
+byte[] bytes;
+using (var stream = new MemoryStream())
+{
+    using (var writer = new StreamWriter(stream, leaveOpen: true))
+    {
+        writer.WriteLine("Dune,Frank Herbert,Sci-Fi");
+    }   // writer disposed here -> flushes automatically; leaveOpen keeps the stream alive
+
+    bytes = stream.ToArray();   // flushed by dispose, and the stream is still open to read
+}
+```
+
+This pattern leans on two things: disposing the writer flushes it, and `leaveOpen: true` stops the writer from also closing the `MemoryStream`, so `ToArray()` still works afterward.
+
+The CSV code does *not* use this pattern. It flushes explicitly and calls `ToArray()` while every object is still alive, then disposes them by hand in order. Both approaches are valid; the explicit-flush version just makes the "finish, flush, read, then clean up" sequence visible on the page instead of hiding the flush inside a dispose. Which objects get disposed, and in what order, is the subject of the next part.
+
+## What this part covered
+
+- A `StreamWriter` **buffers** written text in memory and sends it to the stream in batches, for performance.
+- Until a flush, the **stream underneath may be empty** — this is why `ToArray()` can return nothing.
+- **`Flush()`** pushes the buffer into the stream; the safe order is write, flush, then read the bytes.
+- The CSV code flushes each writer before `ToArray()` for exactly this reason.
+- **`AutoFlush`** flushes after every write (simple, slower), and **disposing** a writer flushes it too (which the `leaveOpen` pattern relies on).
+
+## What comes next
+
+**Part 5** is the other half of the finalization loop: **`IDisposable` and `using`**. Why streams, readers, and writers must be cleaned up at all, what `using` really compiles to, why disposal runs top layer first (CsvWriter, then StreamWriter, then MemoryStream), and how the manual disposes in the CSV code relate to the `using` statements from the read side.

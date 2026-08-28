@@ -1,0 +1,131 @@
+---
+title: "Encoding: the bridge between bytes and characters"
+date: 2026-08-27
+status: written
+minutes: 12
+order: 7
+lead: 'Every StreamReader and StreamWriter has been quietly translating between bytes and characters using an encoding. When that translation goes wrong, readable text turns into garbage. This part explains encodings, where that garbling comes from, and why the InvariantCulture in the CSV config is a different thing entirely.'
+---
+
+Parts 3 through 6 kept saying "UTF-8 by default" and moving on. This part stops and looks at what that means. Encoding is the rule that turns characters into bytes and back, and getting it wrong is the source of one of the most recognisable bugs in software: text that arrives as garbage.
+
+## A character is not a byte
+
+A stream stores bytes — numbers from 0 to 255. Text is made of characters. There are only 256 possible byte values, but there are many thousands of characters: Latin letters, accented letters, Greek, Cyrillic, Chinese, emoji. The characters cannot each fit in one byte, so there has to be a rule for turning characters into sequences of bytes and reading them back out.
+
+That rule is an **encoding**. Encoding is the direction characters-to-bytes; decoding is bytes-to-characters. A `StreamWriter` encodes; a `StreamReader` decodes. Everything else in this part is about which rule they use and what happens when two sides disagree.
+
+## The encodings that matter
+
+Only a few encodings come up in practice:
+
+| Encoding | Bytes per character | Covers | Notes |
+|---|---|---|---|
+| ASCII | 1 (values 0 to 127) | English letters, digits, basic punctuation | no accents, no non-Latin scripts |
+| UTF-8 | 1 to 4 (variable) | all of Unicode | ASCII-compatible; the web and .NET default |
+| UTF-16 | 2 or 4 | all of Unicode | what a .NET `string` uses in memory |
+
+**ASCII** is the original and the simplest: 128 characters, one byte each. It has no way to represent an accented letter, which is why it is rarely enough on its own.
+
+**UTF-8** is the modern default almost everywhere. It is *variable-width*: a plain ASCII character still takes a single byte (so UTF-8 is backward-compatible with ASCII), while accented and non-Latin characters take two, three, or four. This mix of compatibility and full Unicode coverage is why it won.
+
+**UTF-16** uses two bytes for most characters. It is what a .NET `string` is made of internally, which is a useful thing to know but rarely something to choose for a file.
+
+When encoding and decoding use the *same* rule, text round-trips perfectly:
+
+<Diagram title="Encode and decode must agree">
+  <DiagramRow>
+    <DiagramNode title="cafe (with accent)" sub="text" />
+    <DiagramArrow label="encode UTF-8" />
+    <DiagramNode title="63 61 66 C3 A9" sub="bytes" />
+    <DiagramArrow label="decode UTF-8" />
+    <DiagramNode title="cafe (with accent)" sub="text again" />
+  </DiagramRow>
+</Diagram>
+
+## The same bytes, different text
+
+The trouble starts when the two sides disagree. A byte sequence has no meaning on its own — it only becomes text once an encoding interprets it. The identical bytes, read under a different encoding, produce different characters:
+
+```text
+"cafe" + accented e, encoded as UTF-8:   63 61 66 C3 A9
+
+decoded as UTF-8    ->  cafe + accent    (correct)
+decoded as Latin-1  ->  cafA + copyright (garbage: C3 and A9 read as two separate chars)
+```
+
+The accented character was stored as two bytes (`C3 A9`) under UTF-8. A decoder expecting one byte per character reads those as two unrelated symbols, and the word comes out mangled.
+
+## Where mojibake comes from, and the fix
+
+That garbled output has a name — **mojibake** — and a single root cause: **text written with one encoding is read with another.** A file saved as UTF-8 and opened as Latin-1, a database column in one encoding queried by a client assuming another, a CSV produced on one system and parsed on a system with different defaults.
+
+The fix is equally single: **agree on an encoding, and make it UTF-8.** When every layer that touches the text uses UTF-8 to both write and read, the bytes round-trip and the accents survive. This is why the default across .NET is UTF-8, and why the safest habit is to state UTF-8 explicitly wherever an encoding can be passed:
+
+```csharp
+using var reader = new StreamReader("books.csv", Encoding.UTF8);
+using var writer = new StreamWriter("out.csv", append: false, Encoding.UTF8);
+```
+
+## The BOM: an invisible marker at the start
+
+There is a subtle wrinkle. A file can begin with a **Byte Order Mark** — a few bytes (for UTF-8, `EF BB BF`) that announce the encoding to whatever opens the file. A `StreamReader` detects and quietly skips it; that is helpful.
+
+The wrinkle is on the writing side. `Encoding.UTF8` in .NET *emits* a BOM by default, and some consumers — certain CSV parsers, some command-line tools — do not expect those three extra bytes at the front and choke on them or show a stray character before the first field. For machine-read formats like CSV and JSON, a BOM-less UTF-8 is often the safer choice:
+
+```csharp
+// Encoding.UTF8 writes a BOM (EF BB BF) at the start of the output.
+// A BOM-less UTF-8 avoids surprising downstream parsers:
+var utf8NoBom = new UTF8Encoding(encoderShouldEmitByteOrderMark: false);
+using var writer = new StreamWriter(stream, utf8NoBom);
+```
+
+The rule of thumb: BOM is fine for files a human opens in an editor, and a frequent nuisance for files another program parses.
+
+## The Encoding class
+
+All of this is exposed through the **`Encoding`** class. Its static members provide the common encodings, and its methods convert directly between text and bytes without a stream:
+
+| Member | What it does |
+|---|---|
+| `Encoding.UTF8` | the UTF-8 encoding |
+| `Encoding.ASCII` | the ASCII encoding |
+| `Encoding.Unicode` | UTF-16 |
+| `encoding.GetBytes(text)` | text to `byte[]` |
+| `encoding.GetString(bytes)` | `byte[]` to text |
+
+```csharp
+byte[] bytes = Encoding.UTF8.GetBytes("data");   // text -> bytes
+string text = Encoding.UTF8.GetString(bytes);    // bytes -> text
+```
+
+`GetBytes` and `GetString` are the same encode/decode the stream readers and writers perform, just done in one shot on data already in memory.
+
+## Encoding is not culture
+
+One last distinction, because it is the exact point where the CSV code invites confusion. The CSV configuration takes a `CultureInfo.InvariantCulture`:
+
+```csharp
+var config = new CsvConfiguration(CultureInfo.InvariantCulture);
+```
+
+This looks like it might be about text or encoding. It is not. **Culture** and **encoding** are two unrelated concerns:
+
+| Concern | Governs | Example setting |
+|---|---|---|
+| Encoding | bytes to and from characters | `Encoding.UTF8` |
+| Culture | number and date formatting, string comparison | `CultureInfo.InvariantCulture` |
+
+Encoding decides how `"café"` becomes bytes. Culture decides whether the number one-and-a-half is written `1.5` or `1,5`, how a date is laid out, and how strings sort — all of which vary by region. `InvariantCulture` pins those rules to a fixed, machine-neutral setting so a CSV produced on a machine in one country parses identically on a machine in another. It says nothing about UTF-8 and touches no bytes. A file has *both* an encoding (how its characters are stored) and is parsed under *a* culture (how its numbers and dates are interpreted); they are set separately and solve different problems.
+
+## What this part covered
+
+- An **encoding** is the rule mapping characters to byte sequences; writers encode, readers decode.
+- **UTF-8** is the default worth standardising on: ASCII-compatible, full Unicode, variable-width.
+- The **same bytes** decode to different text under different encodings — that mismatch is **mojibake**, fixed by using one encoding (UTF-8) everywhere.
+- The **BOM** is an optional marker at the start of a file; harmless for editors, often a nuisance for parsers, so BOM-less UTF-8 suits CSV and JSON.
+- **Encoding is not culture.** `InvariantCulture` fixes number and date formatting, not bytes — a separate concern from UTF-8.
+
+## What comes next
+
+**Part 8** is the capstone. Every layer built across this series comes together to read a book CSV, sort its rows into groups by genre, write one CSV per genre into in-memory streams, and pull the finished bytes out — the full read, transform, and write pipeline, with the dictionary-of-writers pattern, `Flush`, `ToArray`, and dispose-order all in one place, plus a look at doing it all asynchronously.

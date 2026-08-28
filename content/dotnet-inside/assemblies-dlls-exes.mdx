@@ -26,7 +26,7 @@ That is the entire distinction at the file level. Same insides, different doorwa
 
 Here is the part that upends the old mental model. Build a runnable application and the output contains *both* files:
 
-```
+```text
 build a runnable app  ->  output:
 |
 +-- MyApi.dll   the real program  (IL + metadata + manifest)
@@ -50,7 +50,7 @@ An application project (one whose output type is an executable, with a `Program.
 
 Real solutions are not one project. They split into several, and each project produces its own assembly:
 
-```
+```text
 Solution
 |
 +-- Api        -> Api.dll  + Api.exe (launcher)   <- startup project

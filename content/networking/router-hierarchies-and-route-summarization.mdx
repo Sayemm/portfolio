@@ -29,7 +29,7 @@ Because all of New York's subnets share the prefix `10.20`, a distant router doe
 
 Instead of carrying:
 
-```
+```text
 10.20.55.0/24 -> R4
 10.20.66.0/24 -> R4
 10.20.77.0/24 -> R4
@@ -37,7 +37,7 @@ Instead of carrying:
 
 it can keep a single summarised route:
 
-```
+```text
 10.20.0.0/16 -> R4
 ```
 
@@ -49,7 +49,7 @@ One route now covers every subnet in New York. This is the direct payoff of hier
 
 The number after the slash — the prefix length — says how many bits of the address are the "network" part that must match. The shorter the prefix, the broader the route; the longer the prefix, the more specific.
 
-```
+```text
 /24   match first 3 octets   10.20.55.x   one subnet
 /16   match first 2 octets   10.20.x.x    all of New York
 /8    match first 1 octet    10.x.x.x     everything under 10

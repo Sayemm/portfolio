@@ -1,4 +1,5 @@
 import { MDXRemote } from "next-mdx-remote/rsc";
+import remarkGfm from "remark-gfm";
 import rehypeSlug from "rehype-slug";
 import rehypePrettyCode, { type Options } from "rehype-pretty-code";
 import { mdxComponents, NoteToSelf } from "@/components/mdx";
@@ -47,6 +48,9 @@ export function NoteBody({ note }: { note: Note }) {
         components={mdxComponents}
         options={{
           mdxOptions: {
+            // Tables, strikethrough and autolinks are GitHub-flavoured
+            // markdown; plain remark renders a table as literal pipes.
+            remarkPlugins: [remarkGfm],
             rehypePlugins: [rehypeSlug, [rehypePrettyCode, prettyCode]],
           },
         }}

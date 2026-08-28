@@ -16,7 +16,7 @@ Order 3 drew the line: the runtime *runs* apps, the SDK *builds* them, and the S
 
 This is why a development box never installs the runtime separately. Two commands make the split visible:
 
-```
+```bash
 dotnet --list-sdks       # what can build
 dotnet --list-runtimes   # what can run
 ```
@@ -27,7 +27,7 @@ A machine can have several of each, at different versions, side by side.
 
 The SDK is not one program. It is a coordinated bundle of tools, each responsible for one part of turning source into a running application:
 
-```
+```text
 dotnet SDK
 |
 +-- Runtime          also lets the SDK run apps
@@ -62,7 +62,7 @@ MSBuild coordinates all of that and calls Roslyn as a *single step* inside it. T
 
 Every one of those tools is reached through a single command: `dotnet`.
 
-```
+```text
 dotnet new         scaffold a project from a template
 dotnet restore     fetch dependencies
 dotnet build       compile to IL, produce output
@@ -84,7 +84,7 @@ For repeatable builds across a team, a `global.json` file can pin which SDK vers
 
 The most-typed command is `dotnet build`, and it is a relay:
 
-```
+```text
 dotnet build
    -> CLI dispatches to MSBuild
    -> MSBuild reads the .csproj, restores, resolves references

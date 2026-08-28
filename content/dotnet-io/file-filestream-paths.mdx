@@ -1,0 +1,173 @@
+---
+title: "Files for real: File, FileStream, and paths"
+date: 2026-08-27
+status: written
+minutes: 12
+order: 6
+lead: 'Most file work needs one line: File.ReadAllText or File.WriteAllBytes. The rest of the time — large files, precise control, sharing rules — there is FileStream with its modes, plus the Path class for building locations that work on every operating system. This part covers real disk I/O.'
+---
+
+The series has talked *about* files since Part 2 without opening one. This part does the real thing: reading and writing actual files on disk, from the one-line convenience helpers down to `FileStream` with full control, and the `Path` class that keeps file locations correct across operating systems.
+
+## The easy path: the File helper methods
+
+Most of the time, reading or writing a file does not need the layered stack at all. The static **`File`** class bundles the whole thing — open, read or write, and dispose — into a single call:
+
+<Diagram title="A File helper bundles the whole stack into one call">
+  <DiagramRow>
+    <DiagramNode title="File.ReadAllText" sub="one call" />
+    <DiagramArrow label="opens, reads, disposes" />
+    <DiagramNode title="string" sub="the file contents" />
+  </DiagramRow>
+</Diagram>
+
+The common members:
+
+| Method | What it does |
+|---|---|
+| `File.ReadAllText(path)` | read the whole file into one string |
+| `File.ReadAllLines(path)` | read the file into a string array, one entry per line |
+| `File.ReadAllBytes(path)` | read the whole file into a `byte[]` |
+| `File.WriteAllText(path, text)` | create or overwrite the file with `text` |
+| `File.WriteAllLines(path, lines)` | write each line, with line breaks between them |
+| `File.AppendAllText(path, text)` | add text to the end, creating the file if needed |
+| `File.Exists(path)` | `true` if the file exists |
+| `File.Delete(path)` | delete the file |
+
+Reading and writing a book CSV becomes trivial:
+
+```csharp
+string text = File.ReadAllText("books.csv");      // the whole file as one string
+string[] lines = File.ReadAllLines("books.csv");  // one string per line
+
+File.WriteAllText("output.csv", "title,author,genre\n");
+File.WriteAllBytes("books.csv", bytes);           // write a byte[] straight to disk
+```
+
+That last line is the natural way to save the `byte[]` values the CSV write side produces — `ToArray()` gives the bytes, `File.WriteAllBytes` puts them on disk.
+
+## The catch: helpers load the whole file
+
+The convenience comes with a limit. `File.ReadAllText` and `File.ReadAllLines` load the **entire file into memory** at once. For a configuration file or a small CSV that is exactly right. For a multi-gigabyte log, it is a way to exhaust memory.
+
+When a file is large, or needs to be processed as it streams rather than all at once, the helpers give way to a `FileStream` wrapped in a `StreamReader` — reading one line at a time, holding only a little in memory (the Part 3 pattern). The rule of thumb: **small and simple, use `File`; large or streaming, use a `FileStream`.**
+
+## FileStream: a stream over a file
+
+A `FileStream` is the stream layer from Part 2, backed by a file on disk. Its constructor needs a path and a **`FileMode`**, and usually a **`FileAccess`** as well:
+
+```csharp
+using var stream = new FileStream(
+    "books.csv",
+    FileMode.Open,       // the file must already exist
+    FileAccess.Read);    // read only
+
+using var reader = new StreamReader(stream);   // then the familiar reader pattern
+string first = reader.ReadLine();
+```
+
+`FileMode` decides how the file is opened — whether it must exist, gets created, or gets emptied:
+
+| FileMode | Behaviour |
+|---|---|
+| `Open` | open an existing file; error if it is missing |
+| `OpenOrCreate` | open it if it exists, otherwise create it |
+| `Create` | create a new file, overwriting any existing one |
+| `CreateNew` | create a new file; error if it already exists |
+| `Append` | open or create, with the cursor at the end for appending |
+| `Truncate` | open an existing file and empty its contents |
+
+`FileAccess` decides what may be done once open:
+
+| FileAccess | Meaning |
+|---|---|
+| `Read` | read only |
+| `Write` | write only |
+| `ReadWrite` | both |
+
+There is a third, optional argument, **`FileShare`**, which controls whether *other* processes may open the same file while this one holds it — `None`, `Read`, `Write`, or `ReadWrite`. It matters for files that several programs touch at once (logs, shared data). For most single-program work the default is fine, but it is the knob to reach for when a file mysteriously reports "in use by another process."
+
+## Shortcuts that return a reader or writer
+
+Between the all-in-one `File` helpers and the full `FileStream` constructor sit a few shortcuts that open a file and hand back the reader or writer directly, skipping the explicit `FileStream`:
+
+```csharp
+using var reader = File.OpenText("books.csv");     // returns a StreamReader
+using var writer = File.CreateText("output.csv");  // returns a StreamWriter (overwrites)
+using var appender = File.AppendText("log.csv");   // returns a StreamWriter (appends)
+```
+
+These are the most convenient way to get a text reader or writer over a file when the defaults (UTF-8, standard sharing) are acceptable — which they usually are.
+
+## Paths: build them with Path, not string glue
+
+A file path is a string, but assembling one by gluing strings together is a bug waiting to happen: the separator differs by operating system (`/` versus `\`), and doubled or missing separators break the path. The **`Path`** class builds and inspects paths correctly:
+
+| Path method | Result for `data/books.csv` |
+|---|---|
+| `Path.Combine("data", "books.csv")` | joins with the OS-correct separator |
+| `Path.GetFileName(p)` | `books.csv` |
+| `Path.GetFileNameWithoutExtension(p)` | `books` |
+| `Path.GetExtension(p)` | `.csv` |
+| `Path.GetDirectoryName(p)` | `data` |
+| `Path.ChangeExtension(p, ".txt")` | `data/books.txt` |
+
+`Path.Combine` is the one to internalise — it inserts exactly one separator, in the form the current OS expects:
+
+```csharp
+string dir = "data";
+string path = Path.Combine(dir, "books.csv");            // data/books.csv, correctly
+string name = Path.GetFileNameWithoutExtension(path);    // books
+```
+
+This is how the capstone will name its output files — combining an output directory with each genre and a `.csv` extension, instead of concatenating strings by hand.
+
+## Relative versus absolute paths
+
+A path like `books.csv` is **relative** — it is resolved against the program's *current working directory*, which is not always where the file, or the program, actually lives. The same relative path can find the file when launched from one folder and fail from another.
+
+An **absolute** path (`/home/user/data/books.csv` or `C:\data\books.csv`) is unambiguous. When a location must be reliable, resolve it to an absolute path — `Path.GetFullPath` expands a relative one against the current directory, and framework helpers provide well-known base directories to build from. The short version: relative paths are convenient for quick scripts and fragile for anything that runs from more than one place.
+
+## Async file helpers
+
+Every `File` read/write helper has an async twin, for I/O that should not block a thread while the disk works — which matters in a web API handling many requests:
+
+```csharp
+string text = await File.ReadAllTextAsync("books.csv");
+await File.WriteAllBytesAsync("books.csv", bytes);
+```
+
+Same methods, same arguments, an `Async` suffix and an `await`. The full story of async I/O — why it matters and how it streams — comes with the capstone.
+
+## Bringing it back to the CSV
+
+With this part, both ends of the book pipeline can touch disk. Reading:
+
+```csharp
+using var reader = File.OpenText("books.csv");        // a StreamReader over the file
+using var csv = new CsvReader(reader, configuration);  // the Part 3 handoff
+```
+
+And writing each finished group out, using `Path.Combine` for the location and `File.WriteAllBytes` for the bytes:
+
+```csharp
+foreach (var group in groups)   // groups: genre -> byte[]
+{
+    string path = Path.Combine("output", group.Key + ".csv");
+    File.WriteAllBytes(path, group.Value);
+}
+```
+
+The parser and writer layers are unchanged from earlier parts — only the source and sink became real files.
+
+## What this part covered
+
+- The **`File`** helpers do open-read/write-dispose in one call, ideal for small files.
+- They load the **whole file into memory**, so large or streaming files use a **`FileStream`** plus a reader instead.
+- **`FileStream`** takes a **`FileMode`** (how to open) and **`FileAccess`** (what is allowed), with optional **`FileShare`** for concurrent access.
+- **`File.OpenText` / `CreateText` / `AppendText`** are shortcuts that hand back a ready reader or writer.
+- **`Path.Combine`** and friends build and inspect paths correctly across operating systems; prefer absolute paths where reliability matters.
+
+## What comes next
+
+**Part 7** fills in the translation that every `StreamReader` and `StreamWriter` has been doing quietly all along: **encoding**. What UTF-8 and UTF-16 actually are, why the same bytes can decode into different text, where the mojibake bugs come from, and how the `InvariantCulture` in the CSV configuration relates to all of it.

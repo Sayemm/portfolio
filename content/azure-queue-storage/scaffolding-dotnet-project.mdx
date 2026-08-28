@@ -1,0 +1,558 @@
+---
+title: "Scaffolding the .NET 10 Web API"
+date: 2026-08-25
+status: written
+minutes: 14
+order: 2
+lead: 'One command generates a working API in seconds — and every file it leaves behind exists for a reason. This part opens each one, explains what it does, strips out what is not needed, and reshapes the project into the structure the rest of the series builds on.'
+---
+
+Part 1 established what a queue is and got Azurite running locally. Nothing has been built yet. This part changes that.
+
+The goal here is not to write queue code — that starts in Part 5. The goal is to produce a clean, correctly structured .NET 10 Web API project and to understand every single file inside it. A scaffolded project that is not understood is just noise. A scaffolded project that is understood is a foundation.
+
+## Prerequisites
+
+Two things need to be in place before starting.
+
+**The .NET 10 SDK.** To check what is installed:
+
+```bash
+dotnet --version
+```
+
+The output should start with `10.` — for example `10.0.201`. If .NET is not installed, download it from [dotnet.microsoft.com](https://dotnet.microsoft.com/download).
+
+> **A note on version numbers.** The `dotnet --version` command reports the SDK version, not the runtime version. An SDK version of `10.0.201` means .NET 10. The patch numbers move constantly and do not matter for this series.
+
+**VS Code with the C# Dev Kit extension.** Any editor works, but VS Code with the official C# Dev Kit extension gives IntelliSense, error squiggles, and debugging without configuration. Install it from the Extensions panel by searching for "C# Dev Kit".
+
+## Creating the Project
+
+Start by making a folder for the project and opening it in the editor:
+
+```bash
+mkdir JobQueueApi
+cd JobQueueApi
+code .
+```
+
+The `code .` command opens VS Code in the current folder. If the terminal reports `command not found`, VS Code can be opened manually — File → Open Folder → select the `JobQueueApi` folder.
+
+Now open the integrated terminal inside VS Code with `Ctrl + ~` (or `Cmd + ~` on macOS) and run the scaffolding command:
+
+```bash
+dotnet new webapi -n JobQueueApi
+```
+
+Breaking that down:
+
+- `dotnet new` — the .NET CLI command that generates projects from templates
+- `webapi` — the template name, meaning "ASP.NET Core Web API"
+- `-n JobQueueApi` — names the project `JobQueueApi`
+
+To see what other templates exist, `dotnet new list` prints them all. Two web API templates appear in that list:
+
+```text
+ASP.NET Core Web API              webapi        [C#],F#
+ASP.NET Core Web API (native AOT) webapiaot     [C#]
+```
+
+The plain `webapi` template is the right one. The AOT variant compiles ahead of time for faster startup and smaller binaries, but it strips out reflection-based features that this project depends on. It is a specialised tool, not a default.
+
+The command creates a subfolder. Move into it:
+
+```bash
+cd JobQueueApi
+```
+
+## What the Template Generated
+
+Listing the contents shows a small set of files:
+
+```bash
+ls
+```
+
+```text
+JobQueueApi.csproj
+Program.cs
+appsettings.json
+appsettings.Development.json
+Properties/
+    launchSettings.json
+```
+
+Five files. Each one has a specific job.
+
+### JobQueueApi.csproj
+
+This is the **project file** — the manifest that describes the entire project to the .NET build system. Opening it shows something like this:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
+```
+
+Line by line:
+
+- `Sdk="Microsoft.NET.Sdk.Web"` — tells .NET this is a web project, which brings in ASP.NET Core automatically
+- `TargetFramework` — which version of .NET this project compiles against
+- `Nullable` — enables nullable reference type warnings, so the compiler flags places where `null` could sneak in unexpectedly
+- `ImplicitUsings` — automatically adds common `using` statements (like `System`, `System.Linq`, `System.Collections.Generic`) to every file, so they never need to be written manually
+
+This file also holds every NuGet package the project depends on. It rarely needs manual editing — the `dotnet add package` command updates it automatically.
+
+### Program.cs
+
+This is the **entry point** of the entire application. When the app starts, execution begins at the top of this file and runs downward.
+
+In older versions of .NET this responsibility was split across two files — `Program.cs` for startup and `Startup.cs` for configuration. Since .NET 6, everything lives in `Program.cs`. Any tutorial that mentions `Startup.cs` is written for .NET 5 or earlier.
+
+This file gets a full rewrite later in this part.
+
+### appsettings.json
+
+The **configuration file**. Connection strings, queue names, feature flags, logging levels — anything that might need to change between environments without recompiling the code lives here.
+
+The generated version is minimal:
+
+```json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*"
+}
+```
+
+Part 3 adds the Azure Storage connection string and queue names to this file.
+
+### appsettings.Development.json
+
+The same structure, but these values **override** `appsettings.json` when the app runs in the Development environment. This is how environment-specific configuration works in .NET — a base file plus environment overrides.
+
+The environment is determined by the `ASPNETCORE_ENVIRONMENT` variable, which `launchSettings.json` sets to `Development` during local runs.
+
+### Properties/launchSettings.json
+
+This file controls **how the app runs locally**. It sets the port, the environment variable, and whether a browser opens automatically. It only affects local development — it is completely ignored in production.
+
+Opening it reveals the port assignment:
+
+```json
+{
+  "profiles": {
+    "http": {
+      "commandName": "Project",
+      "applicationUrl": "http://localhost:5295",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      }
+    }
+  }
+}
+```
+
+> **The port number is randomly assigned.** The .NET template picks a random port when generating the project, so the number here will differ from any tutorial or article. Whatever appears in this file is the port to use. It can be changed to anything else if preferred.
+
+## The First Run
+
+Before changing anything, it is worth running the project as-is to confirm the toolchain works:
+
+```bash
+dotnet run
+```
+
+The output looks something like this:
+
+```text
+Using launch settings from Properties/launchSettings.json...
+Building...
+info: Microsoft.Hosting.Lifetime[14]
+      Now listening on: http://localhost:5295
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0]
+      Hosting environment: Development
+info: Microsoft.Hosting.Lifetime[0]
+      Content root path: /path/to/JobQueueApi
+warn: Microsoft.AspNetCore.HttpsPolicy.HttpsRedirectionMiddleware[3]
+      Failed to determine the https port for redirect.
+```
+
+Several things to unpack here.
+
+**"Now listening on: http://localhost:5295"** — the app is running and accepting HTTP requests on that port. This is the number from `launchSettings.json`.
+
+**"Hosting environment: Development"** — confirms `ASPNETCORE_ENVIRONMENT` was set correctly, which means `appsettings.Development.json` is being applied on top of `appsettings.json`.
+
+**The HTTPS warning.** This one causes a lot of confusion. The generated `Program.cs` includes a line called `UseHttpsRedirection()`, which tries to redirect every HTTP request to HTTPS. But no HTTPS port is configured locally and no development certificate is set up, so ASP.NET cannot perform that redirect and logs a warning.
+
+This is a **warning, not an error**. The app runs fine. HTTP requests still work. That line gets removed shortly, and the warning disappears with it.
+
+To confirm the app is genuinely responding, open a second terminal (leaving the app running in the first) and hit the generated endpoint:
+
+```bash
+curl http://localhost:5295/weatherforecast
+```
+
+The response is a JSON array of fake weather data:
+
+```json
+[
+  {"date":"2026-08-26","temperatureC":18,"summary":"Mild","temperatureF":64},
+  {"date":"2026-08-27","temperatureC":-4,"summary":"Freezing","temperatureF":25}
+]
+```
+
+The toolchain works. Stop the app with `Ctrl + C`.
+
+## Understanding the Generated Program.cs
+
+Opening `Program.cs` reveals something that may be surprising — it contains a fully working weather forecast API written entirely inside this one file:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddOpenApi();
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+}
+
+app.UseHttpsRedirection();
+
+var summaries = new[]
+{
+    "Freezing", "Bracing", "Chilly", "Cool", "Mild",
+    "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
+};
+
+app.MapGet("/weatherforecast", () =>
+{
+    var forecast = Enumerable.Range(1, 5).Select(index =>
+        new WeatherForecast
+        (
+            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
+            Random.Shared.Next(-20, 55),
+            summaries[Random.Shared.Next(summaries.Length)]
+        ))
+        .ToArray();
+    return forecast;
+})
+.WithName("GetWeatherForecast");
+
+app.Run();
+
+record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
+{
+    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
+}
+```
+
+Walking through it:
+
+**`WebApplication.CreateBuilder(args)`** — creates the application builder. This single call sets up configuration loading (reading `appsettings.json`), logging, and the dependency injection container. Everything the app needs to bootstrap.
+
+**`builder.Services.AddOpenApi()`** — registers OpenAPI (formerly Swagger) support, which generates interactive API documentation.
+
+**`builder.Build()`** — takes everything registered on the builder and produces the finished application. This is a hard boundary: after this line, no new services can be registered. Part 7 covers why that boundary matters.
+
+**`if (app.Environment.IsDevelopment())`** — a conditional that only runs locally. API documentation is exposed during development but not in production, where it could leak implementation details.
+
+**`app.UseHttpsRedirection()`** — the line causing the warning seen earlier.
+
+**`app.MapGet("/weatherforecast", () => { ... })`** — the actual API endpoint, route and logic defined together inline.
+
+**`app.Run()`** — starts the web server and blocks, listening for requests until the process is stopped.
+
+**`record WeatherForecast(...)`** — a data model declared at the bottom of the same file. A `record` is a lightweight immutable class, ideal for simple data shapes.
+
+## Two Ways to Build an API in .NET
+
+That generated code demonstrates one of two distinct approaches to building APIs in ASP.NET Core. Understanding the difference matters, because the rest of this series uses the other one.
+
+### Minimal APIs
+
+Endpoints are defined inline in `Program.cs` using `MapGet`, `MapPost`, `MapPut`, and `MapDelete`:
+
+```csharp
+app.MapGet("/weatherforecast", () =>
+{
+    return "some data";
+});
+```
+
+Everything — route, HTTP verb, and logic — sits in one place. This was introduced in .NET 6 and is the default for the `webapi` template.
+
+**Strengths:** minimal ceremony, fast to write, easy to read for tiny APIs. Ideal for microservices with a handful of endpoints or quick prototypes.
+
+**Weaknesses:** `Program.cs` grows without bound. With twenty endpoints it becomes a wall of code. Shared logic across endpoints (authentication, validation, common setup) has no natural home.
+
+### Controller-based APIs
+
+Endpoints live in dedicated classes called controllers, in separate files:
+
+```csharp
+[ApiController]
+[Route("jobs")]
+public class JobsController : ControllerBase
+{
+    [HttpPost("push/{id}")]
+    public IActionResult PushJob(Guid id)
+    {
+        return Ok();
+    }
+}
+```
+
+Each controller groups related endpoints. Attributes declare routes and HTTP verbs. `Program.cs` stays small — it just registers that controllers exist and lets ASP.NET discover them.
+
+**Strengths:** organisation scales. Related endpoints group naturally. Cross-cutting concerns (filters, attributes, base controllers) have a clear place to live. This is what the overwhelming majority of production .NET codebases use.
+
+**Weaknesses:** more files, more ceremony for very small APIs.
+
+### Which One This Series Uses
+
+Controllers. Three reasons:
+
+1. **It matches production reality.** Reading an existing enterprise .NET codebase means reading controllers. Learning the pattern here means recognising it there.
+2. **The structure teaches the concepts.** Separating the controller, the helper, the models, and the configuration into distinct files makes the responsibilities of each one visible. In a minimal API, they blur together.
+3. **It demonstrates dependency injection properly.** Controllers receive their dependencies through constructor injection, which is the concept Part 3 and Part 7 dig into. Minimal APIs can do DI too, but the mechanism is less obvious.
+
+## Installing the Azure Queue Storage Package
+
+The .NET base libraries know nothing about Azure. Talking to Azure Queue Storage requires the official SDK package:
+
+```bash
+dotnet add package Azure.Storage.Queues
+```
+
+The output confirms the installation:
+
+```text
+info : Adding PackageReference for package 'Azure.Storage.Queues' into project 'JobQueueApi.csproj'.
+info : Installed Azure.Storage.Queues 12.x.x from https://api.nuget.org/v3/index.json
+```
+
+Opening `JobQueueApi.csproj` now shows a new section:
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Azure.Storage.Queues" Version="12.24.0" />
+</ItemGroup>
+```
+
+This is how .NET tracks dependencies. Anyone cloning this repository runs `dotnet restore` and NuGet downloads exactly these packages at exactly these versions.
+
+> **What this package provides.** `Azure.Storage.Queues` contains `QueueClient` — the class that handles all communication with a queue. It manages the HTTP calls, authentication, retries, and serialisation of requests. Part 5 uses it heavily. Notably, this same package works identically against Azurite and against real Azure — only the connection string differs.
+
+## Creating the Folder Structure
+
+The template generated a flat project. Adding structure now makes every subsequent part obvious about where code belongs:
+
+```bash
+mkdir Controllers Helpers Models Settings
+```
+
+Four folders, each with a single clear responsibility:
+
+<Diagram title="Project structure and responsibilities">
+  <DiagramRow>
+    <DiagramNode title="Controllers" sub="HTTP entry points" />
+    <DiagramNode title="Helpers" sub="Azure SDK wrapper" />
+  </DiagramRow>
+  <DiagramRow>
+    <DiagramNode title="Models" sub="data shapes" />
+    <DiagramNode title="Settings" sub="typed configuration" />
+  </DiagramRow>
+</Diagram>
+
+**Controllers** — classes that receive HTTP requests and return HTTP responses. They orchestrate but contain no business logic of their own.
+
+**Helpers** — the code that actually talks to Azure Queue Storage. Isolating this means the Azure SDK is only referenced in one place. If the storage mechanism ever changes, only these files change.
+
+**Models** — the data shapes. What goes into a queue message, what comes back in an API response, and the enums that give both of those meaning.
+
+**Settings** — typed classes that hold configuration values read from `appsettings.json`.
+
+> **Folders are not just organisation.** In .NET, folder names become part of the namespace by convention. A class in `Models/QueueJobModel.cs` gets the namespace `JobQueueApi.Models`. This makes imports readable and makes the project navigable by name alone.
+
+## Rewriting Program.cs
+
+The generated `Program.cs` contains a weather forecast API that has nothing to do with this project. Time to replace it entirely.
+
+Delete everything in `Program.cs` and replace it with:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+
+var app = builder.Build();
+
+app.MapControllers();
+
+app.Run();
+```
+
+Six lines. Here is what each one does and what was deliberately removed.
+
+**`WebApplication.CreateBuilder(args)`** — unchanged. Sets up configuration, logging, and the dependency injection container.
+
+**`builder.Services.AddControllers()`** — replaces `AddOpenApi()`. This registers everything needed for controller-based APIs: routing, model binding, JSON serialisation, and content negotiation. It also scans the assembly and discovers every controller class automatically. No manual registration required.
+
+**`builder.Build()`** — unchanged. Produces the finished app and seals the dependency injection container.
+
+**`app.MapControllers()`** — replaces the inline `MapGet` call. This activates the routes declared by attributes on controller classes. Without this line, controllers exist but no request ever reaches them.
+
+**`app.Run()`** — unchanged. Starts the server.
+
+### What Was Removed and Why
+
+**`AddOpenApi()` and `MapOpenApi()`** — API documentation is not needed for this project. Testing happens through Postman and Azure Storage Explorer. Removing it keeps the startup path minimal and easier to reason about.
+
+**`UseHttpsRedirection()`** — this caused the warning during the first run. Local development uses plain HTTP, so redirecting to HTTPS serves no purpose and only produces noise. In production this line belongs, backed by a real certificate.
+
+**The weather forecast endpoint and record** — sample code from the template. It demonstrated minimal APIs, which this project does not use.
+
+## Verifying the Scaffold
+
+Two checks confirm everything is in order.
+
+First, that the project compiles:
+
+```bash
+dotnet build
+```
+
+The expected output:
+
+```text
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+Note that the warnings are now zero — removing `UseHttpsRedirection()` eliminated the HTTPS message.
+
+> **`dotnet build` versus `dotnet run`.** The build command compiles the code and reports errors without starting the application. It is significantly faster than a full run and is the right tool for a quick correctness check after writing code. `dotnet run` builds *and* starts the server.
+
+Second, that the app still starts:
+
+```bash
+dotnet run
+```
+
+The output is now cleaner — no HTTPS warning:
+
+```text
+Now listening on: http://localhost:5295
+Application started. Press Ctrl+C to shut down.
+Hosting environment: Development
+```
+
+Hitting any URL now returns a 404:
+
+```bash
+curl -i http://localhost:5295/weatherforecast
+```
+
+```text
+HTTP/1.1 404 Not Found
+```
+
+This 404 is **the correct result**. The weather forecast endpoint was deleted and no controllers have been written yet, so the app has zero routes. A 404 proves the server is running and routing is functioning — it received the request, looked for a matching route, found none, and responded appropriately. A connection error would indicate a problem. A 404 does not.
+
+## The Project So Far
+
+```text
+JobQueueApi/
+├── Controllers/                 empty — filled in Part 6
+├── Helpers/                     empty — filled in Part 5
+├── Models/                      empty — filled in Part 4
+├── Settings/                    empty — filled in Part 3
+├── appsettings.json             config — extended in Part 3
+├── appsettings.Development.json environment overrides
+├── Program.cs                   6 lines, rewritten
+├── JobQueueApi.csproj           now includes Azure.Storage.Queues
+└── Properties/
+    └── launchSettings.json      local port and environment
+```
+
+Four empty folders and a six-line `Program.cs` may not feel like much progress. It is. Every file that follows has an obvious home, the Azure SDK is available, and the startup path is small enough to hold in mind completely.
+
+## Command Reference
+
+Everything used in this part, in one place:
+
+```bash
+# Check the installed .NET SDK version
+dotnet --version
+
+# See all available project templates
+dotnet new list
+
+# Create a new Web API project
+dotnet new webapi -n JobQueueApi
+
+# Install the Azure Queue Storage SDK
+dotnet add package Azure.Storage.Queues
+
+# Compile and check for errors without running
+dotnet build
+
+# Compile and start the application
+dotnet run
+
+# Restore packages listed in the .csproj (after cloning a repo)
+dotnet restore
+```
+
+## Common Questions at This Stage
+
+### Why does the port number differ from the article?
+
+The .NET template assigns a random port when generating the project and writes it into `launchSettings.json`. Every generated project gets a different one. Whatever number appears in that file is the correct port for that project, and it can be edited to any preferred value.
+
+### Is it a problem that the folders are empty?
+
+No. Git does not track empty folders, so they will not appear in a commit until they contain files — but locally they exist and serve as a map of where upcoming code belongs. Each one gets filled in the parts ahead.
+
+### Why remove OpenAPI when it generates useful documentation?
+
+For a production API, OpenAPI is genuinely valuable. For this project it adds startup code that has nothing to do with queue storage, which makes `Program.cs` harder to reason about while learning. It can always be added back with a single line once the core concepts are solid.
+
+### What is the difference between `dotnet build` and `dotnet run`?
+
+`dotnet build` compiles the code and stops. It reports compilation errors quickly without starting a server. `dotnet run` performs the same build and then launches the application. During development, `dotnet build` is the fast feedback loop after writing code; `dotnet run` is for actually testing behaviour.
+
+## What Was Accomplished in This Part
+
+- ✅ A .NET 10 Web API project created and running
+- ✅ Every generated file opened and understood
+- ✅ The difference between Minimal APIs and Controller-based APIs understood, and a deliberate choice made
+- ✅ The `Azure.Storage.Queues` SDK installed and visible in the project file
+- ✅ A four-folder structure created with clear responsibilities
+- ✅ `Program.cs` reduced to six understood lines
+- ✅ A clean build with zero warnings and a running server
+
+## What Comes Next
+
+**Part 3** tackles configuration. The Azure connection string and queue names need to reach the code without being hardcoded, which introduces the Options Pattern — one of the most commonly used and most commonly misunderstood features in .NET.
+
+That part covers what `appsettings.json` binding actually does, why registering a settings class with `AddSingleton` silently produces an empty object, what `IOptions<T>` is and why it wraps the settings class at all, and an enum-keyed dictionary pattern for managing queue names without magic strings.

@@ -38,7 +38,7 @@ One clarification prevents a common confusion: **a MAC address belongs to an int
 
 And "interface" is more physical than it sounds — **an interface is one port you plug a cable into** (or one radio, for Wi-Fi). Look at the back of the box: each jack is an interface, each with its own NIC behind it, so each has its own MAC. That makes the count concrete — MAC count simply tracks interface count:
 
-```
+```text
 device               interfaces           MACs
 ------               ----------           ----
 simple host          1 NIC                1

@@ -26,7 +26,7 @@ That is it. A single method that produces an *enumerator*. `IEnumerable<T>` itse
 
 Contrast the contracts:
 
-```
+```text
 List<T>           "I store items; add, remove, index, count them."   — large contract
 IEnumerable<T>    "I can hand you my items, one at a time."          — minimal contract
 ```
@@ -55,7 +55,7 @@ So an enumerator offers: `MoveNext()` to step forward, `Current` to read where i
 
 Two roles, kept separate on purpose:
 
-```
+```text
 IEnumerable<T>   the sequence         — "iteration is possible"
 IEnumerator<T>   the cursor over it   — "here is the current position, and a way to advance"
 ```
@@ -112,7 +112,7 @@ public static IEnumerable<T> Where<T>(this IEnumerable<T> source, Func<T, bool> 
 
 Written once, it works on every type that implements `IEnumerable<T>`:
 
-```
+```text
 IEnumerable<T>   "you can enumerate my elements"
 |
 +- List<T>                     array-backed, growable, indexable
@@ -129,7 +129,7 @@ IEnumerable<T>   "you can enumerate my elements"
 
 `IEnumerable<T>` sits at the base of a hierarchy that adds capability step by step:
 
-```
+```text
 IEnumerable<T>              GetEnumerator only — walk forward, once per cursor
 |
 +- ICollection<T>          + Count, Add, Remove, Clear, Contains, CopyTo

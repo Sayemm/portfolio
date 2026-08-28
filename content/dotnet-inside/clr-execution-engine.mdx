@@ -13,7 +13,7 @@ The runtime article gave the anatomy: the CLR contains a loader, a type system, 
 
 The CLR (CoreCLR) is the execution engine, and its job is everything between "there is IL to run" and "the correct native effect happens, safely." None of it is a one-time step. Each is a responsibility held for the whole life of the process:
 
-```
+```text
 CLR responsibilities  (active the whole time code runs)
 |
 +-- Load      find + load assemblies, build type structures

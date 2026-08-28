@@ -38,7 +38,7 @@ CoreCLR loads the application assembly and reads its **manifest** — the identi
 
 This is where self-describing assemblies pay off: the runtime needs no external description of the program. Each file carries its own manifest, so loading the graph is just following references from one manifest to the next.
 
-```
+```text
 dotnet MyApi.dll   (or MyApi.exe apphost)
 |
 +-- 1. Host starts

@@ -11,7 +11,7 @@ lead: 'dotnet build is a single command, but not a single action. Between typing
 
 The earlier look at the SDK ended on a relay: `dotnet build` hands off to a chain of tools. Here is that chain in full. The important idea up front — a build is a pipeline, and compiling the code is only one stage of it:
 
-```
+```text
 dotnet build
 |
 +-- 1. Dispatch    CLI hands off to MSBuild
@@ -55,7 +55,7 @@ Output of this stage: `MyApi.dll` — portable IL, as the "why .NET exists" arti
 
 Roslyn produced an assembly. MSBuild now produces a *runnable folder*. Into `bin/Debug/net8.0/` it writes:
 
-```
+```text
 MyApi.dll                the IL Roslyn produced
 MyApi.pdb                debug symbols (line numbers for stack traces)
 MyApi.deps.json          the dependency graph, so the host knows what to load

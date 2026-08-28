@@ -29,7 +29,7 @@ The CLR is already at work. The HttpContext, the header strings, the buffers —
 
 The request enters the **middleware pipeline** — the ordered chain assembled at startup. Each middleware receives the request, may inspect or change it, and then either passes it onward or short-circuits and responds itself.
 
-```
+```text
 request in
   |
   v  exception handler  ---------------------+

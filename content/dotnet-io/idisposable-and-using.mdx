@@ -1,0 +1,189 @@
+---
+title: "IDisposable and using: cleaning up, in the right order"
+date: 2026-08-27
+status: written
+minutes: 13
+order: 5
+lead: 'A file handle that is never released stays locked. A stream that is never closed leaks. IDisposable and using are how .NET makes cleanup automatic and correct — and they are the other half of the CSV code, from the read-side using statements to the write-side dispose loop.'
+---
+
+Every part so far has ended with a note about cleanup. This part pays that off. It explains why streams, readers, and writers have to be released at all, what `using` actually does, and why the dispose calls in the CSV write code run in the order they do.
+
+## Why cleanup is needed at all
+
+C# has a garbage collector that reclaims memory automatically, so it is fair to ask why anything needs manual cleanup. The answer is that some resources are **not** plain memory.
+
+When a `FileStream` opens a file, the operating system hands out a *file handle* — a limited, OS-level resource that lives outside the .NET managed heap. The garbage collector does not track it directly and will not release it promptly. The same is true of network sockets, database connections, and OS buffers. Left unreleased, these leak: the file stays locked so nothing else can open it, connections pile up until the pool is exhausted, and buffered writes may never reach disk.
+
+These are called **unmanaged resources**, and the rule is simple: whoever holds one is responsible for releasing it, explicitly, as soon as it is no longer needed.
+
+## IDisposable: one method, Dispose()
+
+.NET expresses "this object holds something that must be released" through a single interface:
+
+```csharp
+public interface IDisposable
+{
+    void Dispose();   // release whatever this object is holding
+}
+```
+
+Any type that wraps an unmanaged resource implements `IDisposable` and puts its cleanup logic in `Dispose()`. Every stream, reader, and writer in this series does: `FileStream`, `MemoryStream`, `StreamReader`, `StreamWriter`, `StringReader`, `StringWriter`, and `CsvReader` / `CsvWriter` are all `IDisposable`. Seeing that a type is disposable is the signal that it needs cleanup.
+
+## Manual Dispose, and why it is fragile
+
+The cleanup can be done by hand:
+
+```csharp
+var reader = new StringReader(csvContent);
+var csv = new CsvReader(reader, configuration);
+
+// use csv...
+
+csv.Dispose();
+reader.Dispose();
+```
+
+This works, but it is easy to get wrong in two ways. It is easy to simply forget the `Dispose()` calls. And worse, if the code in the middle throws an exception, execution jumps past the `Dispose()` lines entirely — the resources leak precisely when something has already gone wrong. Reliable cleanup needs to survive exceptions, and hand-written `Dispose()` calls do not.
+
+## The using statement: cleanup that always runs
+
+The `using` statement solves both problems. It guarantees `Dispose()` is called when the block exits, no matter how it exits — normal completion, an early `return`, or an exception:
+
+```csharp
+using (var reader = new StringReader(csvContent))
+using (var csv = new CsvReader(reader, configuration))
+{
+    // use csv...
+}   // csv disposed first, then reader — guaranteed
+```
+
+Under the hood, `using` compiles to a `try/finally`, which is what makes the guarantee hold:
+
+```text
+using (var reader = new StringReader(csvContent))
+{
+    // use reader...
+}
+
+// compiles to roughly:
+var reader = new StringReader(csvContent);
+try
+{
+    // use reader...
+}
+finally
+{
+    reader.Dispose();   // runs no matter how the block is left
+}
+```
+
+The `finally` block runs on every exit path, so the resource is released even if the body throws. That is the whole reason to prefer `using` over manual `Dispose()`.
+
+## The using declaration: the read-side pattern
+
+C# 8 added a lighter form — the **using declaration** — which is what the original CSV read code uses:
+
+```csharp
+using var reader = new StringReader(csvContent);
+using var csv = new CsvReader(reader, configuration);
+
+// use csv...
+// no braces: both are disposed automatically at the end of the enclosing method
+```
+
+There is no block and no extra indentation. The rule is: an object declared with `using var` is disposed when the **enclosing scope ends** (usually the method). It is the same guarantee as the `using` statement, written more compactly. When several are declared in a row, they are disposed in **reverse order** of declaration — which turns out to matter.
+
+## Multiple resources close in reverse order
+
+When resources are stacked, they are torn down last-created-first. Creation runs down the layers of the stack; disposal runs back up:
+
+<Diagram title="Build bottom layer first, tear top layer first">
+  <DiagramRow>
+    <DiagramNode title="MemoryStream" sub="created 1st" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="StreamWriter" sub="created 2nd" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="CsvWriter" sub="created 3rd" />
+  </DiagramRow>
+  <DiagramArrow down label="dispose in reverse" align="start" />
+  <DiagramRow>
+    <DiagramNode title="CsvWriter" sub="disposed 1st" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="StreamWriter" sub="disposed 2nd" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="MemoryStream" sub="disposed 3rd" />
+  </DiagramRow>
+</Diagram>
+
+Stacked `using` declarations do this automatically. But *why* is this the correct order, rather than an arbitrary convention?
+
+## Why the order matters: the top flushes into the bottom
+
+The top layer depends on the layer beneath it, and its cleanup often *writes to* that lower layer. Disposing a `CsvWriter` finishes any pending CSV output and flushes it down into the `StreamWriter`; disposing the `StreamWriter` flushes its buffer down into the `MemoryStream`. Each layer, on the way out, needs the layer below it to still be alive.
+
+Reverse that order and it breaks: dispose the `MemoryStream` first, and then disposing the `StreamWriter` tries to flush its buffer into a stream that is already closed — an error, or silently lost data. **A layer must be disposed before the layer it writes to.** Since creation went bottom-to-top, disposal must go top-to-bottom.
+
+## Why the write code disposes by hand
+
+The read side gets this ordering for free from stacked `using` declarations. The write side cannot, and that is why its cleanup is a manual loop.
+
+The reason is *where the objects live*. On the write side, each group's stream/writer/CsvWriter is created inside a loop and **stored in a dictionary** to be reused across many input rows. A `using` cannot wrap something that has to outlive the current iteration — it would dispose the writer immediately, long before the next row for that group arrives:
+
+```csharp
+// created inside a loop and STORED for later — a using here would dispose too early
+var stream = new MemoryStream();
+var writer = new StreamWriter(stream);
+var csvWriter = new CsvWriter(writer, configuration);
+writers[group] = (stream, writer, csvWriter);
+```
+
+Because `using` does not fit, the finalization loop takes on the ordering responsibility itself — and follows the exact top-first rule:
+
+```csharp
+foreach (var entry in writers)
+{
+    entry.Value.Writer.Flush();                       // finish writing (Part 4)
+    groups[entry.Key] = entry.Value.Stream.ToArray(); // read the bytes while all alive
+    entry.Value.Csv.Dispose();                        // 1. top layer
+    entry.Value.Writer.Dispose();                     // 2. middle layer
+    entry.Value.Stream.Dispose();                     // 3. bottom layer
+}
+```
+
+`Csv`, then `Writer`, then `Stream` — top to bottom, the same order stacked `using` declarations would have produced automatically. The manual disposes are the price of storing the objects in a dictionary for later.
+
+## Wrappers cascade, and Dispose is safe to repeat
+
+Two details make the manual loop robust. First, a wrapper disposes what it wraps: disposing a `StreamWriter` disposes its underlying stream by default, and disposing a `CsvWriter` disposes its `TextWriter`. So in principle, disposing the top object could cascade all the way down. Second, `Dispose()` is **idempotent** — calling it more than once on the same object is harmless.
+
+Together, those mean the explicit three disposes are partly redundant (the cascade would have reached the lower layers anyway) but perfectly safe, and they make the intended order obvious on the page rather than hidden inside cascade behaviour. When a wrapper should *not* close the stream underneath it — for instance, to `ToArray()` a `MemoryStream` after the writer is gone — the `leaveOpen: true` constructor option switches the cascade off (the pattern from Part 4).
+
+## Async cleanup: await using
+
+Streams that release their resource asynchronously implement `IAsyncDisposable`, and are cleaned up with `await using`:
+
+```csharp
+await using var stream = new FileStream("books.csv", FileMode.Open);
+// disposed asynchronously at the end of scope
+```
+
+It is the same idea as `using`, for resources whose teardown involves awaiting I/O (flushing to disk, closing a network connection). Async I/O gets its own treatment later; this is just the disposal form that goes with it.
+
+## Gotchas worth remembering
+
+- **Using a disposed object throws.** Touching a stream, reader, or writer after its `using` scope ends raises `ObjectDisposedException`. The classic case is calling `ToArray()` after the `using` that owned the writer has already closed the stream.
+- **Returning a disposable from inside its own using disposes it too early.** If a method wraps a resource in `using` and returns it, the caller receives an already-disposed object. Either do not use `using` on something being returned, or return a copy of the data instead.
+- **Disposal order is not cosmetic.** Bottom-first disposal can lose buffered data or throw. Reverse-of-creation is the rule, whether `using` enforces it or the code does it by hand.
+
+## What this part covered
+
+- Streams, readers, and writers hold **unmanaged resources** the garbage collector will not release promptly, so they must be disposed.
+- **`IDisposable`** provides `Dispose()`; **`using`** guarantees it runs by compiling to `try/finally`, even on exceptions.
+- The **using declaration** (`using var`) disposes at end of scope, and stacked declarations dispose in **reverse order** — top layer first.
+- Order matters because each layer **flushes into the one below** on cleanup, so the lower layer must still be open.
+- The write code disposes **manually** because its objects live in a dictionary and cannot be wrapped in `using`, so it follows the top-first order by hand.
+
+## What comes next
+
+**Part 6** leaves the abstractions and works with real files: the `File` helper methods, `FileStream` with its `FileMode` and `FileAccess` options, and the `Path` class for building and combining paths safely. It is where the `FileStream` mentioned since Part 2 finally gets its full treatment.

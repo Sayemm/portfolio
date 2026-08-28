@@ -17,7 +17,7 @@ That "somewhere" is .NET. And the machine-code translation, though it is where o
 
 Order 1 established that native code is pinned to a CPU-plus-OS pair. Spell that matrix out and the problem becomes obvious:
 
-```
+```text
 Windows  x64        Linux  x64        macOS  Intel
 Windows  ARM64      Linux  ARM64      macOS  Apple Silicon
                     ... and every future architecture
@@ -29,7 +29,7 @@ The escape hatch is the intermediate language from order 1. C# compiles **once**
 
 ## Compile once to IL, finish on the machine
 
-```
+```text
 C# source
   |
   v

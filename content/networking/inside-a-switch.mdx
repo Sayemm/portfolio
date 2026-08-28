@@ -51,7 +51,7 @@ Because it now knows A's port, it **forwards** the reply out that one port only,
 
 So switching "warms up" in essentially two messages. The first, A to D, floods and teaches the switch about A. The reply, D to A, teaches it about D and is already a precise forward. After those two, the conversation is fully contained:
 
-```
+```text
 message 1   A -> D, arrives on port 5:
   table:  A -> port 5              (learned A from source)
   D unknown  ->  FLOOD out all other ports

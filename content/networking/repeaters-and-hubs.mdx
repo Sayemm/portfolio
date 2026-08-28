@@ -27,7 +27,7 @@ So far every connection has been one host wired straight to another. Watch what 
 
 That cost is not linear — it is quadratic. Wiring N hosts directly to each other (a *full mesh*) needs N × (N − 1) / 2 separate links:
 
-```
+```text
 hosts   direct links needed
   2        1
   3        3
@@ -44,7 +44,7 @@ Fifty hosts would need over twelve hundred cables, and every single new host mak
 
 The escape is to stop connecting hosts to each other and instead connect every host *once* to a central device. Adding a host is then a single cable to that device, and it immediately has reach to everyone already attached. This shape is a **star topology**:
 
-```
+```text
   A --+
   B --+-- [ central device ]
   C --+
@@ -61,7 +61,7 @@ Now N hosts need N cables, not N × (N − 1) / 2. The growth is linear instead 
 
 The first answer was the **hub**, and it is exactly what it sounds like: a repeater with many ports. Whatever arrives on one port is regenerated and sent out *all the other ports*.
 
-```
+```text
 A sends one frame:
 
   A --> [ HUB ] --> B   (copy)

@@ -1,0 +1,151 @@
+---
+title: "The layered I/O stack: why moving data takes four objects, not one"
+date: "2026-08-26"
+status: "written"
+minutes: 11
+order: 1
+lead: "Reading a CSV touches a File, a Stream, a Reader, and a parser. Writing one runs the same four layers in reverse. That is not clutter — each layer does exactly one translation, and once the layers are named, code like new CsvWriter(new StreamWriter(new MemoryStream()), config) reads as a pipeline instead of a pile. This note draws the map the rest of the series fills in."
+---
+
+This is a ground-up series on .NET I/O — files, streams, readers, and writers. By the end, the kind of code that reads a CSV into objects and builds new CSVs back out as bytes will be fully understandable, every layer and every line.
+
+This first part does not write much code. That is intentional. The single biggest mistake when learning I/O is treating `FileStream`, `StreamReader`, and `CsvReader` as interchangeable noise to be copied from Stack Overflow. They are not noise. Each one does a specific job, and once those jobs are clear, the rest of the series feels obvious instead of mysterious.
+
+## The core problem: bytes on one side, meaning on the other
+
+A file on disk is not text. It is a sequence of **bytes** — numbers from 0 to 255. A network connection carries bytes. Memory holds bytes. At the lowest level, the world outside a program only ever moves bytes.
+
+A program wants **meaning**: a string like `"Dune"`, a number like `1965`, a `Book` object. Getting between raw bytes and meaning is not one step — it is two.
+
+<Diagram title="Two translations sit between bytes and objects">
+  <DiagramRow>
+    <DiagramNode title="Bytes" sub="disk, wire, memory" />
+    <DiagramArrow label="encoding" />
+    <DiagramNode title="Text" sub="characters" />
+    <DiagramArrow label="parse / format" />
+    <DiagramNode title="Objects" sub="Book, int, string" />
+  </DiagramRow>
+</Diagram>
+
+Reading walks left to right; writing walks right to left. Either way there are two separate problems. Bytes-to-characters is about **encoding** — which byte patterns mean which letters. Characters-to-objects is about **parsing** (or, going the other way, **formatting**) — what the comma-separated shape of a CSV actually means. .NET keeps these apart on purpose, because one object trying to do both at once would be welded to a single source and a single format forever.
+
+## One layer per job — the same four, in both directions
+
+The stack has four roles. Each has a *reading* form and a *writing* form:
+
+| Layer | Reading form | Writing form | Job |
+|---|---|---|---|
+| Source / sink | a file, a string | a file, memory | hold or carry the raw bytes |
+| Stream | FileStream | MemoryStream | move the data as bytes |
+| Reader / Writer | StreamReader, StringReader | StreamWriter, StringWriter | translate bytes and text (encoding) |
+| Domain parser | CsvReader | CsvWriter | translate text and objects |
+
+The reading column turns a source into objects. The writing column turns objects into a sink. Same four responsibilities, pointed opposite ways.
+
+## Reading: from a source down to objects
+
+Take a file `books.csv`:
+
+```text
+title,author,genre
+The Hobbit,J.R.R. Tolkien,Fantasy
+Dune,Frank Herbert,Sci-Fi
+```
+
+Reading it off disk runs top to bottom through every layer:
+
+<Diagram title="Reading books.csv, source down to objects">
+  <DiagramRow>
+    <DiagramNode title="books.csv" sub="file on disk" />
+  </DiagramRow>
+  <DiagramArrow down label="bytes" align="start" />
+  <DiagramRow>
+    <DiagramNode title="FileStream" sub="bytes out of the file" />
+  </DiagramRow>
+  <DiagramArrow down label="decode, UTF-8" align="start" />
+  <DiagramRow>
+    <DiagramNode title="StreamReader" sub="bytes to characters" />
+  </DiagramRow>
+  <DiagramArrow down label="parse" align="start" />
+  <DiagramRow>
+    <DiagramNode title="CsvReader" sub="characters to records" />
+  </DiagramRow>
+  <DiagramArrow down label="map fields" align="start" />
+  <DiagramRow>
+    <DiagramNode title="Book values" sub="Title, Author, Genre" />
+  </DiagramRow>
+</Diagram>
+
+Each arrow is one translation. The `FileStream` neither knows nor cares what the bytes mean. The `StreamReader` turns bytes into text but has no idea the text is a CSV. The `CsvReader` reads text and knows nothing about disks. Every layer does its one job and hands off.
+
+## Writing: from objects down to bytes
+
+Building a CSV is the same stack in reverse. To produce a `books.csv` in memory:
+
+<Diagram title="Writing books.csv, objects down to bytes">
+  <DiagramRow>
+    <DiagramNode title="rows to write" sub="Title, Author, Genre" />
+  </DiagramRow>
+  <DiagramArrow down label="format" align="start" />
+  <DiagramRow>
+    <DiagramNode title="CsvWriter" sub="values to CSV text" />
+  </DiagramRow>
+  <DiagramArrow down label="encode" align="start" />
+  <DiagramRow>
+    <DiagramNode title="StreamWriter" sub="text to bytes" />
+  </DiagramRow>
+  <DiagramArrow down label="collect" align="start" />
+  <DiagramRow>
+    <DiagramNode title="MemoryStream" sub="bytes buffered in memory" />
+  </DiagramRow>
+  <DiagramArrow down label="ToArray()" align="start" />
+  <DiagramRow>
+    <DiagramNode title="byte[]" sub="the finished CSV" />
+  </DiagramRow>
+</Diagram>
+
+In code, that stack is built inside-out — sink first, parser last:
+
+```csharp
+var stream = new MemoryStream();                    // the sink: an in-memory byte buffer
+var writer = new StreamWriter(stream);              // text -> bytes into that buffer
+var csv    = new CsvWriter(writer, configuration);  // values -> CSV text
+
+csv.WriteField("title");
+csv.WriteField("author");
+csv.WriteField("genre");
+csv.NextRecord();                                   // end the header row
+
+byte[] bytes = stream.ToArray();                    // the finished CSV, as bytes
+```
+
+The `CsvWriter` formats, the `StreamWriter` encodes, the `MemoryStream` collects. Reading's `CsvReader` / `StreamReader` / `FileStream` map exactly onto writing's `CsvWriter` / `StreamWriter` / `MemoryStream`.
+
+## Why the in-memory adapters exist
+
+Two layers are pure adapters — they exist only to make in-memory data fit the same pipeline a file would use.
+
+On the **reading** end, `StringReader`. A parser like `CsvReader` consumes text — specifically a `TextReader`, the abstraction for "characters can be read from this." A plain `string` is already characters, but it is not a `TextReader`, so the parser will not take it directly. `StringReader` wraps the string and presents it as a `TextReader`, letting a string enter the pipeline one layer down — skipping the file and the decode step entirely.
+
+On the **writing** end, `MemoryStream`. Output has to flow into some stream, but not every result belongs in a file — sometimes the bytes are wanted in memory, to return from an API, attach to an email, or hand to another process. `MemoryStream` is a stream whose backing store is memory instead of disk, and `ToArray()` lifts the collected bytes out as a `byte[]`.
+
+> **Why the layers?** The recurring question — "why can't I hand my string or my file path straight to the CSV parser, or get a byte array straight out of it?" — dissolves once the layers are named. A parser's job is text-to-objects, so its edge type is a text abstraction: `TextReader` in, `TextWriter` out. Anything that is not already text gets walked up to text first (a file becomes a `FileStream`, then a `StreamReader`); a string is already text and only needs a `StringReader` to wear the right shape. Bytes come out at the bottom, from the stream — `MemoryStream.ToArray()` — never from the parser. The parser is never the layer that opens files or produces byte arrays.
+
+## Two things the diagrams hide
+
+The arrows suggest data flows straight through. Two realities complicate that, and each gets its own part later:
+
+- **Buffering.** Text written to a `StreamWriter` may sit in an internal buffer and not reach the `MemoryStream` yet. Asking the stream for its bytes before the writer has been *flushed* returns an incomplete result — which is why real write code calls `Flush()` before `ToArray()`. That is Part 4.
+- **Cleanup order.** Every layer that holds a real resource — a file handle, an OS buffer — must be released, and the layers must come down top-first: parser, then writer, then stream. Tearing out a lower layer while an upper one still points at it causes trouble. That is the job of `using` and `Dispose()`, in Part 5.
+
+## What this part covered
+
+- Data crosses **two translations** between the outside world and a C# object: bytes to text (encoding), and text to objects (parsing or formatting).
+- .NET gives each translation its own **layer**: source/sink, stream, reader/writer, parser.
+- The **same four layers** serve reading and writing in mirror image.
+- `StringReader` and `MemoryStream` are **adapters** for the in-memory ends of the pipeline.
+- Bytes enter and leave at the **stream** layer; objects enter and leave at the **parser** layer.
+
+## What comes next
+
+**Part 2** goes to the bottom of the stack — the `Stream` itself. What it actually is, the handful of operations it exposes (`Read`, `Write`, `Position`, `Seek`), and why `FileStream`, `NetworkStream`, and the `MemoryStream` the write side depends on are all interchangeable behind one abstraction. No new tools are needed — just the mental map built in this part.
