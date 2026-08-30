@@ -1,0 +1,437 @@
+---
+title: "The controller and end-to-end testing"
+date: 2026-08-28
+status: written
+minutes: 15
+order: 6
+lead: 'Five parts of groundwork collapse into one controller action with a single if statement. Then the interesting part: watching a message land in Azure Storage Explorer, sending the same id twice, and discovering that a 400 arrives before any controller code runs at all.'
+---
+
+Every piece now exists. Configuration is bound, models are defined, and the helper can push and check. This part connects them to HTTP and then proves the whole thing works.
+
+The controller is deliberately thin. All the queue logic lives in the helper, all the data shapes live in the models, and all the configuration lives in settings. What remains is translation — turn an HTTP request into method calls, turn the result back into an HTTP response.
+
+## The Controller
+
+Create `Controllers/JobsController.cs`:
+
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using JobQueueApi.Helpers;
+using JobQueueApi.Models;
+using JobQueueApi.Settings;
+
+namespace JobQueueApi.Controllers;
+
+[ApiController]
+[Route("jobs")]
+public class JobsController : ControllerBase
+{
+    private readonly AzureStorageSettings _azureStorageSettings;
+
+    public JobsController(IOptions<AzureStorageSettings> azureStorageSettings)
+    {
+        _azureStorageSettings = azureStorageSettings.Value;
+    }
+
+    [HttpPost("push/{id}")]
+    [ProducesResponseType(typeof(JobPushResponseModel), 200)]
+    public IActionResult PushJob(Guid id)
+    {
+        if (AzureQueueHelper.IsJobQueued(_azureStorageSettings, id))
+        {
+            return Ok(new JobPushResponseModel
+            {
+                Status = EJobPushStatus.AlreadyProcessing
+            });
+        }
+
+        AzureQueueHelper.PushJobToQueue(_azureStorageSettings, id);
+
+        return Ok(new JobPushResponseModel
+        {
+            Status = EJobPushStatus.Queued
+        });
+    }
+}
+```
+
+Roughly thirty lines, and most of them are structure rather than logic. Each piece is worth understanding individually.
+
+## Anatomy of a Controller
+
+### The ApiController Attribute
+
+```csharp
+[ApiController]
+```
+
+This attribute changes several behaviours at once, and its effects are easy to attribute to magic if the attribute goes unnoticed.
+
+**Automatic model validation.** If a request fails binding or validation, ASP.NET returns `400 Bad Request` automatically. The controller method never executes. This is the mechanism behind the malformed-id test later in this part.
+
+**Automatic parameter source inference.** Without this attribute, parameters need explicit attributes such as `[FromRoute]` or `[FromBody]` to tell ASP.NET where to look. With it, ASP.NET infers the source — simple types from the route or query string, complex types from the request body. That inference is why `Guid id` needs no attribute here.
+
+**Problem Details error responses.** Validation failures return a standardised JSON error format defined by RFC 7807, rather than an ad-hoc shape.
+
+**Attribute routing required.** Conventional routing is disabled, so every action must declare its route explicitly. This is a constraint, and a good one — the route is visible directly above the method rather than inferred from a convention configured elsewhere.
+
+### The Route Attribute
+
+```csharp
+[Route("jobs")]
+```
+
+Sets the base path for every action in the controller. Combined with the action's own `[HttpPost("push/{id}")]`, the full route becomes:
+
+```text
+POST /jobs/push/{id}
+```
+
+A common convention writes this as `[Route("api/[controller]")]`, where `[controller]` is a token replaced with the class name minus the `Controller` suffix — producing `api/jobs`. That indirection is avoided here because an explicit literal string is unambiguous, and renaming the class then cannot silently change a public URL.
+
+### Inheriting from ControllerBase
+
+```csharp
+public class JobsController : ControllerBase
+```
+
+`ControllerBase` supplies the helper methods that construct HTTP results — `Ok()`, `BadRequest()`, `NotFound()`, `CreatedAtAction()`, and others — along with access to `HttpContext`, `Request`, `Response`, and `User`.
+
+There is a related class named `Controller` which inherits from `ControllerBase` and adds view rendering for server-rendered HTML pages. An API returns data, not views, so `ControllerBase` is the correct base. Inheriting from `Controller` in an API works but drags in MVC view machinery that is never used.
+
+### Constructor Injection
+
+```csharp
+private readonly AzureStorageSettings _azureStorageSettings;
+
+public JobsController(IOptions<AzureStorageSettings> azureStorageSettings)
+{
+    _azureStorageSettings = azureStorageSettings.Value;
+}
+```
+
+This is where Part 3 pays off.
+
+The constructor declares a dependency on `IOptions<AzureStorageSettings>`. ASP.NET creates this controller for each request, inspects the constructor, resolves that dependency from the container, and passes it in. Nothing in this file constructs the settings or reads a configuration file.
+
+`.Value` unwraps the options wrapper once, at the boundary. The field is a plain `AzureStorageSettings`, so no method in the class needs to know the Options Pattern exists. It also matches what the helper expects — a plain settings object, since the helper is static and knows nothing about dependency injection.
+
+`readonly` prevents reassignment after construction. The dependency is fixed for the controller's lifetime, and the compiler enforces it.
+
+### The HTTP Method Attribute
+
+```csharp
+[HttpPost("push/{id}")]
+```
+
+Two declarations in one attribute: this action responds to `POST`, and its route segment is `push/{id}` appended to the controller's base route.
+
+`{id}` is a **route parameter**. The name inside the braces must match a method parameter name — `id` here matches `Guid id`. ASP.NET extracts that URL segment and binds it.
+
+**Why POST rather than GET.** The endpoint changes server state by adding a message to a queue. `GET` is defined as safe and idempotent — browsers prefetch them, proxies cache them, and crawlers follow them. An operation with side effects behind a `GET` invites all three to trigger it accidentally. `POST` communicates that state changes.
+
+### The ProducesResponseType Attribute
+
+```csharp
+[ProducesResponseType(typeof(JobPushResponseModel), 200)]
+```
+
+This is pure metadata. It has no effect on runtime behaviour whatsoever — removing it changes nothing about how the endpoint responds.
+
+Its purpose is documentation for tooling. OpenAPI generators read it to describe the API accurately, client code generators use it to produce typed clients, and human readers see the response contract without tracing through the method body.
+
+Without it, tooling can often infer the type from the return statement, but only when the method returns a concrete type. This method returns `IActionResult` — an interface that could wrap anything — so the attribute is the only source of that information.
+
+### The Action Method
+
+```csharp
+public IActionResult PushJob(Guid id)
+```
+
+**`IActionResult`** is an interface representing "some HTTP result". It allows one method to return different result types on different paths — `Ok()`, `NotFound()`, `BadRequest()` — since all of them implement it.
+
+An alternative is `ActionResult<JobPushResponseModel>`, which is more specific and helps tooling infer the response type. `IActionResult` is used here because it is the more common shape in existing codebases and keeps the return statements uniform.
+
+**`Guid id`** is bound from the route. The type is doing real work — Part 4 chose `Guid` over `string` specifically for the validation it provides, and the test at the end of this part demonstrates it.
+
+## The Logic
+
+Stripped of the surrounding structure, the entire behaviour is four lines:
+
+```csharp
+if (AzureQueueHelper.IsJobQueued(_azureStorageSettings, id))
+    return Ok(new JobPushResponseModel { Status = EJobPushStatus.AlreadyProcessing });
+
+AzureQueueHelper.PushJobToQueue(_azureStorageSettings, id);
+return Ok(new JobPushResponseModel { Status = EJobPushStatus.Queued });
+```
+
+<Diagram title="Request flow through the action">
+  <DiagramRow>
+    <DiagramNode title="POST /jobs/push/{id}" sub="request arrives" />
+    <DiagramArrow label="calls" />
+    <DiagramNode title="IsJobQueued" sub="peek and scan" />
+  </DiagramRow>
+  <DiagramArrow down label="found?" align="end" />
+  <DiagramRow>
+    <DiagramNode title="Yes" sub="return AlreadyProcessing" items="nothing pushed" />
+    <DiagramNode title="No" sub="PushJobToQueue, return Queued" items="message added" />
+  </DiagramRow>
+</Diagram>
+
+Check first, push only if absent. The controller makes a decision and reports it. It does not know what a `QueueClient` is, how messages are serialised, or that a 32-message peek limit exists. Those belong to the helper.
+
+### A Race Condition Worth Naming
+
+This is a check-then-act sequence, and it is **not atomic**.
+
+Two requests arriving simultaneously with the same id can both execute `IsJobQueued` before either executes `PushJobToQueue`. Both see an empty queue, both return `Queued`, and two identical messages land in the queue.
+
+The window is small — the time between the peek response and the send request, typically single-digit milliseconds — but it is real, and under genuine concurrent load it will eventually be hit.
+
+Azure Queue Storage offers no mechanism to close this. There is no conditional send, no unique constraint, no atomic check-and-insert. The service is not designed for it.
+
+The real solutions are the same ones listed for the 32-message limit in Part 5, which is not a coincidence — both problems stem from using a queue as a lookup structure. A database with a unique constraint on the id makes the insert atomic and pushes duplicate detection into a system built for it. Alternatively, making the consumer idempotent removes the need to prevent duplicates at all, which is often the most robust answer since duplicates can arise from network-level retries regardless of anything the producer does.
+
+Naming this openly matters more than solving it here. Understanding that a check-then-act pattern has a race window is a transferable insight; it appears in file handling, caching, and database access, not just queues.
+
+## Running It
+
+Three things must be running. Start Azurite in one terminal:
+
+```bash
+azurite --silent --location .azurite --debug .azurite/debug.log
+```
+
+Confirm it is listening:
+
+```bash
+curl http://127.0.0.1:10001/devstoreaccount1
+```
+
+Then start the API in a second terminal:
+
+```bash
+dotnet run
+```
+
+```text
+Now listening on: http://localhost:5295
+Application started. Press Ctrl+C to shut down.
+Hosting environment: Development
+```
+
+The port comes from `launchSettings.json` and differs between projects. Every example below uses `5295` — substitute whatever the terminal reports.
+
+Open Azure Storage Explorer and expand **Emulator → Queues**. The `job-queue` does not exist yet. `CreateIfNotExists()` creates it on the first request.
+
+## Testing with Postman
+
+A Guid is needed. Any valid one works:
+
+```text
+3fa85f64-5717-4562-b3fc-2c963f66afa6
+```
+
+### First Request
+
+In Postman:
+
+1. Set the method dropdown to **POST**
+2. Enter the URL: `http://localhost:5295/jobs/push/3fa85f64-5717-4562-b3fc-2c963f66afa6`
+3. Click **Send**
+
+No body, no headers, no authentication. The id travels in the URL path, so there is nothing else to configure. This is worth noticing — endpoints that accept a JSON body require setting **Body → raw → JSON** in Postman, and this one deliberately does not.
+
+The response:
+
+```json
+{
+    "status": "Queued"
+}
+```
+
+Three things to observe.
+
+**The status is `"Queued"`.** The queue was empty, `IsJobQueued` returned `false`, and a message was pushed.
+
+**It is a string, not `0`.** This is `JsonStringEnumConverter` from Part 4 doing its job. Without that registration the response would read `{"status":0}`.
+
+**The property is lowercase.** The C# property is `Status`; `System.Text.Json` applies camelCase naming by default.
+
+The equivalent with curl:
+
+```bash
+curl -X POST http://localhost:5295/jobs/push/3fa85f64-5717-4562-b3fc-2c963f66afa6
+```
+
+### Verifying in Azure Storage Explorer
+
+Refresh the **Queues** node. Two things changed.
+
+**The `job-queue` now exists.** It was never created manually — `CreateIfNotExists()` created it during the request.
+
+**It contains one message.** Clicking into the queue shows:
+
+```json
+{"Id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}
+```
+
+Readable JSON, exactly as written. This is `QueueMessageEncoding.None` paying off — with Base64 encoding the same message would display as an unreadable string.
+
+The message row also shows metadata worth noting: an insertion time, an expiration time seven days out (the default TTL), and a dequeue count of zero, since nothing has consumed it.
+
+> **Nothing consumes these messages.** This project is the producer half of a queue system. Messages accumulate and expire after seven days. Building the consumer — a background service that receives, processes, and deletes — is the natural next project, and it is where visibility timeouts and dequeue counts stop being theory.
+
+### Second Request, Same Id
+
+Send the exact same request again. The response changes:
+
+```json
+{
+    "status": "AlreadyProcessing"
+}
+```
+
+The duplicate check worked. `IsJobQueued` peeked the queue, found a message whose deserialised `Id` matched, and returned `true`. `PushJobToQueue` was never called.
+
+Refresh Storage Explorer to confirm: still **one** message. Nothing was added.
+
+### Third Request, Different Id
+
+```text
+http://localhost:5295/jobs/push/11111111-1111-1111-1111-111111111111
+```
+
+```json
+{
+    "status": "Queued"
+}
+```
+
+Storage Explorer now shows **two** messages. Each id is tracked independently — the check compares the deserialised `Id` field, not the message as a whole.
+
+### Fourth Request, Malformed Id
+
+This one is the most interesting.
+
+```text
+http://localhost:5295/jobs/push/not-a-guid
+```
+
+The response is `400 Bad Request`:
+
+```json
+{
+    "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+    "title": "One or more validation errors occurred.",
+    "status": 400,
+    "errors": {
+        "id": [
+            "The value 'not-a-guid' is not valid."
+        ]
+    }
+}
+```
+
+**No validation code was written to produce this.** The chain of events:
+
+1. The route matched `POST /jobs/push/{id}`
+2. Model binding attempted to convert `"not-a-guid"` into a `Guid` and failed
+3. `[ApiController]` detected the invalid model state
+4. ASP.NET returned a Problem Details `400` response
+5. **`PushJob` never executed**
+
+The entire behaviour follows from declaring the parameter as `Guid` rather than `string`. Had it been `string`, `"not-a-guid"` would have bound successfully, the helper would have received nonsense, and the failure would surface somewhere deeper and less clearly.
+
+This is a concrete instance of a broader principle: choosing precise types moves error detection earlier and produces better error messages without writing validation code.
+
+## Verifying the Whole Flow
+
+Four requests, four outcomes:
+
+| Request | Response | Queue after |
+|---|---|---|
+| `POST /jobs/push/3fa85f64-...` | `{"status":"Queued"}` | 1 message |
+| `POST /jobs/push/3fa85f64-...` (repeat) | `{"status":"AlreadyProcessing"}` | 1 message |
+| `POST /jobs/push/11111111-...` | `{"status":"Queued"}` | 2 messages |
+| `POST /jobs/push/not-a-guid` | `400 Bad Request` | 2 messages |
+
+Every layer built across five parts participated:
+
+<Diagram title="What each part contributed">
+  <DiagramRow>
+    <DiagramNode title="appsettings.json" sub="Part 3" items="connection string, queue name" />
+    <DiagramArrow label="bound to" />
+    <DiagramNode title="AzureStorageSettings" sub="Part 3" items="via IOptions" />
+  </DiagramRow>
+  <DiagramArrow down label="injected into" align="end" />
+  <DiagramRow>
+    <DiagramNode title="JobsController" sub="Part 6" items="routes, binds, decides" />
+    <DiagramArrow label="calls" />
+    <DiagramNode title="AzureQueueHelper" sub="Part 5" items="peek, serialise, send" />
+  </DiagramRow>
+  <DiagramArrow down label="using" align="end" />
+  <DiagramRow>
+    <DiagramNode title="QueueJobModel" sub="Part 4" items="message body" />
+    <DiagramArrow label="stored in" />
+    <DiagramNode title="Azurite" sub="Part 1" items="port 10001" />
+  </DiagramRow>
+</Diagram>
+
+## Troubleshooting
+
+**`500 Internal Server Error` on the first request.** Azurite is almost certainly not running. The terminal running the API shows the underlying exception — a connection failure from the Azure SDK after its retry policy is exhausted. Start Azurite and retry.
+
+**`KeyNotFoundException` mentioning the dictionary.** The JSON key under `QueueNames` does not match the enum member name exactly. `"JobExport"` in `appsettings.json` must match `JobExport` in `EQueueNames`. Part 3 covers why this fails silently at binding time and only surfaces here.
+
+**`404 Not Found` on a URL that looks correct.** Either `app.MapControllers()` is missing from `Program.cs`, or the route does not match. Note that `/jobs/push` without an id is a different route from `/jobs/push/{id}` and matches nothing.
+
+**Response shows `{"status":0}` instead of `{"status":"Queued"}`.** The `JsonStringEnumConverter` registration from Part 4 is missing or was added to the wrong place. It belongs chained onto `AddControllers()` via `.AddJsonOptions(...)`.
+
+**Messages appear as unreadable text in Storage Explorer.** `MessageEncoding` is set to `Base64` rather than `None` in `QueueClientOptions`, or the option was omitted on a client configured elsewhere.
+
+**Connection refused from Postman.** The API is not running, or the port differs. Check the `Now listening on` line in the terminal.
+
+## Common Questions at This Stage
+
+### Why does the controller take settings and pass them to the helper, rather than the helper reading configuration itself?
+
+Because the helper is static and cannot receive injected dependencies. The controller can — so it receives the settings and forwards them. This is the visible cost of the static choice made in Part 5, and it disappears in the injected version, where the service holds its own settings and the call becomes `_queueService.IsJobQueued(id)`.
+
+### Should the action be async?
+
+Yes, for production. The helper's SDK calls are synchronous and block a thread pool thread for each network round trip. Converting the helper to async makes the action `async Task<IActionResult>` with `await` on both calls. Part 5 covers the reasoning; it is the highest-value refinement to make to this project.
+
+### Why return `200 OK` for `AlreadyProcessing` rather than `409 Conflict`?
+
+Both are defensible. `409 Conflict` signals that the request conflicts with current state, which arguably fits. `200` is used here because from the caller's perspective nothing went wrong — the desired end state (this job is queued) holds either way. Returning `200` with a status field lets the client distinguish the cases without treating one as an error. The choice depends on whether clients should handle it in a success path or an error path, and that is an API design decision rather than a technical one.
+
+### Can the same controller handle multiple queues?
+
+Yes. The `EQueueNames` enum and the dictionary in `AzureStorageSettings` were designed for it. The helper would take an `EQueueNames` parameter instead of hardcoding `EQueueNames.JobExport`, and the controller would pass whichever queue the endpoint targets. That change is small precisely because the enum-keyed lookup was set up in Part 3.
+
+### How would this be unit tested?
+
+The controller cannot be tested in isolation as written — the static helper calls cannot be substituted, so any test hits a real queue. This is the testability cost named in Part 5. With the helper behind an `IAzureQueueService` interface, a test injects a stub returning `true` or `false` and asserts that the correct status comes back, with no Azure or Azurite involved.
+
+## What Was Accomplished in This Part
+
+- ✅ `JobsController` created with the full check-then-push flow
+- ✅ Every controller attribute understood, including what `[ApiController]` silently enables
+- ✅ Constructor injection of `IOptions<T>` connected to the configuration built in Part 3
+- ✅ The check-then-act race condition identified and named honestly
+- ✅ The endpoint tested end to end through Postman
+- ✅ Messages verified as readable JSON in Azure Storage Explorer
+- ✅ The duplicate case confirmed to return `AlreadyProcessing` without adding a message
+- ✅ Automatic `400` validation observed, produced entirely by the choice of `Guid` as a parameter type
+
+## What Comes Next
+
+The project is complete and working. **Part 7** adds no code at all.
+
+Instead it traces what actually happens beneath every line already written — how a `.cs` file becomes IL bytecode, what the CLR and JIT compiler do with that bytecode at startup, how `Program.cs` populates a dependency injection container, why `builder.Build()` is a hard boundary, and how a single HTTP request flows through routing, model binding, controller activation, and output formatting to become a JSON response.
+
+Everything in this project works. That part explains why.

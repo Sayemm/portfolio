@@ -93,6 +93,13 @@ export const topics: Topic[] = [
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
   {
+    id: "design-patterns",
+    name: "Design Patterns",
+    blurb: "The classic patterns, in C# — and when not to reach for them.",
+    order: 1.4,
+    chip: { bg: "#f2e9df", fg: "#7a4a1c" },
+  },
+  {
     id: "dotnet-io",
     name: ".NET I/O",
     blurb: "Files, streams, and everything that crosses a process boundary.",

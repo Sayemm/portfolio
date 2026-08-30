@@ -1,0 +1,392 @@
+---
+title: "The Options pattern in C#: strongly-typed configuration done right"
+date: 2026-08-29
+status: written
+minutes: 22
+order: 1
+lead: 'Reading configuration with magic strings scattered through the codebase is fragile and untestable. The Options pattern binds configuration to strongly-typed classes and hands them to code through dependency injection — with validation, live reloads, and named variants. This is the full picture, from the first Configure call to startup validation and runtime change tracking.'
+---
+
+This is the first entry in a Design Patterns in C# topic. It covers the **Options pattern** — the standard .NET way to turn configuration (from `appsettings.json`, environment variables, and other sources) into strongly-typed objects that get injected wherever they are needed. Every example here is runnable: copy the options class, the JSON, and the registration into an ASP.NET Core app and it works.
+
+The article moves from the simplest possible use up to validation, named options, and runtime reloads, so a beginner can start at the top and an experienced reader can jump to the section they need.
+
+## The problem: configuration by magic string
+
+Configuration values — a database connection, an API key, an SMTP host — have to come from somewhere outside the code so they can change between environments. The naive way to read them is straight off `IConfiguration` by key:
+
+```csharp
+var host = configuration["Email:Host"];
+int port = int.Parse(configuration["Email:Port"]);   // manual parse; throws on bad input
+bool ssl = bool.Parse(configuration["Email:EnableSsl"]);
+```
+
+This works, and it is a trap. The keys are magic strings, so a typo like `"Email:Hostt"` compiles fine and returns `null` at runtime. The types are all strings until parsed by hand. There is no validation, so a missing or malformed value fails deep inside the app instead of at startup. And any class doing this needs `IConfiguration` injected, which makes it awkward to unit test. The configuration is scattered, stringly-typed, and unchecked.
+
+## The idea: bind configuration to a typed object
+
+The Options pattern replaces all of that with one strongly-typed class. Configuration is **bound** to that class once, and the class is handed to whatever needs it through dependency injection.
+
+<Diagram title="Configuration bound to a typed object, injected on demand">
+  <DiagramRow>
+    <DiagramNode title="appsettings.json" sub="Email section" />
+    <DiagramArrow label="Configure / Bind" />
+    <DiagramNode title="EmailOptions" sub="typed class" />
+    <DiagramArrow label="inject" />
+    <DiagramNode title="your service" sub="reads .Value" />
+  </DiagramRow>
+</Diagram>
+
+The payoff is the reverse of every problem above: keys become properties checked by the compiler, values arrive already typed, validation can run at startup, and consumers depend on a plain object instead of `IConfiguration`. Four small steps set it up.
+
+## Step 1: define the options class
+
+An options class is a plain C# object — properties with getters and setters, no base class, no attributes required. A common convention is a `SectionName` constant so the configuration section name lives with the class instead of as a loose string:
+
+```csharp
+public class EmailOptions
+{
+    public const string SectionName = "Email";
+
+    public string Host { get; set; } = "";
+    public int Port { get; set; }
+    public string FromAddress { get; set; } = "";
+    public bool EnableSsl { get; set; }
+    public string[] Recipients { get; set; } = [];
+}
+```
+
+Nothing here is special to the Options pattern yet — it is just a container shaped like the configuration it will hold.
+
+## Step 2: describe it in appsettings.json
+
+The JSON section mirrors the class. Property names match keys (case-insensitively), and nested objects and arrays map to nested classes and collections:
+
+```json
+{
+  "Email": {
+    "Host": "smtp.example.com",
+    "Port": 587,
+    "FromAddress": "noreply@example.com",
+    "EnableSsl": true,
+    "Recipients": [ "ops@example.com", "alerts@example.com" ]
+  }
+}
+```
+
+The `"Email"` object corresponds to `EmailOptions`, each key to a property, and the `"Recipients"` array to the `string[]`.
+
+## Step 3: register the binding
+
+In `Program.cs`, tell the dependency injection container to bind that section to the class. `Configure<T>` reads the section and wires up the options machinery:
+
+```csharp
+builder.Services.Configure<EmailOptions>(
+    builder.Configuration.GetSection(EmailOptions.SectionName));
+```
+
+That single line registers `EmailOptions` so it can be injected anywhere, in three different wrappers described shortly.
+
+## Step 4: inject and use it
+
+A consumer asks for `IOptions<EmailOptions>` in its constructor and reads the bound object from `.Value`:
+
+```csharp
+public class EmailSender
+{
+    private readonly EmailOptions _options;
+
+    public EmailSender(IOptions<EmailOptions> options)
+    {
+        _options = options.Value;   // the bound EmailOptions instance
+    }
+
+    public void Send(string subject)
+    {
+        Console.WriteLine($"Connecting to {_options.Host}:{_options.Port}, SSL={_options.EnableSsl}");
+        // real send logic here
+    }
+}
+```
+
+`_options.Host` is a compiler-checked property, already a `string`; `_options.Port` is already an `int`. No keys, no parsing, no `IConfiguration`.
+
+## A complete, runnable example
+
+Put together, here is a minimal ASP.NET Core app that binds the options and exposes them on an endpoint. Drop the `EmailOptions` class and the `"Email"` section from above alongside this `Program.cs` and it runs:
+
+```csharp
+using Microsoft.Extensions.Options;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<EmailOptions>(
+    builder.Configuration.GetSection(EmailOptions.SectionName));
+
+var app = builder.Build();
+
+app.MapGet("/email-config", (IOptions<EmailOptions> options) =>
+{
+    return Results.Ok(options.Value);   // returns the bound EmailOptions as JSON
+});
+
+app.Run();
+```
+
+Hitting `GET /email-config` returns the fully typed, bound configuration. Everything after this point refines this base: how the values refresh, how they are validated, and how to have several of them.
+
+> **This is not only for web apps.** The Options pattern lives in `Microsoft.Extensions.Options`, part of the generic host. A console app or worker service built with `Host.CreateApplicationBuilder` registers and consumes options exactly the same way — `Configure<T>` and `IOptions<T>` are not ASP.NET-specific.
+
+## The three interfaces: IOptions, IOptionsSnapshot, IOptionsMonitor
+
+There is not one way to consume options but three, and choosing correctly is the single most important part of the pattern. They differ in lifetime, in whether they notice configuration reloads, and in whether they support named options:
+
+| Interface | Lifetime | Value freshness | Named options | Inject into |
+|---|---|---|---|---|
+| `IOptions<T>` | singleton | computed once, cached forever | no | anything |
+| `IOptionsSnapshot<T>` | scoped | recomputed once per request | yes | scoped services, controllers |
+| `IOptionsMonitor<T>` | singleton | always current, plus change notifications | yes | anything, including singletons |
+
+**`IOptions<T>`** is the simplest. The bound object is built the first time it is requested and cached for the life of the application. It never sees a configuration change. Use it for settings that do not change while the app runs, which is most of them.
+
+**`IOptionsSnapshot<T>`** is scoped — a fresh value is computed once per request (per DI scope). If `appsettings.json` changed since the last request, the new request sees the new values. It also supports named options via `.Get(name)`. Because it is scoped, it **cannot** be injected into a singleton.
+
+```csharp
+public class ReportService
+{
+    private readonly EmailOptions _options;
+
+    public ReportService(IOptionsSnapshot<EmailOptions> snapshot)
+    {
+        _options = snapshot.Value;   // re-read for this request
+    }
+}
+```
+
+**`IOptionsMonitor<T>`** is a singleton that always exposes the current value through `.CurrentValue`, and can push notifications when the configuration changes through `.OnChange(...)`. It is the option to use inside singletons and long-running background services, where a scoped snapshot is unavailable but fresh values are still wanted.
+
+```csharp
+public class QueueWorker
+{
+    private readonly IOptionsMonitor<EmailOptions> _monitor;
+
+    public QueueWorker(IOptionsMonitor<EmailOptions> monitor)
+    {
+        _monitor = monitor;
+        _monitor.OnChange(updated =>
+            Console.WriteLine($"Email config changed, new host: {updated.Host}"));
+    }
+
+    public void Process()
+    {
+        var current = _monitor.CurrentValue;   // never stale
+    }
+}
+```
+
+> **The rule that prevents the most common bug:** never inject `IOptionsSnapshot<T>` into a singleton — it is scoped, and the container will throw at resolution time. In a singleton that needs configuration, use `IOptions<T>` for static values or `IOptionsMonitor<T>` for values that can change. In a controller or scoped service that should pick up reloads per request, use `IOptionsSnapshot<T>`.
+
+## How binding actually works
+
+Binding matches configuration keys to properties by name, case-insensitively, and handles more than flat scalars:
+
+- **Nested objects** bind to nested classes. A `"Retry"` object inside `"Email"` binds to a nested `RetryOptions` property on `EmailOptions`.
+- **Arrays and lists** bind to `T[]`, `List<T>`, and similar. The `"Recipients"` array above fills the `string[]`.
+- **Dictionaries** bind from a JSON object to `Dictionary<string, T>`.
+- **Enums** bind from their string name — `"Level": "Warning"` binds to an enum value `Warning`.
+
+A nested example, showing the shape:
+
+```csharp
+public class EmailOptions
+{
+    public const string SectionName = "Email";
+
+    public string Host { get; set; } = "";
+    public int Port { get; set; }
+    public RetryOptions Retry { get; set; } = new();   // nested object
+}
+
+public class RetryOptions
+{
+    public int MaxAttempts { get; set; }
+    public int DelaySeconds { get; set; }
+}
+```
+
+```json
+{
+  "Email": {
+    "Host": "smtp.example.com",
+    "Port": 587,
+    "Retry": { "MaxAttempts": 3, "DelaySeconds": 5 }
+  }
+}
+```
+
+For a one-off bind without the DI machinery, `IConfiguration` can bind directly — `configuration.GetSection("Email").Get<EmailOptions>()` returns a bound object immediately. It is handy in startup code, but it skips the reload, validation, and injection benefits of the full pattern, so it is the exception rather than the rule.
+
+## Validation: catch bad config early
+
+The biggest practical win of the pattern is validating configuration at startup, so a bad value stops the app immediately with a clear message instead of surfacing as a mysterious failure later. Validation is added when registering with `AddOptions<T>()`:
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+public class EmailOptions
+{
+    public const string SectionName = "Email";
+
+    [Required]
+    public string Host { get; set; } = "";
+
+    [Range(1, 65535)]
+    public int Port { get; set; }
+
+    [Required, EmailAddress]
+    public string FromAddress { get; set; } = "";
+}
+```
+
+```csharp
+builder.Services.AddOptions<EmailOptions>()
+    .Bind(builder.Configuration.GetSection(EmailOptions.SectionName))
+    .ValidateDataAnnotations()                              // enforce the attributes above
+    .Validate(o => o.Port != 25, "Port 25 is blocked")     // a custom rule
+    .ValidateOnStart();                                    // fail at startup, not first use
+```
+
+Three layers are available:
+
+| Method | What it checks |
+|---|---|
+| `ValidateDataAnnotations()` | attributes on the class such as `[Required]` and `[Range]` |
+| `Validate(predicate, message)` | a custom lambda condition with a failure message |
+| `IValidateOptions<T>` | complex or reusable validation, registered as its own service |
+| `ValidateOnStart()` | runs all of the above at startup rather than on first access |
+
+`ValidateOnStart()` is the key habit. Without it, validation runs lazily the first time the options are resolved — which might be deep into a request. With it, misconfiguration crashes the app on launch, which is exactly when it should.
+
+For rules too involved for a lambda, implement `IValidateOptions<T>`:
+
+```csharp
+public class EmailOptionsValidator : IValidateOptions<EmailOptions>
+{
+    public ValidateOptionsResult Validate(string? name, EmailOptions options)
+    {
+        if (options.EnableSsl && options.Port == 25)
+            return ValidateOptionsResult.Fail("SSL cannot be used on port 25.");
+
+        return ValidateOptionsResult.Success;
+    }
+}
+
+// register it:
+builder.Services.AddSingleton<IValidateOptions<EmailOptions>, EmailOptionsValidator>();
+```
+
+## Named options: many configs of one type
+
+Sometimes several configurations share a shape — a primary and a backup mail server, or one set of settings per tenant. **Named options** register multiple instances of the same type under different names:
+
+```csharp
+builder.Services.Configure<EmailOptions>(
+    "Primary", builder.Configuration.GetSection("Email:Primary"));
+
+builder.Services.Configure<EmailOptions>(
+    "Backup", builder.Configuration.GetSection("Email:Backup"));
+```
+
+They are retrieved by name through `IOptionsSnapshot<T>` or `IOptionsMonitor<T>` with `.Get(name)`:
+
+```csharp
+public class Mailer
+{
+    private readonly EmailOptions _primary;
+    private readonly EmailOptions _backup;
+
+    public Mailer(IOptionsSnapshot<EmailOptions> options)
+    {
+        _primary = options.Get("Primary");
+        _backup = options.Get("Backup");
+    }
+}
+```
+
+Plain `IOptions<T>` only ever exposes the default (unnamed) options, so named options require the snapshot or monitor interface.
+
+## Configuring in code, and post-configuration
+
+Options do not have to come from a file. `Configure<T>` also accepts a lambda that sets values directly — useful for defaults, tests, or values computed at startup:
+
+```csharp
+builder.Services.Configure<EmailOptions>(o =>
+{
+    o.Host = "localhost";
+    o.Port = 25;
+});
+```
+
+When both a file binding and a code lambda are registered, they run in order, so later ones override earlier ones. **`PostConfigure<T>`** runs *after* all normal `Configure` calls, which is the right place to fill in derived defaults or fix up values once everything else has been applied:
+
+```csharp
+builder.Services.PostConfigure<EmailOptions>(o =>
+{
+    if (string.IsNullOrWhiteSpace(o.FromAddress))
+        o.FromAddress = $"noreply@{o.Host}";
+});
+```
+
+## Reacting to changes at runtime
+
+By default, the ASP.NET Core host watches `appsettings.json` and reloads it when the file changes (`reloadOnChange` is on). The consuming interface decides whether that reload is seen: `IOptions<T>` never notices, `IOptionsSnapshot<T>` picks it up on the next request, and `IOptionsMonitor<T>` reflects it immediately and can run a callback:
+
+```csharp
+_monitor.OnChange(updated =>
+{
+    Console.WriteLine($"Config reloaded: host is now {updated.Host}");
+    // re-establish connections, clear caches, etc.
+});
+```
+
+This makes runtime configuration changes possible without a restart — turn a feature flag, change a timeout — for the parts of the app built to observe them.
+
+## Testing options
+
+Because an options class is a plain object and consumers depend on the interface, testing is trivial. `Options.Create` wraps a hand-built instance in an `IOptions<T>`, with no configuration system involved:
+
+```csharp
+var options = Options.Create(new EmailOptions
+{
+    Host = "test-host",
+    Port = 587,
+    FromAddress = "test@example.com"
+});
+
+var sender = new EmailSender(options);   // inject the fake options directly
+sender.Send("hello");
+```
+
+This is the concrete reward for depending on `IOptions<EmailOptions>` instead of `IConfiguration`: a test constructs exactly the settings it wants and passes them straight in.
+
+## Best practices and gotchas
+
+- **Keep options classes as plain POCOs** — properties with setters, sensible defaults, no logic. They are data holders.
+- **Store the section name on the class** (`public const string SectionName`) so the string lives in one place.
+- **Validate, and validate on start.** `ValidateDataAnnotations().ValidateOnStart()` turns misconfiguration into an immediate, readable startup failure.
+- **Match the interface to the lifetime.** `IOptions<T>` for static values anywhere; `IOptionsSnapshot<T>` for per-request freshness in scoped code; `IOptionsMonitor<T>` for singletons and background services.
+- **Never inject `IOptionsSnapshot<T>` into a singleton** — it is scoped and will throw.
+- **Do not cache `.Value` in a singleton if the config can change** — read from `IOptionsMonitor<T>.CurrentValue` each time instead, or the singleton will hold a stale copy forever.
+- **Prefer the full pattern over `configuration.Get<T>()`** except in one-off startup code, so validation, reloads, and DI all keep working.
+
+## What this covered
+
+- The Options pattern binds configuration to a **strongly-typed class** injected through DI, replacing magic-string lookups.
+- Setup is four steps: **define** the class, **describe** it in configuration, **register** the binding with `Configure<T>`, and **inject** it via `IOptions<T>`.
+- The three interfaces — **`IOptions`** (cached singleton), **`IOptionsSnapshot`** (per-request, named), **`IOptionsMonitor`** (always-current, notifies) — differ by lifetime and reload behaviour, and choosing right avoids the pattern's main pitfalls.
+- **Validation** with data annotations, custom rules, or `IValidateOptions<T>`, combined with **`ValidateOnStart`**, catches bad config at launch.
+- **Named options**, **code configuration**, **post-configuration**, and **runtime reloads** cover the advanced cases, and `Options.Create` makes the whole thing trivial to test.
+
+## More patterns to come
+
+This is the first article in the Design Patterns in C# topic. Later entries will cover other patterns — the classic Gang of Four set (factory, strategy, decorator, observer) and .NET-native ones like the mediator and repository patterns — each in this same build-it-up, runnable style.

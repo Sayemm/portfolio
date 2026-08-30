@@ -1,0 +1,378 @@
+---
+title: "What ASP.NET does behind every request"
+date: 2026-08-28
+status: written
+minutes: 18
+order: 7
+lead: 'The project works. This part explains why. Three separate lifetimes are at play — compilation, startup, and per request — and blurring them together is what makes dependency injection feel like magic instead of machinery.'
+---
+
+No code is written in this part. Everything built across the previous six parts stays exactly as it is.
+
+The purpose here is different. A working project answers *what*. This part answers *how* — what happens between saving a `.cs` file and a JSON response arriving in Postman. That path crosses three completely separate lifetimes, and most confusion about ASP.NET comes from collapsing them into one.
+
+## Three Lifetimes
+
+<Diagram title="Three phases, three timescales">
+  <DiagramRow>
+    <DiagramNode title="Build" sub="dotnet build" items="C# → IL bytecode" />
+    <DiagramArrow label="produces .dll" />
+    <DiagramNode title="Startup" sub="dotnet run, once" items="container built and sealed" />
+  </DiagramRow>
+  <DiagramArrow down label="server begins listening" align="end" />
+  <DiagramRow>
+    <DiagramNode title="Per request" sub="thousands of times" items="controller created, used, discarded" />
+  </DiagramRow>
+</Diagram>
+
+**Build** happens on a developer machine or a CI server. It runs once per code change and produces a file.
+
+**Startup** happens when the process launches. It runs once per process and produces a configured, running application.
+
+**Per request** happens on every incoming HTTP call. It runs continuously for the life of the process.
+
+Code written in `Program.cs` executes during **startup**, not per request. Code written in a controller executes **per request**, not at startup. That single distinction resolves most questions about why dependency injection behaves the way it does.
+
+## Phase One: Build
+
+### From C# to IL
+
+Running `dotnet build` invokes MSBuild, which reads `JobQueueApi.csproj` to determine what to compile and against which framework. MSBuild then hands the source files to **Roslyn**, the C# compiler.
+
+Roslyn does not produce machine code. It produces **IL** — Intermediate Language, sometimes called MSIL or CIL. IL is a stack-based instruction set that no CPU executes directly.
+
+A trivial C# method:
+
+```csharp
+public static int Add(int a, int b)
+{
+    return a + b;
+}
+```
+
+Compiles to IL roughly like this:
+
+```text
+ldarg.0      // load argument 0 onto the stack
+ldarg.1      // load argument 1 onto the stack
+add          // pop two, add, push result
+ret          // return top of stack
+```
+
+The output lands in `bin/Debug/net10.0/JobQueueApi.dll`.
+
+### Why an Intermediate Language
+
+Compiling straight to machine code would mean producing a separate binary for every processor architecture and operating system. IL sidesteps this: one `.dll` runs on x64 Windows, ARM64 macOS, and x64 Linux, because the final translation to machine code happens on the target machine at runtime.
+
+IL also carries **metadata** — a complete description of every type, method, property, and attribute in the assembly. This metadata is what makes reflection possible, and reflection is what makes ASP.NET's controller discovery and dependency injection possible. That connection is not incidental. When `AddControllers()` finds `JobsController` without being told about it, it is reading this metadata.
+
+### What the .dll Contains
+
+At this point the file contains IL instructions and metadata, and nothing more. It has no concept of HTTP, no knowledge of Azure, no notion of a queue. It is a description of types and behaviour waiting to be executed.
+
+Package references from the `.csproj` — `Azure.Storage.Queues` in this project — are resolved as separate assemblies alongside it, not merged in.
+
+## Phase Two: Startup
+
+Running `dotnet run` builds if needed, then launches the process. Several things happen in order.
+
+### The CLR Loads the Assembly
+
+The **CLR** — Common Language Runtime — is the .NET virtual machine. It loads `JobQueueApi.dll`, reads its metadata, and resolves referenced assemblies.
+
+The CLR also provides garbage collection, exception handling, type safety enforcement, and thread management. These are runtime services, not language features — which is why they behave identically across C#, F#, and VB.NET.
+
+### JIT Compilation
+
+IL cannot execute on a CPU. The **JIT** — Just-In-Time compiler — translates it to native machine code.
+
+The translation is **per method, on first call**. A method that is never called is never compiled. Once compiled, the native code is cached for the process lifetime, so subsequent calls run at full native speed.
+
+This explains a commonly observed behaviour: the first request to a freshly started API is noticeably slower than the ones that follow. That first request walks a path of methods that have never been JIT-compiled — routing, model binding, the controller, the serialiser. Every one of them compiles on the way through. The second request finds all of it already native.
+
+Modern .NET refines this with **tiered compilation**. The first compilation of a method is quick and lightly optimised, prioritising startup speed. Methods that are called frequently are recompiled in the background with full optimisation. Startup stays fast and steady-state stays fast.
+
+### Program.cs Executes
+
+Only now does written code run, beginning at the first line of `Program.cs`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+```
+
+This single call does a great deal:
+
+**Configuration is loaded.** `appsettings.json`, `appsettings.{Environment}.json`, environment variables, and command-line arguments are read and layered. By the time this line returns, `builder.Configuration` holds the merged result — which is why `GetSection("AzureStorage")` on the next lines works without any file being opened explicitly.
+
+**Logging is configured.** Console and debug providers are registered, reading levels from the `Logging` section of configuration.
+
+**The dependency injection container is created.** An `IServiceCollection` — empty at this point, exposed as `builder.Services`.
+
+**Kestrel is configured.** Kestrel is .NET's cross-platform web server. It is what actually opens a socket and listens on a port. The URL from `launchSettings.json` is applied here.
+
+### Services Are Registered
+
+```csharp
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+    });
+
+builder.Services.Configure<AzureStorageSettings>(
+    builder.Configuration.GetSection("AzureStorage")
+);
+```
+
+A critical point: **these lines do not construct anything.** They add descriptions to a collection.
+
+Each registration is essentially a record saying "if something asks for type X, here is how to produce it, and here is how long the result should live." Nothing is instantiated. The container is a recipe book, not a pantry.
+
+`AddControllers()` adds a substantial number of these descriptions — routing components, model binders, output formatters, action invokers. It also triggers **controller discovery**: reflection over the assembly metadata produced at build time, finding every class inheriting from `ControllerBase`, and recording their routes and actions.
+
+This is why `JobsController` never appears in `Program.cs`. It does not need to. Its existence, its `[Route]` attribute, and its `[HttpPost]` action were all recorded in metadata by Roslyn, and `AddControllers()` reads them.
+
+### Service Lifetimes
+
+Every registration carries a lifetime that determines how often a new instance is produced:
+
+| Lifetime | New instance created | Typical use |
+|---|---|---|
+| **Singleton** | Once per application | Configuration, caches, HTTP clients |
+| **Scoped** | Once per HTTP request | Database contexts, per-request state |
+| **Transient** | Every time it is requested | Lightweight stateless services |
+
+`Configure<AzureStorageSettings>` registers `IOptions<AzureStorageSettings>` as a **singleton**. Configuration is read once, bound once, and shared by every request for the process lifetime. That is correct — the connection string does not change while the app runs.
+
+`IOptionsSnapshot<T>` from Part 3 is **scoped**, which is precisely how it can pick up configuration changes between requests. The lifetime is the mechanism.
+
+### Controllers Are a Special Case
+
+Controllers are not registered in the container by default. `AddControllers()` registers the machinery that *creates* controllers, not the controllers themselves.
+
+At request time, a component called the controller activator instantiates `JobsController` directly, then resolves each constructor parameter from the container. So `IOptions<AzureStorageSettings>` comes from DI, but the controller itself does not.
+
+The practical consequence is that a controller behaves as though it were transient — a fresh instance per request, discarded afterward — without appearing in the service collection. Adding `AddControllers().AddControllersAsServices()` changes this, registering controllers properly so they participate fully in the container. It is rarely necessary.
+
+### The Container Is Sealed
+
+```csharp
+var app = builder.Build();
+```
+
+Part 3 introduced this as a boundary. Here is the mechanism.
+
+`Build()` takes the `IServiceCollection` — the list of descriptions — and constructs an `IServiceProvider` from it. The provider is the object that actually resolves and constructs services on demand.
+
+Once the provider exists, the collection is closed. No further registrations are possible, and attempting one throws.
+
+The reason is consistency. If registrations could be added after some services had already been resolved, two requests could receive different implementations of the same interface depending purely on when they arrived. Sealing guarantees that every consumer, for the entire life of the process, sees an identical set of registrations.
+
+<Diagram title="Registration versus resolution">
+  <DiagramRow>
+    <DiagramNode title="IServiceCollection" sub="before Build()" items="descriptions only, mutable" />
+    <DiagramArrow label="builder.Build()" />
+    <DiagramNode title="IServiceProvider" sub="after Build()" items="constructs instances, sealed" />
+  </DiagramRow>
+</Diagram>
+
+### The Middleware Pipeline
+
+```csharp
+app.MapControllers();
+```
+
+ASP.NET processes requests through a **middleware pipeline** — an ordered chain of components, each able to inspect the request, pass it along, and then inspect the response on the way back out.
+
+The shape is a nested chain rather than a list. Each middleware wraps the next:
+
+<Diagram title="Middleware nesting">
+  <DiagramRow>
+    <DiagramNode title="Request" sub="from Kestrel" />
+    <DiagramArrow label="enters" />
+    <DiagramNode title="Routing" sub="match endpoint" />
+    <DiagramArrow label="passes to" />
+    <DiagramNode title="Endpoint" sub="execute controller" />
+  </DiagramRow>
+  <DiagramArrow down label="response travels back out through each layer" align="end" />
+  <DiagramRow>
+    <DiagramNode title="Response" sub="to Kestrel" items="written to the socket" />
+  </DiagramRow>
+</Diagram>
+
+Order matters enormously in real applications. Authentication middleware must run before authorization, and both before the endpoint. This project's pipeline is minimal — `MapControllers()` adds routing and endpoint execution and nothing else — which is exactly why Part 2 removed `UseHttpsRedirection()`. Fewer layers, easier to reason about.
+
+### The Server Starts
+
+```csharp
+app.Run();
+```
+
+Kestrel binds to the configured port and begins accepting connections. This call **blocks** — it does not return until the process is shut down.
+
+The `Now listening on: http://localhost:5295` line appears, and startup is complete. Everything from here is phase three.
+
+## Phase Three: Per Request
+
+A request from Postman to `POST /jobs/push/3fa85f64-...` triggers the following.
+
+### Kestrel Accepts the Connection
+
+Kestrel reads the raw bytes from the socket, parses the HTTP request line, headers, and body, and constructs an `HttpContext` — an object holding everything about this request and the response being built for it.
+
+That `HttpContext` is then handed to the first middleware.
+
+### A Scope Is Created
+
+Before any middleware runs, ASP.NET creates a **dependency injection scope** for this request.
+
+This is what gives scoped services meaning. Every scoped service resolved during this request comes from this scope; a different request gets a different scope and therefore different instances. When the request completes, the scope is disposed, and any scoped service implementing `IDisposable` is disposed with it.
+
+Singletons ignore scopes entirely — they come from the root provider and are shared across all of them.
+
+### Routing Matches the Endpoint
+
+The routing middleware compares the request's method and path against the endpoints discovered at startup.
+
+`POST /jobs/push/3fa85f64-...` is tested against the registered routes. `JobsController.PushJob` declared `[Route("jobs")]` plus `[HttpPost("push/{id}")]`, producing the template `POST /jobs/push/{id}`. It matches.
+
+Routing also extracts **route values** from the match:
+
+```text
+id = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+```
+
+Still a string at this point. Conversion happens next.
+
+If nothing matches, routing sets no endpoint and the pipeline eventually returns `404`. That is precisely what happened in Part 2 after the weather forecast endpoint was deleted and no controllers existed yet.
+
+### The Controller Is Activated
+
+With an endpoint selected, ASP.NET constructs the controller.
+
+The activator inspects `JobsController`'s constructor and finds one parameter: `IOptions<AzureStorageSettings>`. It asks the request scope's service provider for that type. The provider finds the registration created by `Configure<T>` back at startup, returns the singleton instance — binding the configuration on first access and caching it — and the activator passes it to the constructor.
+
+```csharp
+public JobsController(IOptions<AzureStorageSettings> azureStorageSettings)
+{
+    _azureStorageSettings = azureStorageSettings.Value;
+}
+```
+
+The constructor body runs. `.Value` unwraps the options. The field is set.
+
+This is the whole of dependency injection: read the constructor, resolve each parameter from the container, call the constructor. There is no magic beyond reflection over metadata and a dictionary of registrations.
+
+### Model Binding
+
+The action signature is `PushJob(Guid id)`. Model binding populates that parameter.
+
+Binding sources are consulted in order — route values, query string, form data, request body, headers. `[ApiController]` makes this inference automatic, which is why no `[FromRoute]` attribute is required.
+
+The route value `id` matches the parameter name `id`. The value is the string `"3fa85f64-5717-4562-b3fc-2c963f66afa6"` and the target type is `Guid`, so a type converter attempts the conversion.
+
+**On success**, the parameter is populated and execution proceeds.
+
+**On failure** — the `"not-a-guid"` case from Part 6 — the error is recorded in `ModelState`. `[ApiController]` then short-circuits: it builds a Problem Details response, returns `400`, and **the action method never runs**. That entire behaviour lives in this step, before the controller code is reached.
+
+### The Action Executes
+
+Finally, the controller method body runs:
+
+```csharp
+if (AzureQueueHelper.IsJobQueued(_azureStorageSettings, id))
+```
+
+`AzureQueueHelper` is a static class, so there is no instance and no DI involvement. The method is called directly. Inside it, the Azure SDK issues HTTP requests to Azurite, and — being synchronous — blocks this thread until they complete.
+
+The method returns an `IActionResult`:
+
+```csharp
+return Ok(new JobPushResponseModel { Status = EJobPushStatus.Queued });
+```
+
+`Ok()` constructs an `OkObjectResult` holding the model and status code `200`. **Nothing has been serialised.** The response is still a C# object in memory, and no bytes have been written.
+
+### The Result Is Executed
+
+ASP.NET takes the returned `IActionResult` and executes it.
+
+For an `ObjectResult`, execution means **content negotiation**: inspecting the request's `Accept` header and selecting an output formatter capable of producing a matching content type. Postman sends `Accept: */*`, so the default JSON formatter is chosen.
+
+The formatter invokes `System.Text.Json` with the options configured at startup — including the `JsonStringEnumConverter` registered in Part 4. That converter is why `EJobPushStatus.Queued`, a value stored in memory as the integer `0`, is written as the text `"Queued"`.
+
+The camelCase naming policy, also a default of these options, turns the property `Status` into the JSON key `status`.
+
+The resulting bytes are written to the response stream:
+
+```json
+{"status":"Queued"}
+```
+
+### The Response Returns
+
+The response travels back out through each middleware layer in reverse order — the exit half of the nesting shown earlier. Kestrel writes the status line, headers, and body to the socket.
+
+The request scope is disposed. The `JobsController` instance becomes unreachable and is garbage collected. The singleton `IOptions<AzureStorageSettings>` is untouched, ready for the next request.
+
+## The Complete Path
+
+Everything above, condensed:
+
+| Step | What happens | Where it was configured |
+|---|---|---|
+| 1 | Kestrel parses the request, builds `HttpContext` | `CreateBuilder` |
+| 2 | A DI scope is created for the request | `builder.Build()` |
+| 3 | Routing matches `POST /jobs/push/{id}` | `[Route]`, `[HttpPost]`, `MapControllers()` |
+| 4 | Controller constructed, `IOptions<T>` injected | `Configure<T>` |
+| 5 | `"3fa85f64-..."` bound and converted to `Guid` | `[ApiController]`, parameter type |
+| 6 | Action body runs, helper calls Azurite | The controller and helper |
+| 7 | `OkObjectResult` returned, not yet serialised | `Ok()` |
+| 8 | Output formatter serialises to JSON | `AddJsonOptions` |
+| 9 | Bytes written, scope disposed, controller collected | Framework |
+
+Every row traces back to a specific line written in one of the previous parts. Nothing in the framework is doing anything that was not asked for.
+
+## Common Questions at This Stage
+
+### Why is the first request always slow?
+
+Three effects compound. JIT compilation converts every method on the request path to machine code for the first time. Lazily-initialised framework components construct on first use. And `IOptions<T>` binds its configuration section on first `.Value` access. All three are one-time costs, which is why the second request is dramatically faster.
+
+### If controllers are created per request, is that expensive?
+
+Not meaningfully. Object allocation in .NET is very cheap, and the garbage collector is highly optimised for short-lived objects — they are collected in generation 0, the cheapest possible collection. A per-request controller is the intended design, and it is what makes it safe for a controller to hold request-specific state in fields.
+
+### What actually happens if a scoped service is injected into a singleton?
+
+The scoped service is resolved once, when the singleton is constructed, and then held for the application's lifetime. It never gets a new instance per request despite being registered as scoped. This is called a **captive dependency** and is a genuine bug — often a disposed database context being reused across requests. .NET detects the most common cases at startup in the development environment and throws, which is why it surfaces immediately rather than as intermittent production failures.
+
+### Where does `async`/`await` fit into this?
+
+At step 6. A synchronous helper call blocks the thread pool thread handling this request for the full network round trip. An awaited call releases that thread to serve other requests and resumes on an available thread when the response arrives. The pipeline itself is asynchronous end to end — synchronous code inside an action is what forces a thread to be held. This is why Part 5 identified the async conversion as the highest-value refinement.
+
+### Does any of this change when deploying to real Azure?
+
+No. The build produces the same IL, the CLR and JIT behave identically, `Program.cs` runs the same registrations, and the request pipeline is unchanged. The only difference is the connection string value, and Kestrel typically sitting behind a reverse proxy. That invariance is the entire argument for the emulator-based workflow from Part 1.
+
+## What Was Covered in This Part
+
+- ✅ The three lifetimes — build, startup, per request — and why conflating them causes confusion
+- ✅ Roslyn producing IL and metadata, and why an intermediate language exists at all
+- ✅ The CLR loading assemblies and the JIT compiling methods on first call, with tiered compilation
+- ✅ What `CreateBuilder` sets up before any written code executes
+- ✅ Service registration as description rather than construction
+- ✅ Service lifetimes, and why controllers are activated rather than registered
+- ✅ `builder.Build()` as the seal between registration and resolution, and the correctness reason for it
+- ✅ The middleware pipeline as nesting rather than a list
+- ✅ The full per-request path: scope creation, routing, activation, binding, execution, formatting, disposal
+- ✅ Exactly where the automatic `400` originates and why the action never runs
+
+## The Series So Far
+
+Seven parts. A .NET 10 Web API that pushes job ids into Azure Queue Storage, checks for duplicates before pushing, returns a typed enum status, runs entirely locally against Azurite, and is understood line by line and layer by layer.
+
+What exists is the **producer** half of a queue system. Messages are written and never read. The natural continuation is the consumer: a background service that receives messages, processes them, and deletes them. That is where the concepts introduced in Part 1 but not yet exercised become concrete — visibility timeouts as a real retry mechanism, dequeue counts identifying poison messages, and the delete-after-processing pattern that gives a queue its reliability guarantees.
+
+The producer is the simpler half. Building it properly first means the consumer has somewhere to start.

@@ -1,0 +1,356 @@
+---
+title: "Modelling the message and the response"
+date: 2026-08-28
+status: written
+minutes: 13
+order: 4
+lead: 'Two data shapes are needed and they must not be the same one. What goes into a queue is a private implementation detail; what comes out of an API is a public contract. This part builds both, and answers a question that catches almost everyone — an enum is a number in C#, so why does the JSON say "Queued"?'
+---
+
+Part 3 filled the `Settings` folder and created the first enum. This part fills the `Models` folder.
+
+The code here is short — three files, fewer than twenty lines combined. The reasoning behind them is not short, and that reasoning is the actual content. Model design decisions are cheap to make and expensive to reverse, because every other layer ends up depending on them.
+
+## Two Shapes, Not One
+
+The project has two distinct pieces of data moving in opposite directions:
+
+<Diagram title="Two data shapes, two directions">
+  <DiagramRow>
+    <DiagramNode title="QueueJobModel" sub="goes INTO the queue" items="Id (Guid)" />
+    <DiagramNode title="JobPushResponseModel" sub="goes OUT to the caller" items="Status (enum)" />
+  </DiagramRow>
+</Diagram>
+
+**Inbound to the queue** — the message body stored inside Azure. This is what a future background worker reads and processes.
+
+**Outbound to the caller** — the JSON body the HTTP client receives back, reporting whether the job was queued or was already there.
+
+The instinct to collapse these into one class is understandable. They are both small, both concern the same operation, and one class means one file. Resisting that instinct matters, and it is worth being precise about why.
+
+### They Serve Different Audiences
+
+The queue message is consumed by a **background worker** — code inside the same system, written by the same team.
+
+The API response is consumed by an **external client** — a frontend application, a mobile app, another service. Possibly written by a different team, possibly outside the organisation.
+
+These audiences have different needs and different rates of change.
+
+### They Change for Different Reasons
+
+Suppose the queue message later needs a retry counter and a timestamp so the worker can track processing attempts. Adding those fields to a shared class would leak internal bookkeeping into the public API response, where they mean nothing to a frontend developer.
+
+Conversely, adding a human-readable message to the API response would push a field into the queue that no worker reads, wasting message size for nothing.
+
+Separate classes change independently. This is a specific instance of a general principle: types that change for different reasons should be different types.
+
+### They Represent Different Concepts
+
+`QueueJobModel` represents *work to be done*.
+`JobPushResponseModel` represents *the outcome of a request*.
+
+Those are not the same idea, and giving them the same shape obscures that.
+
+## The Queue Message Model
+
+Create `Models/QueueJobModel.cs`:
+
+```csharp
+namespace JobQueueApi.Models;
+
+public class QueueJobModel
+{
+    public Guid Id { get; set; }
+}
+```
+
+One property. This is the object that gets serialised to JSON and stored as the message body inside the queue:
+
+```json
+{"Id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}
+```
+
+### Why Wrap a Single Guid in a Class
+
+An obvious objection: the message is one Guid. Pushing `id.ToString()` directly would work and save a file.
+
+It would work today. Here is why it does not survive contact with a real project.
+
+**Adding a field later breaks every existing message.** Suppose a `QueuedAt` timestamp becomes necessary. With a raw Guid string, the message format changes from `"3fa85f64-..."` to something structured. Any message already sitting in the queue is now in the old format, and the worker has to handle both. With a JSON object from the start, adding a field is additive — old messages simply lack it and deserialise with a default value.
+
+**JSON is self-describing.** Opening Azure Storage Explorer and seeing `{"Id":"3fa85f64-..."}` immediately communicates what the message contains. Seeing a bare `3fa85f64-...` communicates that something is a Guid and nothing else.
+
+**Deserialisation gets a target.** `JsonSerializer.Deserialize<QueueJobModel>(body)` produces a typed object with a `.Id` property. Parsing a raw string means calling `Guid.Parse` and handling failure manually at every read site.
+
+**It matches what production code does.** Enterprise queue messages are essentially always structured objects. Starting with the structure means the pattern is already in place when the message inevitably grows.
+
+The cost of the class is one file. The cost of not having it is a migration later.
+
+### Why Guid and Not int or string
+
+`Guid` — a globally unique identifier, 128 bits, rendered as `3fa85f64-5717-4562-b3fc-2c963f66afa6`.
+
+**Against `int`:** sequential integers require a central authority to hand them out, usually a database. Guids can be generated anywhere — in the API, in the client, in a worker — with no coordination and no realistic collision risk. For a distributed system built around queues, that independence matters.
+
+**Against `string`:** a `string` accepts anything. `"abc"`, `""`, and `"; DROP TABLE"` are all valid strings. `Guid` accepts only well-formed identifiers, and ASP.NET enforces that automatically at the routing layer. Part 6 shows a malformed id producing an automatic `400 Bad Request` before controller code runs — a validation layer obtained for free purely by choosing the right type.
+
+## The Status Enum
+
+Create `Models/EJobPushStatus.cs`:
+
+```csharp
+namespace JobQueueApi.Models;
+
+public enum EJobPushStatus
+{
+    Queued,
+    AlreadyProcessing
+}
+```
+
+The API has exactly two possible outcomes:
+
+- **`Queued`** — the id was not in the queue, so a message was pushed
+- **`AlreadyProcessing`** — the id was already in the queue, so nothing was pushed
+
+### Why an Enum Instead of a String or Boolean
+
+**Against a raw string.** Returning `"Queued"` as a string means the compiler cannot catch `"Qeued"`, `"queued"`, or `"QUEUED"`. Three separate bugs, all compiling cleanly, all breaking a client that matches on the exact value. An enum makes every one of them a compile error.
+
+**Against a boolean.** `bool wasQueued` handles two cases and then stops. Real systems grow cases — `Rejected`, `RateLimited`, `QueueUnavailable`. Adding a third outcome to a boolean means changing the response shape and breaking every client. Adding a third enum member is additive.
+
+**For discoverability.** `EJobPushStatus.` in an editor lists every possible outcome. There is no equivalent for a string return type — the possible values live only in documentation, or in someone's memory.
+
+> **Naming the members.** `AlreadyProcessing` is chosen over `AlreadyQueued` deliberately. From the caller's perspective the meaningful fact is that the work is already in flight — whether it is sitting in the queue or actively being processed by a worker is an internal detail. The name describes the outcome from outside the system, which is what a public contract should do.
+
+## The Response Model
+
+Create `Models/JobPushResponseModel.cs`:
+
+```csharp
+namespace JobQueueApi.Models;
+
+public class JobPushResponseModel
+{
+    public EJobPushStatus Status { get; set; }
+}
+```
+
+This is what the controller returns and what the HTTP client receives:
+
+```json
+{"status":"Queued"}
+```
+
+### Why Wrap the Enum in a Class
+
+The same reasoning as `QueueJobModel`, and it applies more forcefully to public contracts.
+
+Returning the bare enum would produce a response body of `"Queued"` — a naked JSON string. That is valid JSON, but it is a poor API contract. Adding any other field later, such as a timestamp or a human-readable message, changes the response from a string to an object, which is a breaking change for every consumer.
+
+An object from the start means growth is additive. A client parsing `response.status` continues working unchanged when a `message` field appears alongside it.
+
+## How an Enum Becomes a String in JSON
+
+This is the point where the mental model usually breaks.
+
+### The Confusion
+
+Enums in C# are backed by integers. Without explicit values, members are numbered from zero in declaration order:
+
+```csharp
+public enum EJobPushStatus
+{
+    Queued,            // 0
+    AlreadyProcessing  // 1
+}
+```
+
+This is verifiable:
+
+```csharp
+int value = (int)EJobPushStatus.AlreadyProcessing;  // 1
+```
+
+So the object being returned holds the number `1`. The client receives `"AlreadyProcessing"`. Something converts between them, and understanding what and where is the point of this section.
+
+### The Two Worlds
+
+<Diagram title="Two representations of the same value">
+  <DiagramRow>
+    <DiagramNode title="C# in memory" sub="EJobPushStatus.Queued" items="stored as int 0" />
+    <DiagramArrow label="serialiser" />
+    <DiagramNode title="JSON on the wire" sub='"Queued"' items="a text string" />
+  </DiagramRow>
+</Diagram>
+
+An enum member is a compile-time name attached to a numeric value. The name exists in metadata inside the compiled assembly; the value is what sits in memory.
+
+JSON has no concept of an enum. It has strings, numbers, booleans, objects, arrays, and null. Any enum crossing into JSON must become one of those.
+
+Which one it becomes is decided entirely by the **serialiser** — not by the enum, and not by the controller.
+
+### The Default Behaviour
+
+.NET's built-in serialiser is `System.Text.Json`, and its default for enums is the **numeric value**:
+
+```json
+{"status":1}
+```
+
+That is technically correct and practically unhelpful. A client receiving `1` has no way to know what it means without out-of-band documentation, and adding a new enum member in the middle of the list silently changes what every existing number means.
+
+### Making It Emit Strings
+
+`System.Text.Json` ships with a converter that changes this. Register it in `Program.cs`:
+
+```csharp
+using System.Text.Json.Serialization;
+using JobQueueApi.Settings;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
+    });
+
+builder.Services.Configure<AzureStorageSettings>(
+    builder.Configuration.GetSection("AzureStorage")
+);
+
+var app = builder.Build();
+
+app.MapControllers();
+
+app.Run();
+```
+
+Reading that addition:
+
+**`.AddJsonOptions(...)`** chains onto `AddControllers()` and configures the serialiser used for every controller response in the application.
+
+**`JsonStringEnumConverter`** is a converter — a class that overrides how one specific type category is read and written. This one instructs the serialiser to write the enum member's *name* rather than its numeric value, and to accept names when reading.
+
+**The result:**
+
+```json
+{"status":"Queued"}
+```
+
+This applies globally. Every enum in every controller response now serialises as a string, with no per-model attributes required.
+
+> **Why not rely on the default.** Relying on defaults for anything that forms a public contract is a mistake. Defaults vary between serialisers, can change between framework versions, and are invisible to anyone reading the model class. One explicit line in `Program.cs` makes the behaviour a deliberate decision rather than an accident.
+
+### Where the Serialiser Is Invoked
+
+A follow-on question naturally arises. Controller code will look like this:
+
+```csharp
+return Ok(new JobPushResponseModel { Status = EJobPushStatus.Queued });
+```
+
+There is no serialiser call anywhere. So where does serialisation happen?
+
+`Ok(...)` does **not** serialise. It constructs an `OkObjectResult` — a small object holding the payload and the status code `200` — and returns it. At that moment the response is still a C# object in memory.
+
+Serialisation happens later, inside the ASP.NET pipeline, after the controller method has returned:
+
+<Diagram title="From return statement to HTTP response">
+  <DiagramRow>
+    <DiagramNode title="return Ok(model)" sub="controller" />
+    <DiagramArrow label="produces" />
+    <DiagramNode title="OkObjectResult" sub="payload + status 200" />
+  </DiagramRow>
+  <DiagramArrow down label="ASP.NET executes the result" align="end" />
+  <DiagramRow>
+    <DiagramNode title="Output formatter" sub="System.Text.Json" items="applies JsonStringEnumConverter" />
+    <DiagramArrow label="writes" />
+    <DiagramNode title="HTTP response body" sub='{"status":"Queued"}' />
+  </DiagramRow>
+</Diagram>
+
+ASP.NET inspects the request's `Accept` header, selects a matching output formatter — JSON by default — applies the configured `JsonSerializerOptions` including the converter registered above, and writes the resulting bytes to the response stream.
+
+The entire machinery is registered by the single `AddControllers()` line. Part 7 traces this pipeline in full.
+
+### Why Property Names Are Lowercase in the JSON
+
+The C# property is `Status` but the JSON shows `"status"`. This is `System.Text.Json`'s default naming policy, camelCase, which matches JavaScript convention and keeps frontend code idiomatic.
+
+It can be changed if a client requires exact PascalCase:
+
+```csharp
+options.JsonSerializerOptions.PropertyNamingPolicy = null;
+```
+
+The default is almost always correct. It is worth knowing about only because seeing `Status` in C# and `status` in a response is otherwise briefly confusing.
+
+## The Models Folder
+
+Four files now, including the enum from Part 3:
+
+```text
+Models/
+├── EQueueNames.cs            queue name lookup keys        (Part 3)
+├── EJobPushStatus.cs         API response outcomes         (Part 4)
+├── QueueJobModel.cs          message body stored in queue  (Part 4)
+└── JobPushResponseModel.cs   HTTP response body            (Part 4)
+```
+
+Two enums and two classes, each with exactly one responsibility. Confirm it compiles:
+
+```bash
+dotnet build
+```
+
+```text
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+## Common Questions at This Stage
+
+### Do these models need attributes like `[JsonPropertyName]`?
+
+Not here. `System.Text.Json` matches property names automatically, case-insensitively, in both directions. Attributes become necessary when the JSON name must differ from the C# name — matching an external API's naming, or preserving a wire format while renaming a C# property. Neither applies to models defined and consumed entirely within one system.
+
+### Should these be `record` types instead of classes?
+
+They could be. A `record` is a class with value-based equality and concise syntax, well suited to immutable data:
+
+```csharp
+public record QueueJobModel(Guid Id);
+```
+
+Classes with `get; set;` properties are used here because they are the more common shape in existing .NET codebases, and reading unfamiliar production code is a goal of this series. Records are an excellent choice for new code; nothing about the Options Pattern, serialisation, or the queue SDK depends on the distinction.
+
+### What happens if a message in the queue does not match `QueueJobModel`?
+
+`JsonSerializer.Deserialize<QueueJobModel>` returns an object with default values for any missing properties — `Guid.Empty` for a missing `Id`. Malformed JSON throws a `JsonException`. Part 5 handles this by null-checking the deserialised result before comparing ids, which keeps a single unexpected message from breaking the entire duplicate check.
+
+### Why is `EQueueNames` in `Models` rather than `Settings`?
+
+It is a judgement call. `EQueueNames` is used by `AzureStorageSettings` in the `Settings` folder, which is an argument for placing it there. It is placed in `Models` because it describes a domain concept — the set of queues that exist in this system — rather than a configuration mechanism. Configuration merely happens to consume it. Either location is defensible; consistency matters more than the specific choice.
+
+### Could the same enum be used for both the queue message and the response?
+
+They are unrelated. `EQueueNames` identifies which queue to talk to. `EJobPushStatus` describes what happened during a request. Sharing an enum between two unrelated concepts is the same mistake as sharing a model between the queue and the response, in a smaller package.
+
+## What Was Accomplished in This Part
+
+- ✅ `QueueJobModel` created — the message body stored inside the queue
+- ✅ `EJobPushStatus` created — the two possible outcomes of a push request
+- ✅ `JobPushResponseModel` created — the HTTP response contract
+- ✅ The reasoning behind separating queue models from response models understood
+- ✅ The reasoning behind wrapping single values in classes understood
+- ✅ Enum-to-JSON serialisation understood — why C# holds a number, why JSON shows a string, and which component performs the conversion
+- ✅ `JsonStringEnumConverter` registered so responses emit readable names
+
+## What Comes Next
+
+**Part 5** finally talks to Azure. The queue helper is where `QueueClient` appears, where the model gets serialised and pushed, and where the duplicate check peeks at existing messages.
+
+That part covers why `CreateIfNotExists()` is called on every operation, what separates peeking from receiving in practice, a hard limit in the Azure API that constrains how the duplicate check can work, and why messages appear as unreadable Base64 in Storage Explorer unless the client is configured otherwise.

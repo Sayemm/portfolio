@@ -1,0 +1,475 @@
+---
+title: "Talking to the queue"
+date: 2026-08-28
+status: written
+minutes: 17
+order: 5
+lead: 'Azure finally enters the picture. One static class, three methods, and a handful of SDK calls — wrapped around a hard 32-message limit that quietly shapes what the duplicate check can and cannot promise.'
+---
+
+Parts 3 and 4 built configuration and models without touching Azure once. This part changes that. Everything here uses the `Azure.Storage.Queues` package installed back in Part 2.
+
+The helper is the only place in the project that knows Azure exists. Controllers call it, models pass through it, and configuration feeds it — but the `QueueClient` type appears in exactly one file. That containment is deliberate and is the first thing worth explaining.
+
+## Why a Helper Layer at All
+
+The controller could talk to Azure directly. Creating a `QueueClient` inside a controller action works and skips a file.
+
+Three reasons not to.
+
+**Isolation of the dependency.** `Azure.Storage.Queues` is referenced in one file. Swapping to Azure Service Bus, RabbitMQ, or a database-backed queue means rewriting that file and nothing else. With SDK calls scattered across controllers, the same change touches every one.
+
+**Separation of responsibility.** A controller's job is to translate HTTP into method calls and results back into HTTP. Serialising JSON, constructing clients, and scanning message bodies are not that job. Mixing them produces controllers that are long, hard to read, and hard to test.
+
+**Reuse.** The same push logic is needed from more than one place in real systems — an HTTP endpoint that triggers a job on demand, and a scheduled timer that triggers the same job nightly. If the logic lives in the controller, the timer either duplicates it or awkwardly calls into a controller. If it lives in a helper, both call the same method.
+
+## The Static Class Decision
+
+Create `Helpers/AzureQueueHelper.cs`. It is declared `static`:
+
+```csharp
+public static class AzureQueueHelper
+```
+
+A static class cannot be instantiated. Its methods are called directly on the type:
+
+```csharp
+AzureQueueHelper.PushJobToQueue(settings, jobId);
+```
+
+This is worth pausing on, because it is a genuine trade-off rather than an obvious best practice.
+
+### Why Static Works Here
+
+The helper holds no state. Every method receives everything it needs as a parameter — the settings object and the job id — and returns a result. Nothing is remembered between calls. A class with no state has nothing to gain from being instantiated.
+
+Static also produces the shortest possible call site. No constructor, no injection, no field. `AzureQueueHelper.PushJobToQueue(...)` reads as exactly what it does.
+
+This pattern is extremely common in existing .NET codebases, particularly in shared utility assemblies. Recognising it matters.
+
+### What Static Costs
+
+**Testability.** A unit test of a controller that calls a static helper cannot substitute a fake. The test either talks to a real queue, or does not test that path at all. With an interface, a test supplies a stub in one line.
+
+**Explicit dependencies.** A constructor parameter announces what a class depends on. A static call buried inside a method body does not. Reading a controller's constructor should reveal what it needs, and static calls hide that.
+
+**Lifecycle control.** Dependency injection manages object lifetimes, disposal, and configuration. Static methods opt out of all of it.
+
+### The Alternative
+
+The dependency-injected version defines an interface:
+
+```csharp
+public interface IAzureQueueService
+{
+    bool IsJobQueued(Guid jobId);
+    void PushJobToQueue(Guid jobId);
+}
+```
+
+An implementation receives `IOptions<AzureStorageSettings>` in its own constructor, so callers no longer pass settings on every call. It is registered in `Program.cs` and injected into the controller.
+
+That version is better for production code. This series uses the static version because it makes the data flow completely visible — settings are passed explicitly at every call site, so there is no hidden state to reason about while the underlying queue concepts are still new. The refactor to an interface is mechanical once those concepts are solid, and knowing both patterns is more useful than knowing one.
+
+## Getting a QueueClient
+
+The first method is private — an internal detail the rest of the class uses:
+
+```csharp
+private static QueueClient GetQueue(string connectionString, string queueName)
+{
+    var client = new QueueClient(
+        connectionString,
+        queueName,
+        new QueueClientOptions
+        {
+            MessageEncoding = QueueMessageEncoding.None
+        }
+    );
+
+    client.CreateIfNotExists();
+
+    return client;
+}
+```
+
+### What QueueClient Is
+
+`QueueClient` is the SDK's representation of **one specific queue**. Not the storage account, not the queue service — a single named queue.
+
+It handles everything underneath: constructing REST requests, signing them with credentials parsed from the connection string, retrying transient network failures with backoff, and parsing responses back into .NET objects.
+
+Constructing one is cheap. It does not open a connection or contact the server — it just stores the connection string and queue name and prepares to make HTTP calls when a method is invoked.
+
+> **The same client, two destinations.** This `QueueClient` talks to Azurite locally and to real Azure in production, with no code difference. The connection string alone determines the destination. That is what makes the emulator approach in Part 1 viable.
+
+### CreateIfNotExists
+
+```csharp
+client.CreateIfNotExists();
+```
+
+A queue must exist before messages can be sent to it. Sending to a nonexistent queue throws.
+
+This call creates the queue if it is absent and does nothing if it is present. It is idempotent — calling it a thousand times has the same effect as calling it once.
+
+Calling it on **every** operation looks wasteful, and it does cost one extra HTTP round trip per call. The trade-offs:
+
+**In favour:** the project never needs manual queue provisioning. Deploying to a fresh Azure account works immediately. No deployment script, no forgotten setup step, no runtime failure because someone skipped a wiki page.
+
+**Against:** an extra network call on every push and every check. On a high-traffic endpoint this is measurable.
+
+The production refinement is to call it once at startup — or in the constructor of an injected service, which exists for the app's lifetime — rather than per operation. Calling it per operation here keeps the helper stateless and makes the behaviour obvious at the point of use, which is worth more while learning than the round trip costs.
+
+### Message Encoding
+
+```csharp
+new QueueClientOptions
+{
+    MessageEncoding = QueueMessageEncoding.None
+}
+```
+
+This option controls how message bodies are encoded on the wire, and it is a genuine source of confusion.
+
+**`QueueMessageEncoding.None`** sends the message body exactly as provided. A JSON string goes in as a JSON string and appears in Azure Storage Explorer as readable JSON:
+
+```json
+{"Id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}
+```
+
+**`QueueMessageEncoding.Base64`** Base64-encodes the body before sending. The same message appears as:
+
+```text
+eyJJZCI6IjNmYTg1ZjY0LTU3MTctNDU2Mi1iM2ZjLTJjOTYzZjY2YWZhNiJ9
+```
+
+Crucially, the encoding is **symmetric and invisible to the code**. With `Base64` set, the SDK encodes on send and decodes on receive automatically. Code always works with the plain string in both directions. It is a wire format detail, not something the application handles.
+
+> **Which is the default?** In the modern `Azure.Storage.Queues` v12 SDK, the default is `None` — plain text. This trips people up because the older v11 library (`Microsoft.WindowsAzure.Storage`) defaulted to Base64, and a large amount of tutorial content and Stack Overflow material still reflects that older behaviour. Setting the option explicitly, as above, removes all ambiguity for anyone reading the code.
+
+**When Base64 is genuinely required:** Azure Functions queue triggers expect Base64-encoded messages by default. A queue written by this API and read by an Azure Function needs `Base64` set here, or the function's binding configured for plain text. Interoperating with older v11-based code has the same requirement. Mismatched encoding produces messages that arrive but fail to parse — a confusing failure mode worth recognising.
+
+For this project, `None` is correct. Messages are readable in Storage Explorer during development, which makes the testing in Part 6 far more instructive.
+
+## Checking Whether a Job Is Queued
+
+The duplicate check:
+
+```csharp
+public static bool IsJobQueued(AzureStorageSettings settings, Guid jobId)
+{
+    var queue = GetQueue(
+        settings.ConnectionString,
+        settings.QueueNames[EQueueNames.JobExport]
+    );
+
+    PeekedMessage[] messages = queue.PeekMessages(32).Value;
+
+    return messages.Any(message =>
+    {
+        var model = JsonSerializer.Deserialize<QueueJobModel>(message.Body.ToString());
+        return model != null && model.Id == jobId;
+    });
+}
+```
+
+Several things happen in nine lines.
+
+### Peek, Not Receive
+
+`PeekMessages` reads message contents **without changing their state**. The messages remain visible to every other consumer. Nothing is hidden, nothing is locked, nothing is consumed.
+
+This is essential here. The goal is to answer a question about the queue, not to take work from it. Using `ReceiveMessages` instead would make every peeked message invisible for 30 seconds, meaning a duplicate check would temporarily hide real work from the background worker that is supposed to process it.
+
+The distinction from Part 1, restated concretely:
+
+| | `PeekMessages` | `ReceiveMessages` |
+|---|---|---|
+| Returns message content | Yes | Yes |
+| Changes message visibility | No | Yes — hidden for the visibility timeout |
+| Increments `DequeueCount` | No | Yes |
+| Returns a delete receipt | No | Yes — required to delete |
+| Use for | Inspecting | Processing |
+
+`PeekedMessage` and `QueueMessage` are different types for this reason: a peeked message has no `PopReceipt`, because without one it cannot be deleted. The type system prevents an inspect-only read from being mistaken for a claim on the work.
+
+### The 32-Message Limit
+
+```csharp
+queue.PeekMessages(32)
+```
+
+**32 is the maximum the Azure Queue Storage API accepts.** Not a convention, not a tuning choice — a hard service limit. Requesting more returns an error.
+
+This has a direct and important consequence:
+
+> **The duplicate check is not a guarantee.** If 40 messages are in the queue and the target id sits at position 35, `PeekMessages(32)` never sees it. The check returns `false`, and a duplicate is pushed.
+
+This is not a bug in the code. It is a limitation of using a queue as a lookup structure. A queue is designed to deliver messages in order, not to answer membership questions. Peek exists for inspection and diagnostics, not for indexing.
+
+It is worth being clear about what this design does and does not provide, because the distinction matters:
+
+**What it does provide:** protection against the common case — a user double-clicking a button, a client retrying a request, a duplicate webhook delivery. In these cases the target message is near the front of a short queue and is found reliably.
+
+**What it does not provide:** correctness under load. A backlog beyond 32 messages means duplicates get through.
+
+The production approaches, in ascending order of robustness:
+
+**A database flag.** Store an `IsQueued` boolean or a `QueuedAt` timestamp on the record itself. Check that instead of the queue. The lookup is indexed, exact, and unbounded in size. This is the most common real solution and the one the pattern in this series ultimately points toward.
+
+**A distributed cache.** Write the id to Redis with a TTL when pushing, check for its presence before pushing. Fast and self-expiring, though it introduces a second piece of infrastructure.
+
+**Idempotent consumers.** Accept that duplicates occur and make processing safe to repeat. Often the most robust answer, since duplicates can arise from network retries regardless of any check on the producer side.
+
+**Azure Service Bus.** A different service with built-in duplicate detection over a configurable time window. It solves this at the infrastructure layer, at higher cost and complexity than Queue Storage.
+
+For a learning project, and for the common real cases of double-submission, the peek check is a reasonable and widely used approach. Knowing its boundary is what separates using it deliberately from using it accidentally.
+
+### Unwrapping the Response
+
+```csharp
+PeekedMessage[] messages = queue.PeekMessages(32).Value;
+```
+
+Azure SDK methods return `Response<T>` rather than `T` directly. The wrapper carries HTTP metadata alongside the payload — status code, headers, request id — useful for logging and diagnostics.
+
+`.Value` extracts the payload. In code that needs the metadata, the wrapper is kept:
+
+```csharp
+Response<PeekedMessage[]> response = queue.PeekMessages(32);
+var requestId = response.GetRawResponse().ClientRequestId;
+var messages = response.Value;
+```
+
+This project does not need the metadata, so `.Value` is taken inline.
+
+### Reading the Message Body
+
+```csharp
+message.Body.ToString()
+```
+
+`Body` is of type `BinaryData` — a wrapper over raw bytes. Azure Queue Storage stores arbitrary payloads; the SDK does not assume text.
+
+`ToString()` interprets those bytes as a UTF-8 string, which is the JSON that was written. `BinaryData` also offers `ToObjectFromJson<T>()`, which would collapse the deserialisation into one call. `JsonSerializer.Deserialize` is used here because it makes the JSON step explicit and mirrors the `Serialize` call on the push side.
+
+### The Null Check
+
+```csharp
+return model != null && model.Id == jobId;
+```
+
+`JsonSerializer.Deserialize<T>` returns a nullable `T?`. It returns `null` when the JSON body is literally `null`, and throws a `JsonException` when the JSON is malformed.
+
+The null check prevents a `NullReferenceException` on that first case. It does not protect against malformed JSON, which would propagate as an exception — a message written by unrelated code, or a manual test entry added through Storage Explorer, would break the entire check. Production code wraps the deserialisation in a try/catch and skips unparseable messages rather than failing the whole operation.
+
+### The LINQ Predicate
+
+```csharp
+return messages.Any(message => { ... });
+```
+
+`Any` returns `true` as soon as one element satisfies the predicate, short-circuiting the rest. If the target id is the first message, one deserialisation happens rather than 32.
+
+## Pushing a Job
+
+```csharp
+public static void PushJobToQueue(AzureStorageSettings settings, Guid jobId)
+{
+    var model = new QueueJobModel { Id = jobId };
+
+    var json = JsonSerializer.Serialize(model);
+
+    var queue = GetQueue(
+        settings.ConnectionString,
+        settings.QueueNames[EQueueNames.JobExport]
+    );
+
+    queue.SendMessage(json);
+}
+```
+
+Three steps: construct the model, serialise it, send it.
+
+**`JsonSerializer.Serialize(model)`** converts the C# object into a JSON string:
+
+```json
+{"Id":"3fa85f64-5717-4562-b3fc-2c963f66afa6"}
+```
+
+Note that this is a *direct* serialiser call, unlike the controller responses in Part 4 where ASP.NET invoked the serialiser through the pipeline. Consequently the `JsonStringEnumConverter` registered in `Program.cs` does **not** apply here — those options configure MVC's output formatters, not standalone `JsonSerializer` calls. This matters the moment an enum is added to a queue message: it would serialise as a number unless options are passed explicitly to this call.
+
+**`queue.SendMessage(json)`** performs the HTTP POST to Azure or Azurite. The message is appended to the back of the queue and becomes immediately visible to consumers.
+
+`SendMessage` has overloads for two useful behaviours:
+
+```csharp
+// Invisible for the first 5 minutes — a scheduled message
+queue.SendMessage(json, visibilityTimeout: TimeSpan.FromMinutes(5));
+
+// Auto-deleted after 1 hour if not processed
+queue.SendMessage(json, timeToLive: TimeSpan.FromHours(1));
+```
+
+The default TTL is 7 days. Neither is needed here, but both are worth knowing — delayed visibility is how scheduled jobs are built on top of a plain queue.
+
+## The Complete Helper
+
+```csharp
+using Azure.Storage.Queues;
+using Azure.Storage.Queues.Models;
+using System.Text.Json;
+using JobQueueApi.Models;
+using JobQueueApi.Settings;
+
+namespace JobQueueApi.Helpers;
+
+public static class AzureQueueHelper
+{
+    private static QueueClient GetQueue(string connectionString, string queueName)
+    {
+        var client = new QueueClient(
+            connectionString,
+            queueName,
+            new QueueClientOptions
+            {
+                MessageEncoding = QueueMessageEncoding.None
+            }
+        );
+
+        client.CreateIfNotExists();
+
+        return client;
+    }
+
+    public static bool IsJobQueued(AzureStorageSettings settings, Guid jobId)
+    {
+        var queue = GetQueue(
+            settings.ConnectionString,
+            settings.QueueNames[EQueueNames.JobExport]
+        );
+
+        PeekedMessage[] messages = queue.PeekMessages(32).Value;
+
+        return messages.Any(message =>
+        {
+            var model = JsonSerializer.Deserialize<QueueJobModel>(message.Body.ToString());
+            return model != null && model.Id == jobId;
+        });
+    }
+
+    public static void PushJobToQueue(AzureStorageSettings settings, Guid jobId)
+    {
+        var model = new QueueJobModel { Id = jobId };
+
+        var json = JsonSerializer.Serialize(model);
+
+        var queue = GetQueue(
+            settings.ConnectionString,
+            settings.QueueNames[EQueueNames.JobExport]
+        );
+
+        queue.SendMessage(json);
+    }
+}
+```
+
+The `using` statements, each earning its place:
+
+- `Azure.Storage.Queues` — `QueueClient`, `QueueClientOptions`
+- `Azure.Storage.Queues.Models` — `PeekedMessage`, `QueueMessageEncoding`
+- `System.Text.Json` — `JsonSerializer`
+- `JobQueueApi.Models` — `QueueJobModel`, `EQueueNames`
+- `JobQueueApi.Settings` — `AzureStorageSettings`
+
+Confirm it compiles:
+
+```bash
+dotnet build
+```
+
+```text
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
+
+## The Synchronous Choice
+
+Every SDK call here is synchronous. Each has an async counterpart:
+
+| Synchronous | Asynchronous |
+|---|---|
+| `client.CreateIfNotExists()` | `client.CreateIfNotExistsAsync()` |
+| `queue.PeekMessages(32)` | `queue.PeekMessagesAsync(32)` |
+| `queue.SendMessage(json)` | `queue.SendMessageAsync(json)` |
+
+The distinction matters more than it might appear.
+
+A synchronous network call **blocks the thread** for the entire round trip. ASP.NET serves requests from a thread pool of finite size. Under load, blocked threads accumulate, the pool exhausts, and requests queue behind threads that are doing nothing but waiting on a network response.
+
+An asynchronous call releases the thread while waiting. That thread serves other requests and is reclaimed when the response arrives. The same pool handles far more concurrent requests.
+
+The async version of the helper:
+
+```csharp
+public static async Task<bool> IsJobQueued(AzureStorageSettings settings, Guid jobId)
+{
+    var queue = await GetQueueAsync(
+        settings.ConnectionString,
+        settings.QueueNames[EQueueNames.JobExport]
+    );
+
+    PeekedMessage[] messages = (await queue.PeekMessagesAsync(32)).Value;
+
+    return messages.Any(message =>
+    {
+        var model = JsonSerializer.Deserialize<QueueJobModel>(message.Body.ToString());
+        return model != null && model.Id == jobId;
+    });
+}
+```
+
+The controller action becomes `async Task<IActionResult>` and awaits the helper calls.
+
+Async is the correct choice for production. The synchronous version is used here to keep the focus on queue semantics rather than on `async`/`await` mechanics — but this is a genuine simplification, not a stylistic preference, and converting the helper to async is the single most valuable refinement to make after the concepts are solid.
+
+## Common Questions at This Stage
+
+### Should `QueueClient` be cached instead of created per call?
+
+Yes, in production. `QueueClient` is thread-safe and designed to be long-lived. Creating one per call is inexpensive but not free, and combined with the per-call `CreateIfNotExists()` it means two avoidable round trips on a hot path. The DI-based refactor solves both naturally — a singleton service constructs the client once in its constructor and reuses it.
+
+### Why pass `AzureStorageSettings` into every method rather than reading configuration inside the helper?
+
+Because a static class has no way to receive injected dependencies. Reading configuration inside would mean a static reference to `IConfiguration`, which is a well-known anti-pattern — it hides the dependency and makes the class impossible to test. Passing settings explicitly keeps the data flow visible. This awkwardness is a direct consequence of choosing static, and it disappears entirely in the injected version.
+
+### What happens if Azurite is not running?
+
+`CreateIfNotExists()` fails first, throwing after the SDK exhausts its retry policy — typically a few seconds of delay. The exception surfaces as an unhandled error and ASP.NET returns `500 Internal Server Error`. Production code catches `RequestFailedException` and returns a meaningful status such as `503 Service Unavailable`, which distinguishes an infrastructure outage from a bug in the application.
+
+### Does the message need to be JSON?
+
+No. Azure Queue Storage stores arbitrary strings up to 64 KB. Plain text, XML, or a raw Guid would all work. JSON is chosen because it is self-describing, human-readable in Storage Explorer, universally supported, and extends cleanly when the message grows a field.
+
+### Why is `GetQueue` private?
+
+Because it is an implementation detail. Exposing it would let callers obtain a raw `QueueClient` and bypass the helper entirely, which defeats the containment described at the start of this part. The public surface is exactly two methods — check and push — and everything else is internal.
+
+## What Was Accomplished in This Part
+
+- ✅ `AzureQueueHelper` created — the only file in the project that references the Azure SDK
+- ✅ `QueueClient` understood, including why the same client serves Azurite and real Azure
+- ✅ `CreateIfNotExists()` understood, with the round-trip cost and its production refinement
+- ✅ Message encoding understood — what Base64 does, that the v12 SDK defaults to plain text, and when Base64 is genuinely required
+- ✅ Peek versus receive understood in practice, including why `PeekedMessage` lacks a pop receipt
+- ✅ The 32-message limit understood, along with what the duplicate check does and does not guarantee
+- ✅ `Response<T>` and `BinaryData` unwrapping understood
+- ✅ The synchronous versus asynchronous trade-off understood
+
+## What Comes Next
+
+**Part 6** ties everything together. The controller receives an HTTP request, calls the two helper methods, and returns the response model built in Part 4.
+
+That part also covers end-to-end testing — hitting the endpoint from Postman, watching a message appear in Azure Storage Explorer as readable JSON, sending the same id twice to see `AlreadyProcessing` come back, and sending a malformed id to see ASP.NET reject it with a `400` before a single line of controller code runs.
