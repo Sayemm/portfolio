@@ -1,0 +1,195 @@
+---
+title: "Deferred execution: why a LINQ query is a recipe, not results"
+date: 2026-09-02
+status: written
+minutes: 15
+order: 4
+lead: 'Because LINQ is built on yield, a query runs nothing when it is written — it is a recipe that executes only when walked, one element at a time through the whole chain. That single fact explains the pipeline, the live-view behaviour, and the multiple-enumeration trap that catches everyone. This part follows deferred execution all the way through, and shows when to freeze a query with ToList.'
+---
+
+Part 3 showed that a single `yield` method runs nothing until it is iterated, and re-runs on every fresh enumeration. LINQ operators like `Where` and `Select` are themselves iterator methods, so **every one of those facts is true of LINQ**. This part follows the consequences, because they are the source of both LINQ's power and its most common bugs.
+
+## A LINQ query is a recipe, not results
+
+Writing a LINQ query builds a **description of work**. It does not do the work. The operators just wire up a pipeline and hand it back; nothing runs until something walks it.
+
+```csharp
+var numbers = new[] { 1, 2, 3, 4, 5 };
+
+var query = numbers.Where(n =>
+{
+    Console.WriteLine($"checking {n}");
+    return n > 2;
+});
+
+Console.WriteLine("query built");   // this prints FIRST
+
+foreach (var n in query)            // only now does the checking happen
+    Console.WriteLine($"got {n}");
+```
+
+The output shows the query did nothing until the `foreach`:
+
+```text
+query built
+checking 1
+checking 2
+checking 3
+got 3
+checking 4
+got 4
+checking 5
+got 5
+```
+
+This is **deferred execution**: the query is a recipe, and iterating it is cooking. `query` holds no results — it holds the *instructions* for producing them.
+
+## The pipeline runs one element at a time
+
+Here is the part almost everyone pictures wrong. A chain like `Where().Select()` does **not** run all of `Where` and then all of `Select`. Each element flows through the *entire* chain before the next element starts.
+
+```csharp
+var result = new[] { 1, 2, 3 }
+    .Where(n => { Console.WriteLine($"where {n}"); return n % 2 == 1; })
+    .Select(n => { Console.WriteLine($"select {n}"); return n * 10; });
+
+foreach (var x in result)
+    Console.WriteLine($"got {x}");
+```
+
+Watch the order — it is element-by-element, not stage-by-stage:
+
+```text
+where 1     -> passes
+select 1
+got 10
+where 2     -> fails the filter, so Select is never called for it
+where 3     -> passes
+select 3
+got 30
+```
+
+Element `1` goes all the way through (`where`, `select`, consumer) before element `2` is even looked at. And `2`, failing the filter, never reaches `Select` at all.
+
+<Diagram title="Each element flows through the whole chain before the next one starts">
+  <DiagramRow>
+    <DiagramNode title="source" sub="one item" />
+    <DiagramArrow label="Where" />
+    <DiagramNode title="passes?" sub="filter" />
+    <DiagramArrow label="Select" />
+    <DiagramNode title="to consumer" sub="one result" />
+  </DiagramRow>
+</Diagram>
+
+This streaming is why LINQ never builds intermediate lists between operators, and why it can process huge or even infinite sources without running out of memory.
+
+## Deferred versus immediate operators
+
+Not every LINQ operator is deferred. The rule of thumb: operators that return **another sequence** are deferred; operators that return a **single value or a concrete collection** run immediately, because they have to walk the sequence to produce their answer.
+
+| Deferred (lazy — return a query) | Immediate (run now — return a value or collection) |
+|---|---|
+| `Where`, `Select`, `SelectMany` | `ToList`, `ToArray`, `ToDictionary` |
+| `Take`, `Skip`, `Distinct` | `Count`, `Sum`, `Average`, `Min`, `Max` |
+| `OrderBy`, `ThenBy`, `GroupBy` | `First`, `Last`, `Single`, `ElementAt` |
+| `Concat`, `Reverse`, `Cast` | `Any`, `All`, `Contains` |
+
+The immediate ones are also the tools for **forcing** a query to run and capturing its results — `ToList()` most of all.
+
+> **A subtlety worth knowing:** a few deferred operators are *buffering* rather than *streaming*. `OrderBy`, `GroupBy`, `Distinct`, and `Reverse` are still deferred (they run nothing until iterated), but once they do run, they must pull in the *whole* source before yielding even the first result — sorting needs to see everything before it knows what comes first. So they defer, but they do not stream one element at a time.
+
+## The trap: walking a query twice does the work twice
+
+Because a query is a recipe that re-runs every time it is iterated, using it more than once **repeats all the work**.
+
+```csharp
+var query = numbers.Where(Expensive);   // deferred — nothing has run
+
+int count = query.Count();   // enumeration #1 — runs Expensive over everything
+int first = query.First();   // enumeration #2 — runs Expensive over it AGAIN
+```
+
+Each of `Count()` and `First()` walks the query from the start, so `Expensive` runs twice across the whole sequence. With a costly filter this is a silent performance bug; with a source that can only be read once — a file, a network stream, a database reader — the second pass may return different results or fail outright.
+
+A `foreach` twice has the same effect: two full runs of the pipeline.
+
+## A deferred query is a live view
+
+Since the query re-reads its source each time it runs, changes to the source **between** enumerations show up. A deferred query is a live view of the data, not a snapshot.
+
+```csharp
+var list = new List<int> { 1, 2, 3 };
+var query = list.Where(n => n > 1);
+
+Console.WriteLine(query.Count());   // 2  (2 and 3)
+
+list.Add(4);
+Console.WriteLine(query.Count());   // 3  (2, 3, and 4) — the query re-ran and saw the new item
+```
+
+Sometimes this live behaviour is exactly what is wanted; often it is a surprise. Either way, it is a direct consequence of "the recipe runs again each time."
+
+## The captured-variable surprise
+
+Deferred execution also means a query reads its captured variables **when it runs**, not when it is written. A variable changed after the query is built affects the query.
+
+```csharp
+int threshold = 5;
+var query = numbers.Where(n => n > threshold);   // captures the variable threshold
+
+threshold = 100;                                 // changed BEFORE the query runs
+
+foreach (var n in query)                         // the filter now uses 100, not 5
+    Console.WriteLine(n);                         // prints nothing (nothing exceeds 100)
+```
+
+The lambda closed over the *variable* `threshold`, not the value `5`. When the `foreach` finally executes the lambda, it reads `threshold`'s current value — `100`. This trips people who expect the query to "remember" the value at the moment it was written.
+
+## The cure: materialize with ToList or ToArray
+
+When a query needs to be read more than once, or its result should be a fixed snapshot, run it once and keep the result. `ToList()` (or `ToArray()`) does exactly that — it forces the pipeline to run one time and stores the output in a real collection:
+
+```csharp
+List<int> results = numbers.Where(Expensive).ToList();   // run the pipeline ONCE
+
+int count = results.Count;   // O(1), no re-run
+int first = results[0];      // no re-run
+// results is a plain List — indexing, counting, re-reading are all free now
+```
+
+After `ToList()`, `results` is finished data, not a recipe. Reading it is cheap and repeatable, the captured-variable and live-view surprises are gone (the values are frozen), and a one-shot source is safely consumed a single time.
+
+## Why laziness is worth it
+
+Deferred execution is not just a hazard to manage — it is why LINQ is efficient and expressive:
+
+- **Short-circuiting.** Operators like `First`, `Take`, and `Any` stop as soon as they have their answer, so the pipeline never processes more than it must:
+
+```csharp
+bool anyBig = numbers.Where(Expensive).Any(n => n > 100);
+// Any stops at the first match — Expensive is not run over the whole sequence
+```
+
+- **No intermediate collections.** Elements stream through the chain one at a time, so a ten-operator query still allocates no in-between lists.
+- **Infinite and huge sources.** Because values are pulled on demand, an endless sequence works fine when capped:
+
+```csharp
+var firstThree = Naturals().Where(n => n % 7 == 0).Take(3).ToList();   // 7, 14, 21
+```
+
+- **Composability.** Queries can be built up in pieces and combined, since building adds to the recipe without running it.
+
+## Practical rules
+
+- **Materialize before reading twice.** If a query will be enumerated more than once — or counted and then read — call `.ToList()`/`.ToArray()` first.
+- **Mind one-shot and expensive sources.** For a database reader, a network stream, or a costly filter, assume every enumeration is a full, real run.
+- **Let return types signal intent.** Returning `IEnumerable<T>` hands the caller a possibly-lazy recipe (and the multiple-enumeration hazard); returning `IReadOnlyList<T>` signals "already materialized, safe to re-read."
+- **Heed the analyzer.** "Possible multiple enumeration of IEnumerable" is the exact warning for this trap — it is pointing at a query that should probably be materialized.
+
+## The one idea to hold onto
+
+> A LINQ query is a **recipe**, not results. It runs only when walked, streams **one element through the whole chain** at a time, and **re-runs every time** it is iterated — reflecting current source and variable values. That is the source of its efficiency and of the multiple-enumeration trap. When results must be reused or frozen, `ToList()` cooks the recipe once.
+
+## What comes next
+
+The first four parts covered `IEnumerable<T>` and the mechanics that make it special — cursors, `yield`, and deferred execution. **Part 5** widens the view to the whole **collection interface family**: `ICollection`, `IList`, `ISet`, the read-only twins, and `IDictionary`. Instead of memorising the hierarchy, it uses a capabilities model — ask what the code needs to do, and let the answer pick the interface — which is the map for the concrete data structures that fill the rest of the series.

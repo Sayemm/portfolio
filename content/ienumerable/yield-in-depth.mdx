@@ -1,0 +1,314 @@
+---
+title: "yield return in depth: the method that pauses"
+date: 2026-09-02
+status: written
+minutes: 16
+order: 3
+lead: 'yield return confuses people because a method that uses it does not behave like a normal method — it pauses, hands back one value, and resumes where it left off, and none of it runs until something iterates. This part takes yield apart completely: the pausing model, a line-by-line trace, the state machine the compiler builds, and the gotchas that make experts split their methods in two.'
+---
+
+Part 2 built a cursor by hand — `CountdownCursor`, with its `_current` and `_started` fields tracking the position. It worked, but it was a lot of boilerplate for a countdown. `yield return` is the language feature that writes all of that boilerplate automatically. The catch is that a method using `yield` behaves unlike any normal method, and that is where the confusion comes from. This part removes the confusion by tracing exactly what happens.
+
+## The one mental shift: a method that pauses
+
+A normal method runs top to bottom and returns **once**. A method with `yield return` in it is different: it runs partway, **pauses** at a `yield return`, hands back one value, and — the next time it is asked — **resumes from exactly where it paused**, with all its local variables still intact.
+
+That is the whole idea. `yield return` does not mean "return." It means "hand back this one value and freeze here; continue from this spot next time."
+
+A method that contains `yield` is called an **iterator method**, and its return type must be one of `IEnumerable<T>`, `IEnumerator<T>`, or their non-generic versions. It produces a sequence — one value per `yield return`.
+
+## Nothing runs until you iterate
+
+This is the number-one source of confusion, so it comes first: **calling an iterator method runs none of its body.** Not a single line. The body only starts running when something iterates the result — a `foreach`, or a manual `MoveNext()`.
+
+```csharp
+IEnumerable<int> Numbers()
+{
+    Console.WriteLine("start");   // this does NOT run when Numbers() is called
+    yield return 1;
+    yield return 2;
+}
+
+var seq = Numbers();              // prints nothing — the body has not run yet
+Console.WriteLine("got the sequence");
+
+foreach (var n in seq)            // NOW the body starts running
+    Console.WriteLine(n);
+```
+
+The output proves it — "got the sequence" prints *before* "start":
+
+```text
+got the sequence
+start
+1
+2
+```
+
+Calling `Numbers()` just builds and hands back an object (the generated cursor from Part 2, made automatically). The code inside only runs when that object is walked.
+
+<Diagram title="Each MoveNext runs the method to the next yield, then pauses">
+  <DiagramRow>
+    <DiagramNode title="MoveNext()" sub="from foreach" />
+    <DiagramArrow label="runs until" />
+    <DiagramNode title="yield return x" sub="hand out x, freeze" />
+    <DiagramArrow label="x becomes" />
+    <DiagramNode title="Current" sub="read by the loop" />
+  </DiagramRow>
+</Diagram>
+
+## A full trace, line by line
+
+The clearest way to internalise the pausing is to interleave the method body with the loop body and watch the order. Consider:
+
+```csharp
+IEnumerable<int> Numbers()
+{
+    Console.WriteLine("A: start");
+    yield return 1;
+    Console.WriteLine("B: after first yield");
+    yield return 2;
+    Console.WriteLine("C: after second yield");
+}
+
+foreach (var n in Numbers())
+    Console.WriteLine($"loop got {n}");
+```
+
+Here is what happens on each step, in order:
+
+```text
+foreach asks for a cursor        -> nothing runs yet
+MoveNext() #1
+  runs "A: start"
+  hits yield return 1  -> Current = 1, method FREEZES here
+  loop body runs       -> "loop got 1"
+MoveNext() #2
+  RESUMES after yield 1
+  runs "B: after first yield"
+  hits yield return 2  -> Current = 2, method FREEZES here
+  loop body runs       -> "loop got 2"
+MoveNext() #3
+  RESUMES after yield 2
+  runs "C: after second yield"
+  method ends          -> MoveNext returns false, loop stops
+```
+
+So the actual output is interleaved, not "all the method, then all the loop":
+
+```text
+A: start
+loop got 1
+B: after first yield
+loop got 2
+C: after second yield
+```
+
+Read that until it feels obvious. The method and the loop take turns: the method runs up to a `yield return`, the loop processes that value, then control goes *back into the method* where it paused. That back-and-forth is the heart of `yield`.
+
+## Locals survive the pause
+
+Because the method resumes where it left off, its **local variables keep their values** across every pause. This is what makes an iterator a state machine — the locals *are* the state.
+
+```csharp
+IEnumerable<int> RunningTotal(IEnumerable<int> numbers)
+{
+    int total = 0;                 // survives across every yield
+    foreach (var n in numbers)
+    {
+        total += n;
+        yield return total;        // pause here; total is remembered next time
+    }
+}
+
+foreach (var t in RunningTotal(new[] { 10, 20, 30 }))
+    Console.WriteLine(t);          // 10, 30, 60
+```
+
+`total` is not reset between values. After yielding `10`, the method freezes with `total == 10`; the next `MoveNext()` resumes with that same `total` and adds the next number. The local variable persists through the pause, which is exactly what a hand-written cursor's fields did in Part 2.
+
+## yield break: stopping early
+
+Alongside `yield return` there is `yield break`, which ends the sequence immediately — the iterator's equivalent of `return`. Everything after it is skipped, and the enumeration is over.
+
+```csharp
+IEnumerable<int> UpToFirstNegative(IEnumerable<int> numbers)
+{
+    foreach (var n in numbers)
+    {
+        if (n < 0)
+            yield break;           // stop the whole sequence right here
+        yield return n;
+    }
+}
+
+foreach (var n in UpToFirstNegative(new[] { 3, 7, -1, 9 }))
+    Console.WriteLine(n);          // 3, 7  (stops at -1, never reaches 9)
+```
+
+`yield break` makes `MoveNext()` return `false`, so the consuming `foreach` ends.
+
+## What the compiler actually builds
+
+Now the payoff for Part 2. When the compiler sees `yield`, it generates a class that implements the cursor — a class shaped almost exactly like the hand-written `CountdownCursor`, with a `_state` field marking where execution paused. This iterator method:
+
+```csharp
+IEnumerable<int> Numbers()
+{
+    yield return 1;
+    yield return 2;
+}
+```
+
+becomes, conceptually, a cursor like this:
+
+```csharp
+class NumbersIterator : IEnumerator<int>
+{
+    private int _state = 0;                 // where execution is paused
+    public int Current { get; private set; }
+
+    public bool MoveNext()
+    {
+        switch (_state)
+        {
+            case 0:
+                Current = 1;
+                _state = 1;
+                return true;                // paused right after "yield return 1"
+            case 1:
+                Current = 2;
+                _state = 2;
+                return true;                // paused right after "yield return 2"
+            default:
+                return false;               // no more items
+        }
+    }
+    // Current (non-generic), Reset, Dispose omitted
+}
+```
+
+The `_state` field is the "resume point." Every `yield return` becomes a case that sets `Current`, records the new state, and returns `true`; running off the end returns `false`. Local variables become fields on this class so they survive between calls. This is the same machinery from Part 2 — `yield` just writes it automatically, correctly, every time.
+
+> **The key realisation:** `yield` is not a special kind of loop or a magic keyword with hidden behaviour. It is shorthand. The compiler turns the method into the exact `IEnumerator<T>` state machine that could have been written by hand — pausing is just "save the state and return," resuming is just "jump back to the saved state." Understanding the hand-written cursor from Part 2 *is* understanding `yield`.
+
+## Each enumeration starts over
+
+Because each `foreach` asks for a fresh cursor (Part 2), an iterator method's body **runs again from the top for every enumeration**. Iterating twice runs the code twice — including any side effects.
+
+```csharp
+IEnumerable<int> Noisy()
+{
+    Console.WriteLine("running the body");
+    yield return 1;
+    yield return 2;
+}
+
+var seq = Noisy();
+foreach (var n in seq) { }   // prints "running the body"
+foreach (var n in seq) { }   // prints "running the body" AGAIN — fresh run
+```
+
+This is a feature (each pass is independent and current) and a trap (repeated work, repeated side effects). Part 4 is entirely about the consequences.
+
+## Real examples
+
+A few patterns show why `yield` is worth mastering.
+
+**Filtering — this is essentially how LINQ's `Where` is written:**
+
+```csharp
+IEnumerable<T> MyWhere<T>(IEnumerable<T> source, Func<T, bool> predicate)
+{
+    foreach (var item in source)
+        if (predicate(item))
+            yield return item;     // pass through only the ones that match
+}
+```
+
+**An infinite sequence — legal, because values are pulled one at a time:**
+
+```csharp
+IEnumerable<int> Naturals()
+{
+    int i = 1;
+    while (true)                    // never ends on its own...
+        yield return i++;
+}
+
+var first5 = Naturals().Take(5).ToList();   // ...but Take stops asking after 5: 1,2,3,4,5
+```
+
+The `while (true)` does not hang, because nothing runs ahead of demand. `Take(5)` calls `MoveNext()` five times and then stops, so the loop only ever executes five times.
+
+**Streaming a file line by line — low memory, and the file is closed automatically:**
+
+```csharp
+IEnumerable<string> ReadLines(string path)
+{
+    using var reader = new StreamReader(path);   // opened when iteration starts
+    string? line;
+    while ((line = reader.ReadLine()) != null)
+        yield return line;                       // one line per step, nothing buffered
+}                                                // reader disposed when iteration ends
+```
+
+This ties back to Part 2's disposal: the generated cursor implements `IDisposable`, and when the `foreach` finishes (or breaks), it disposes the cursor, which runs the `using`'s cleanup and closes the file. A whole file is streamed while only one line is ever held in memory.
+
+## The expert gotcha: validation runs too late
+
+Here is the trap that separates a beginner's iterator from a robust one. Because the *entire* body is deferred, argument checks inside an iterator method do not run when the method is called — they run when iteration starts, which can be much later and far from the call site.
+
+```csharp
+// BUG: the null check is deferred along with everything else
+public IEnumerable<int> Positives(IEnumerable<int> source)
+{
+    if (source is null)
+        throw new ArgumentNullException(nameof(source));   // does NOT throw at call time
+
+    foreach (var n in source)
+        if (n > 0)
+            yield return n;
+}
+
+var result = Positives(null);   // no exception here — surprising!
+foreach (var n in result) { }   // the exception finally fires HERE
+```
+
+The fix is the pattern LINQ itself uses: split the method in two. A normal (non-iterator) outer method validates immediately and returns a private iterator method, which is the only part that is deferred:
+
+```csharp
+public IEnumerable<int> Positives(IEnumerable<int> source)
+{
+    if (source is null)
+        throw new ArgumentNullException(nameof(source));   // runs NOW, at call time
+
+    return Iterator(source);   // the deferred part
+
+    static IEnumerable<int> Iterator(IEnumerable<int> src)
+    {
+        foreach (var n in src)
+            if (n > 0)
+                yield return n;
+    }
+}
+```
+
+The outer method has no `yield`, so it is a normal method that runs immediately and validates. It then hands back the iterator for the lazy part. This is the standard way to write a public iterator that validates its arguments eagerly.
+
+## Where yield is not allowed
+
+A few restrictions are worth knowing so the compiler errors make sense:
+
+- The method's **return type** must be `IEnumerable`, `IEnumerable<T>`, `IEnumerator`, or `IEnumerator<T>`.
+- `yield return` **cannot appear inside a `try` block that has a `catch`**, and cannot appear in a `catch` or `finally` block. It *is* allowed in a `try` that has only a `finally` (which is how the file-reading example works).
+- It cannot be used in **lambdas or anonymous methods** — though a **local function** can be an iterator.
+- The method cannot have **`ref`, `in`, or `out` parameters**, and `yield` cannot be used in an **unsafe** context.
+
+## The one idea to hold onto
+
+> A `yield` method is a **pausable** method. Calling it runs nothing; each `MoveNext()` runs it forward to the next `yield return`, hands back that value, and freezes with all locals intact until the next call. The compiler turns it into exactly the `IEnumerator<T>` state machine from Part 2 — `yield` is that boilerplate, written for you.
+
+## What comes next
+
+**Part 4** takes the "nothing runs until you iterate" and "each enumeration starts over" facts and follows them across LINQ, where they become **deferred execution** — the reason a LINQ query does no work until it is walked, why chaining `Where().Select()` builds a pipeline that runs per element, and the multiple-enumeration trap that catches everyone, along with `ToList()` as the cure.

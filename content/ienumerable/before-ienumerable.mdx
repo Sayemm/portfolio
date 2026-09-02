@@ -1,0 +1,254 @@
+---
+title: "Before IEnumerable: interfaces, objects, and how iteration really works"
+date: 2026-09-01
+status: written
+minutes: 12
+order: 1
+lead: 'IEnumerable makes no sense until two more basic ideas click: what an interface really is, and the difference between the type a variable is declared as and the object it actually holds. This first part builds both from zero, then turns them into the cursor idea that foreach and LINQ run on.'
+---
+
+This is the first part of a from-scratch series on `IEnumerable<T>`. It deliberately spends most of its time *before* `IEnumerable` — on interfaces and objects — because that is where the real confusion lives. Once those click, `IEnumerable` stops being mysterious and becomes an ordinary example of ideas already understood. Every step has code to run.
+
+## Step 1: a class is a blueprint, an object is the thing made from it
+
+```csharp
+class Dog
+{
+    public string Name;
+}
+
+Dog d = new Dog();   // new Dog() builds a real object; d points at it
+d.Name = "Rex";
+```
+
+`Dog` is the blueprint. `d` is a real object living in memory. Objects hold data and can have behaviour (methods). Nothing surprising yet — this step just fixes the words *class* and *object*, because the rest depends on telling them apart.
+
+## Step 2: an interface is a promise, with no behaviour inside it
+
+An interface is a list of method names **with no bodies**. It promises that any type implementing it will have those methods — but it does nothing itself.
+
+```csharp
+interface IAnimal
+{
+    string Speak();   // no body, no code — just the promise
+}
+```
+
+Think of it as a **job description**: "must be able to make coffee." The job description does not make coffee. It only says whoever takes the job must be able to.
+
+> **This is the exact thing that confuses people about `IEnumerable`.** The worry "but the interface has no implementation" is not a problem to solve — it is what every interface is. An interface never has code inside it. The code always lives somewhere else, which is the next step.
+
+## Step 3: a class implements an interface by filling in the bodies
+
+The real work is written in classes that promise to fulfil the interface:
+
+```csharp
+class Dog : IAnimal
+{
+    public string Name = "Rex";        // Dog's own member — not part of IAnimal
+    public string Speak() => "Woof";   // Dog's real implementation
+}
+
+class Cat : IAnimal
+{
+    public string Speak() => "Meow";   // Cat's real implementation
+}
+```
+
+`Dog : IAnimal` reads as "Dog promises to be an `IAnimal`, and here is how." The body of `Speak()` lives in `Dog` and in `Cat` — never in `IAnimal`.
+
+## Step 4: the unlock — an interface-typed variable holds a real object
+
+This is the most important step in the whole article. A variable can be **declared as the interface**, while the **object it points at is always a concrete class**:
+
+```csharp
+IAnimal a = new Dog();          // type is IAnimal, object is a Dog
+Console.WriteLine(a.Speak());   // "Woof" — the Dog's version runs
+
+a = new Cat();                  // same variable, now points at a Cat
+Console.WriteLine(a.Speak());   // "Meow" — the Cat's version runs
+```
+
+Two different things are in play, and keeping them apart is the key to everything later:
+
+| | Declared type | Actual object |
+|---|---|---|
+| What it is | the promise | the worker |
+| Example | `IAnimal a` | `new Dog()` |
+| Has the real code? | no | yes |
+| Can it be created with `new`? | no | yes |
+
+<Diagram title="The type is a promise; the object does the work">
+  <DiagramRow>
+    <DiagramNode title="IAnimal a" sub="declared type: the promise" />
+    <DiagramArrow label="points at" />
+    <DiagramNode title="new Dog()" sub="real object: the code" />
+  </DiagramRow>
+</Diagram>
+
+Calling `a.Speak()` runs **the actual object's** version. The interface never needed a body, because there is always a concrete object behind the variable supplying the real code. And there is *always* one — `new IAnimal()` is illegal; an interface cannot be created on its own. There is always a `Dog` or a `Cat` there.
+
+> **Sit with this one.** "A variable typed as an interface always points at a real object that has the code" is the entire answer to "how can `IEnumerable` be iterated if it has no implementation." The rest of the article is this same idea wearing collection names.
+
+### The flip side: the type limits what the code can reach
+
+The declared type does more than pick *which* version of a shared method runs — it also decides *what is visible at all*. Through an `IAnimal` reference, only the things `IAnimal` promises can be touched. Anything extra the concrete class happens to have is invisible, even though it is really there:
+
+```csharp
+IAnimal a = new Dog();
+
+Console.WriteLine(a.Speak());   // works — Speak is promised by IAnimal
+Console.WriteLine(a.Name);      // COMPILE ERROR — IAnimal makes no promise about Name
+```
+
+The object genuinely is a `Dog`, and `Name` genuinely exists in memory — but the *reference* is typed `IAnimal`, so the compiler allows only what `IAnimal` guarantees. To reach `Name`, the variable has to be typed as `Dog`, or cast back to it:
+
+```csharp
+Dog d = new Dog();
+Console.WriteLine(d.Name);          // works — d is typed as Dog
+
+IAnimal a = new Dog();
+Console.WriteLine(((Dog)a).Name);   // works — cast back to Dog first
+```
+
+> **This is exactly how `IEnumerable` behaves.** When a method returns `IEnumerable<T>`, the caller can only do `IEnumerable<T>` things with it — walk it, run LINQ on it. Even if the real object behind it is a `List<T>` with `Add`, `Count`, and an indexer, none of those are reachable through the `IEnumerable<T>` reference. The narrow type is a deliberate limit that says "treat this as a sequence, nothing more" — not a bug to work around.
+
+## Step 5: the goal — walk any collection the same way
+
+Now the actual problem. There are many kinds of "bag of items" — a `List`, an array, a `HashSet` — and each stores its contents completely differently inside. The goal is **one** way to go through any of them, so that `foreach` and LINQ can work on all of them without caring which is which.
+
+The trick every collection agrees to: hand out a **cursor** — a small thing that points at one item and can step forward. Like the numbered ticket at a deli counter: it marks the current position, and it can advance to the next.
+
+## Step 6: two interfaces — the cursor, and the thing that gives one
+
+The cursor is `IEnumerator<T>`. Its promise is "I can step forward and tell the current item":
+
+```csharp
+interface IEnumerator<T>
+{
+    bool MoveNext();    // step to the next item; false when none are left
+    T Current { get; }  // the item the cursor is sitting on right now
+}
+```
+
+The collection is `IEnumerable<T>`. Its one promise is "I can give you a cursor":
+
+```csharp
+interface IEnumerable<T>
+{
+    IEnumerator<T> GetEnumerator();   // here is a fresh cursor over my items
+}
+```
+
+Line these up against Step 4 and they are the same shape:
+
+| Interface | Its promise | Key members |
+|---|---|---|
+| `IEnumerable<T>` | "I can give you a cursor" | `GetEnumerator()` |
+| `IEnumerator<T>` | "I am the cursor" | `MoveNext()`, `Current` |
+
+`IEnumerable<T>` is just like `IAnimal`, and `GetEnumerator()` is just like `Speak()` — a promise with no body. The bodies live in the real collections.
+
+## Step 7: foreach is just using the cursor
+
+`foreach` is not magic. This loop:
+
+```csharp
+foreach (var item in things)
+    Console.WriteLine(item);
+```
+
+is exactly this underneath:
+
+```csharp
+var cursor = things.GetEnumerator();    // ask for a cursor
+while (cursor.MoveNext())               // step forward until none are left
+    Console.WriteLine(cursor.Current);  // read the item at the cursor
+```
+
+So `foreach` needs only one thing from `things`: a working `GetEnumerator()`. That is the whole reason anything implementing `IEnumerable<T>` can be used in a `foreach`.
+
+<Diagram title="foreach only needs a cursor">
+  <DiagramRow>
+    <DiagramNode title="foreach" sub="the loop" />
+    <DiagramArrow label="GetEnumerator" />
+    <DiagramNode title="cursor" sub="MoveNext + Current" />
+    <DiagramArrow label="walks" />
+    <DiagramNode title="items" sub="one at a time" />
+  </DiagramRow>
+</Diagram>
+
+## Step 8: who writes the real GetEnumerator? the concrete collection
+
+Exactly as `Dog` and `Cat` wrote the real `Speak()`, each concrete collection writes the real `GetEnumerator()`. `List<T>` implements it to walk its internal array; `HashSet<T>` implements it to walk its hash buckets; and so on.
+
+```csharp
+IEnumerable<int> e = new List<int> { 1, 2, 3 };  // type: IEnumerable, object: a List
+foreach (var x in e)
+    Console.WriteLine(x);   // runs List's GetEnumerator — the REAL implementation
+```
+
+The interface is empty; the `List` object behind it is not. This is the `Dog` behind the `IAnimal`, one more time.
+
+## Step 9: so how does a LINQ result iterate?
+
+Now the question that started this series answers itself. When `Where` "returns an `IEnumerable<T>`," it does **not** return the empty interface. It returns a **real object** whose *declared type* happens to be `IEnumerable<T>`:
+
+```csharp
+var numbers = new[] { 1, 2, 3, 4, 5 };
+
+IEnumerable<int> q = numbers.Where(x => x > 2);
+
+Console.WriteLine(q.GetType().Name);   // NOT "IEnumerable" — a real class, e.g. "WhereArrayIterator`1"
+```
+
+That real object is a small class (the compiler generates it from the `yield return` inside `Where`) that **has** a genuine `GetEnumerator`, `MoveNext`, and `Current`. Running `foreach` over `q` runs *that object's* implementation — never the interface's, because interfaces have none.
+
+<Diagram title="LINQ returns a real object, typed as the interface">
+  <DiagramRow>
+    <DiagramNode title="Where(...)" sub="returns" />
+    <DiagramArrow label="typed IEnumerable" />
+    <DiagramNode title="iterator object" sub="has real GetEnumerator" />
+  </DiagramRow>
+</Diagram>
+
+Same rule as the `Dog` behind the `IAnimal`: the type is the promise, the object does the work. There is no such thing as iterating "the interface" — always some concrete object's cursor is doing the walking.
+
+## Try it: a collection of your own
+
+The best way to make this concrete is to write a type that implements `IEnumerable<T>` and watch `foreach` accept it. This tiny class counts down, and it is fully runnable:
+
+```csharp
+using System.Collections;
+using System.Collections.Generic;
+
+class Countdown : IEnumerable<int>
+{
+    private readonly int _from;
+    public Countdown(int from) => _from = from;
+
+    // the real implementation of the promise:
+    public IEnumerator<int> GetEnumerator()
+    {
+        for (int i = _from; i >= 1; i--)
+            yield return i;   // hand out each number, one at a time
+    }
+
+    // the older non-generic version, required because IEnumerable<T> extends IEnumerable:
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+// use it exactly like any built-in collection:
+foreach (var n in new Countdown(3))
+    Console.WriteLine(n);   // 3, 2, 1
+```
+
+`Countdown` is now a real object that keeps the `IEnumerable<int>` promise, so `foreach` works on it — because `foreach` only ever needed a `GetEnumerator()`. The `yield return` writes the cursor for us; the second `GetEnumerator` is boilerplate required because `IEnumerable<T>` is built on the older non-generic `IEnumerable`. Both details get their own part later; for now the point is that a hand-written type slots straight into `foreach`.
+
+## The one sentence to hold onto
+
+> An interface is a promise with no code. A variable typed as an interface always points at a real object that *does* have the code. So "iterating an `IEnumerable`" always means running some concrete object's `GetEnumerator` — whether that object is a `List` written by the framework, a `Countdown` written by hand, or an iterator written by the compiler for a LINQ query.
+
+## What comes next
+
+**Part 2** goes one level deeper into the cursor itself — `IEnumerator<T>`, the `MoveNext`/`Current` dance, what "the cursor starts before the first item" means, and how `foreach` cleans the cursor up afterward. From there the series moves on to `yield return` in full, deferred execution and the one trap it sets, and finally the wider family of collection interfaces. Everything builds on the single idea from Step 4: the type is the promise, the object does the work.

@@ -1,0 +1,216 @@
+---
+title: "The cursor in detail: how IEnumerator actually walks a collection"
+date: 2026-09-01
+status: written
+minutes: 13
+order: 2
+lead: 'Part 1 said a collection hands out a cursor. This part opens the cursor up: what IEnumerator is, why it starts before the first item, how MoveNext and Current step through, why foreach disposes it, and how to build one by hand — the small state machine that yield will later write automatically.'
+---
+
+Part 1 established the big idea: `IEnumerable<T>` promises a cursor through `GetEnumerator()`, and the cursor is a separate thing called `IEnumerator<T>`. This part is entirely about that cursor — because understanding it turns `foreach`, re-enumeration, and later `yield` from magic into mechanics. Every step has runnable code.
+
+## The cursor, fully
+
+`IEnumerator<T>` is the object that actually does the walking. Simplified, it is this:
+
+```csharp
+public interface IEnumerator<T> : IDisposable
+{
+    bool MoveNext();     // advance to the next item; false when there are none left
+    T Current { get; }   // the item at the current position
+    void Reset();        // (rarely used) go back to before the start
+}
+```
+
+Four members, but really only two matter day to day:
+
+| Member | What it does |
+|---|---|
+| `MoveNext()` | step the cursor forward; returns `false` when the end is passed |
+| `Current` | the item the cursor is sitting on right now |
+| `Dispose()` | release anything the cursor is holding (a file, a connection) |
+| `Reset()` | in theory, go back before the start — but most cursors do not really support it |
+
+`MoveNext()` and `Current` are the whole engine. Everything a `foreach` does is built from those two.
+
+## The rule that trips everyone: the cursor starts *before* the first item
+
+This is the single most confusing thing about enumerators, so it comes first. A brand-new cursor is **not** sitting on the first item. It is positioned *before* the start, on nothing. `Current` is meaningless until `MoveNext()` has been called at least once.
+
+The reason is that this design makes the loop clean: every step is "advance, then read," and the very first step advances onto the first item. Walking a list of `10, 20, 30`, the states look like this:
+
+```text
+new GetEnumerator()   position: before the start   Current: (not valid yet)
+MoveNext() -> true    position: on 10              Current: 10
+MoveNext() -> true    position: on 20              Current: 20
+MoveNext() -> true    position: on 30              Current: 30
+MoveNext() -> false   position: past the end       Current: (not valid)
+```
+
+`MoveNext()` returns `true` while it successfully lands on an item and `false` the moment it steps off the end. That single boolean is what a loop uses to know when to stop.
+
+> **Never read `Current` before the first `MoveNext()`.** A fresh cursor points at nothing, so `Current` is undefined — it may be a default value or garbage, and relying on it is a bug. The correct shape is always "MoveNext first, then read Current," which is exactly what the loop below does.
+
+## Walking a cursor by hand
+
+`foreach` normally hides all of this, but the cursor can be driven directly. This does exactly what a `foreach` does, spelled out:
+
+```csharp
+var list = new List<int> { 10, 20, 30 };
+
+IEnumerator<int> cursor = list.GetEnumerator();   // fresh cursor, before the start
+
+while (cursor.MoveNext())                          // advance; stop when it returns false
+    Console.WriteLine(cursor.Current);             // read the item it landed on
+
+cursor.Dispose();                                  // release the cursor
+
+// prints 10, 20, 30
+```
+
+Read it against the state table above and every line lines up: `GetEnumerator` gives a cursor before the start, each `MoveNext()` advances it, `Current` reads where it is, and the loop ends when `MoveNext()` finally returns `false`.
+
+## foreach, the complete version
+
+Part 1 showed a simplified desugaring. Here is the real one, which adds the cleanup: the cursor is wrapped in a `try/finally` so it is always disposed, even if the loop body throws or breaks early.
+
+```csharp
+foreach (var x in list)
+    Handle(x);
+
+// actually compiles to roughly:
+IEnumerator<int> cursor = list.GetEnumerator();
+try
+{
+    while (cursor.MoveNext())
+        Handle(cursor.Current);
+}
+finally
+{
+    cursor.Dispose();   // runs no matter how the loop is left
+}
+```
+
+That `finally` is why `foreach` is safe: whatever happens inside the loop, the cursor is cleaned up on the way out. Driving the cursor by hand (as in the previous section) misses that guarantee unless the `try/finally` is written too — which is one reason `foreach` is preferred over manual walking.
+
+## Why does a cursor need Dispose?
+
+A cursor over a plain `List<T>` has nothing to release, so its `Dispose()` does nothing. But some cursors hold real resources. Imagine a cursor that reads lines from a file one at a time: it keeps the file open while walking, and must close it when done. Because *any* cursor might be like that, `IEnumerator<T>` implements `IDisposable`, and `foreach` always calls `Dispose()` in its `finally`. For a lazy, file-backed, or network-backed sequence, that automatic disposal is what closes the underlying resource at the end of the loop.
+
+## Every GetEnumerator call is a fresh, independent cursor
+
+A crucial and reassuring fact: each call to `GetEnumerator()` returns a **new** cursor with its **own** position. Two cursors over the same collection do not interfere.
+
+<Diagram title="A cursor holds its own position over the collection">
+  <DiagramRow>
+    <DiagramNode title="collection" sub="the items" />
+    <DiagramArrow label="GetEnumerator" />
+    <DiagramNode title="cursor" sub="position + Current" />
+  </DiagramRow>
+</Diagram>
+
+```csharp
+var list = new List<int> { 1, 2, 3 };
+
+var a = list.GetEnumerator();   // cursor A
+var b = list.GetEnumerator();   // cursor B, completely separate
+
+a.MoveNext();   // A is on 1
+a.MoveNext();   // A is on 2
+b.MoveNext();   // B is on 1 — A's movement did not affect it
+```
+
+This is also why a collection can be looped more than once. Each `foreach` asks for a fresh cursor that starts from the beginning:
+
+```csharp
+foreach (var x in list) { /* first pass: a new cursor, start to end */ }
+foreach (var x in list) { /* second pass: another new cursor, start to end again */ }
+```
+
+The collection itself never "runs out" — only a single cursor reaches the end. (In Part 4, this becomes important: a *lazy* sequence re-runs its work on every fresh cursor, which is a feature and a trap.)
+
+## Reset: the member to ignore
+
+`Reset()` is supposed to move a cursor back before the start so it can be walked again. In practice most enumerators either do not implement it meaningfully or throw. The idiomatic way to "start over" is not `Reset()` — it is to call `GetEnumerator()` again for a fresh cursor. `Reset()` exists mostly for old COM compatibility and can be treated as "not there."
+
+## Build a cursor by hand
+
+The best way to see that a cursor is just a small **state machine** is to write one. This is the `Countdown` from Part 1, but with the cursor written out explicitly instead of using `yield`. The fields *are* the state: `_current` is the position, `_started` remembers whether the first move has happened.
+
+```csharp
+using System.Collections;
+using System.Collections.Generic;
+
+class Countdown : IEnumerable<int>
+{
+    private readonly int _from;
+    public Countdown(int from) => _from = from;
+
+    public IEnumerator<int> GetEnumerator() => new CountdownCursor(_from);
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+class CountdownCursor : IEnumerator<int>
+{
+    private readonly int _from;
+    private int _current;
+    private bool _started;
+
+    public CountdownCursor(int from)
+    {
+        _from = from;
+        _current = 0;
+        _started = false;    // cursor begins BEFORE the first item
+    }
+
+    public int Current => _current;          // the item at the current position
+    object IEnumerator.Current => Current;    // the non-generic version, required
+
+    public bool MoveNext()
+    {
+        if (!_started)
+        {
+            _current = _from;    // first MoveNext lands on the first item
+            _started = true;
+            return _from >= 1;
+        }
+
+        _current--;              // every later MoveNext steps forward (downward)
+        return _current >= 1;    // false once it steps off the end
+    }
+
+    public void Reset() { _started = false; _current = 0; }
+    public void Dispose() { }    // nothing to release here
+}
+
+// use it exactly like any collection:
+foreach (var n in new Countdown(3))
+    Console.WriteLine(n);   // 3, 2, 1
+```
+
+Trace `MoveNext()` and it matches the state table from earlier: it begins before the start, the first call lands on `3`, each later call steps down, and it returns `false` after `1`. Nothing here is magic — a cursor is a position plus a rule for advancing.
+
+## The state-machine idea
+
+That hand-written cursor is worth staring at, because it is the key to the next part. A cursor is fundamentally:
+
+- some **state** that remembers the current position (here, `_current` and `_started`),
+- a **`MoveNext()`** that advances the state and reports whether an item was found,
+- a **`Current`** that reads the item out of the state.
+
+Writing all of that by hand is tedious. In Part 3, `yield return` will let a method be written as if it were a normal loop, and the compiler will generate *exactly this kind of state machine* behind the scenes. Seeing the manual version first is what makes the generated one make sense.
+
+## Gotchas worth remembering
+
+- **`Current` before the first `MoveNext()` is invalid.** Always advance first, then read.
+- **Do not modify a collection while a cursor is walking it.** The built-in cursors detect the change and throw `InvalidOperationException` ("Collection was modified"), rather than silently skipping or repeating items. Collect changes and apply them after the loop, or iterate a copy.
+- **Do not use a cursor after disposing it.** Once `Dispose()` has run (or the `foreach` has ended), the cursor is done.
+- **To restart, get a new cursor** with `GetEnumerator()`, not `Reset()`.
+
+## The one idea to hold onto
+
+> A cursor (`IEnumerator<T>`) is a position over a collection plus two operations: `MoveNext()` to advance and `Current` to read. It starts before the first item, so the pattern is always "advance, then read." `foreach` is just that pattern wrapped in a `try/finally` that disposes the cursor at the end — and every `foreach` gets its own fresh cursor.
+
+## What comes next
+
+**Part 3** is `yield return`. Writing cursors by hand, as `CountdownCursor` shows, is repetitive and easy to get wrong. `yield return` lets a plain method *become* an enumerable — the compiler reads it and generates the state machine, the `MoveNext`, and the `Current` automatically. Having built one cursor by hand here, the generated version will look like an old friend.

@@ -93,6 +93,13 @@ export const topics: Topic[] = [
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
   {
+    id: "ienumerable",
+    name: "IEnumerable",
+    blurb: "Iteration from first principles — foreach, yield, LINQ, laziness.",
+    order: 1.6,
+    chip: { bg: "#fae9ec", fg: "#9b1c3d" },
+  },
+  {
     id: "design-patterns",
     name: "Design Patterns",
     blurb: "The classic patterns, in C# — and when not to reach for them.",

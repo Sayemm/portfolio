@@ -160,6 +160,117 @@ foreach (var badge in clockIns)
 
 `HashSet.Add` returns a `bool` — `true` if the item was new, `false` if already present — so we get *"insert and check-if-new"* in one O(1) operation. Set operations (`UnionWith`, `IntersectWith`, `ExceptWith`) are the other superpower: *"which employees are available Monday **and** trained on register 3?"* is an `IntersectWith` of two sets.
 
+## Everyday operations worth knowing
+
+The sections above are about *how* each collection works. This one is the working API — the handful of operations reached for daily, and the idioms that separate clean code from subtly slow or crash-prone code.
+
+### List&lt;T&gt;
+
+```csharp
+var shifts = new List<Shift>();
+
+shifts.Add(s);                        // append — amortized O(1)
+shifts.AddRange(moreShifts);          // append many at once
+shifts.Insert(0, s);                  // O(n) — everything after shifts right
+shifts[3] = replacement;              // set by index — O(1)
+
+shifts.Remove(s);                     // remove first match by equality — O(n)
+shifts.RemoveAt(3);                   // remove by index — O(n), items shift left
+int cleared = shifts.RemoveAll(x => x.Hours == 0);   // predicate; returns how many went
+
+bool has = shifts.Contains(s);        // O(n)
+int  idx = shifts.IndexOf(s);         // O(n), -1 if absent
+Shift? found = shifts.Find(x => x.Date == today);    // List's own search, default if none
+
+shifts.Sort((a, b) => a.Start.CompareTo(b.Start));   // in-place sort
+int n = shifts.Count;
+```
+
+The trap to keep in mind is the one from the scorecard: everything that **searches or shifts** (`Contains`, `IndexOf`, `Remove`, `Insert`) is O(n). A `List` is for *ordered, append-and-iterate* work — the moment the frequent question becomes "find me the one with this key," that is a signal to reach for a dictionary.
+
+### Dictionary&lt;TKey,TValue&gt;
+
+```csharp
+var byBadge = new Dictionary<int, Employee>();
+
+byBadge.Add(42, alice);               // INSERT — throws if 42 already exists
+byBadge[42] = alice;                  // UPSERT — adds or overwrites, never throws
+bool added = byBadge.TryAdd(42, bob); // insert-if-absent — false if present, no throw
+
+var e = byBadge[99];                  // READ — throws KeyNotFoundException if 99 is missing
+```
+
+That last line is the single most common dictionary bug: the indexer *getter* throws when the key is absent. The fix is the most important dictionary idiom in the language — **`TryGetValue`**:
+
+```csharp
+if (byBadge.TryGetValue(42, out var emp))
+    Use(emp);                         // runs only when the key was found
+else
+    HandleMissing();
+
+var maybe = byBadge.GetValueOrDefault(99);   // returns null/default instead of throwing
+```
+
+`TryGetValue` matters for a second reason beyond safety — **speed**. The naive "check then read" does the work twice:
+
+```csharp
+// anti-pattern: TWO hash lookups for one answer
+if (byBadge.ContainsKey(42)) { var emp = byBadge[42]; Use(emp); }
+
+// idiom: ONE hash lookup, and no exception risk
+if (byBadge.TryGetValue(42, out var emp)) Use(emp);
+```
+
+In a hot path — a scheduling loop touching a dictionary thousands of times — halving the lookups is real. The rest of the daily surface:
+
+```csharp
+bool exists = byBadge.ContainsKey(42);
+byBadge.Remove(42);
+byBadge.Remove(42, out var removed);  // remove AND hand back the value in one call
+
+foreach (var (badge, employee) in byBadge)   // iterate pairs — NO order guarantee
+    Console.WriteLine($"{badge}: {employee.Name}");
+
+byBadge.Keys;    // just the keys
+byBadge.Values;  // just the values
+```
+
+The one thing to remember about iteration: a `Dictionary` gives **no ordering promise**. Code that relies on the order pairs come out is a latent bug — when order matters, sort explicitly or keep a separate `List`.
+
+### HashSet&lt;T&gt;
+
+```csharp
+var trained = new HashSet<int> { 101, 102, 103 };
+
+bool isNew = trained.Add(104);        // true if added, false if already present
+trained.Remove(101);
+bool ok = trained.Contains(102);      // O(1) — the whole point
+```
+
+The superpower is **set algebra**. These *mutate the set on the left*, which reads almost like the business question:
+
+```csharp
+availableMonday.IntersectWith(trainedOnRegister3);  // available AND trained
+everyone.ExceptWith(onLeave);                        // everyone EXCEPT those on leave
+teamA.UnionWith(teamB);                              // combine both teams
+```
+
+And the non-mutating questions that just return a `bool`:
+
+```csharp
+trained.IsSubsetOf(allEmployees);     // is every trained badge a known employee?
+trained.Overlaps(availableMonday);    // is anyone both trained and available?
+trained.SetEquals(expectedRoster);    // same members, order-independent?
+```
+
+<NoteToSelf>
+Use-cases to cash in later:
+- **`Dictionary<int, T>` is the fix for `Repository<T>.GetById`** — swapping the `List` scan (O(n)) for a keyed lookup (O(1)). The trade-off is losing insertion order, which becomes the EF Core / data-access discussion in Week 6.
+- **`TryGetValue` is the shape of cache-aside** — "is it in the cache? if not, load and store it." That exact idiom returns in the Redis series.
+- **`GroupBy` in LINQ builds a dictionary-shaped lookup under the hood** — the natural bridge into Day 5.
+- **`IntersectWith` on availability vs. skills is the seed of shift optimization** — "available Monday ∩ trained on register 3" is literally the coverage query the forecasting/scheduling work is built on.
+</NoteToSelf>
+
 ## Choosing the right collection
 
 Most performance problems are really *wrong-collection* problems. Match the collection to the **question asked most often**:
