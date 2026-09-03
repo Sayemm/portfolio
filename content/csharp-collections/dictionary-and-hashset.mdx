@@ -1,0 +1,211 @@
+---
+title: "Dictionary and HashSet: turning a value into a location"
+date: 2026-09-03
+status: written
+minutes: 16
+order: 7
+lead: 'A List searches by value in O(n) — it scans. HashSet and Dictionary replace the scan with a calculation: a hash code turns a value straight into the place where it lives, so membership and key lookup are roughly O(1). This part explains hashing, buckets, and collisions, and the two methods — GetHashCode and Equals — that make or break it.'
+---
+
+Part 6 ended on a weakness: searching an array or `List<T>` for a value is O(n), a full scan. This part is the fix, and it is the single most important performance idea in everyday collections. `HashSet<T>` and `Dictionary<K,V>` replace the scan with arithmetic: they compute *where* a value belongs and go straight there. Understanding how — and the two methods it depends on — is what makes them safe to use.
+
+## The core idea: turn a value into a location
+
+Hashing means running a value through a function that produces a number — its **hash code** — and using that number to decide where the value is stored. To find something later, its hash code is computed again, pointing straight at the location. No scanning.
+
+<Diagram title="Hashing turns a value straight into a location">
+  <DiagramRow>
+    <DiagramNode title="key" sub="e.g. Sam" />
+    <DiagramArrow label="GetHashCode" />
+    <DiagramNode title="hash code" sub="a number" />
+    <DiagramArrow label="pick a slot" />
+    <DiagramNode title="bucket" sub="go directly there" />
+  </DiagramRow>
+</Diagram>
+
+That is the whole trick: a scan asks "is it this one? this one? this one?" across everything, while a hash computes the answer's address in one step. It is why membership and key lookups are roughly O(1) regardless of how many items there are.
+
+## HashSet: unique values, instant membership
+
+A `HashSet<T>` is a collection of **unique** values with O(1) `Add`, `Remove`, and `Contains`. It hashes each value to place it, so checking membership is a calculation, not a search.
+
+```csharp
+var seen = new HashSet<int>();
+seen.Add(10);
+seen.Add(10);                        // ignored — 10 is already present
+seen.Add(20);
+
+Console.WriteLine(seen.Count);       // 2 — duplicates are not stored
+Console.WriteLine(seen.Contains(10)); // True — O(1), no scan
+```
+
+Use a `HashSet<T>` whenever the question is "have I seen this?" or "is this in the set?" — it turns what would be an O(n) `List.Contains` into O(1).
+
+## Dictionary: hash the key, store the value
+
+A `Dictionary<K,V>` maps keys to values. It hashes the **key** to find the slot, then stores the value there. Lookup, add, and remove *by key* are all O(1) on average.
+
+```csharp
+var ages = new Dictionary<string, int>();
+ages["Sam"] = 30;                     // hash "Sam" -> slot -> store 30
+ages["Ada"] = 41;
+
+Console.WriteLine(ages["Sam"]);       // 30 — O(1) by key
+
+if (ages.TryGetValue("Leo", out int a))   // safe lookup: false if the key is missing
+    Console.WriteLine(a);
+else
+    Console.WriteLine("no Leo");
+```
+
+`TryGetValue` is the safe way to look up — indexing with a missing key (`ages["Leo"]`) throws, while `TryGetValue` just returns `false`.
+
+## Buckets and collisions
+
+Internally, the hash code is mapped onto an array of **buckets**. The value goes into the bucket its hash code points to. But two different values can produce hash codes that point to the *same* bucket — a **collision** — so a bucket may hold more than one item, kept as a small chain:
+
+```text
+buckets (4 of them here):
+
+bucket 0:  (empty)
+bucket 1:  [ "Sam" -> 30 ]
+bucket 2:  [ "Ada" -> 41 ] -> [ "Leo" -> 25 ]   <- collision: two keys share bucket 2
+bucket 3:  [ "Bo"  -> 19 ]
+
+looking up "Leo":
+  1. GetHashCode("Leo") points at bucket 2
+  2. scan the chain in bucket 2, using Equals:
+        "Ada"? no.  "Leo"? yes -> 25
+```
+
+When collisions are rare, each bucket holds one item and lookup is O(1). When a bad hash puts everything in one bucket, lookup degrades to scanning that chain — O(n). Good hashing keeps buckets small, which is why the *quality* of the hash code matters.
+
+## GetHashCode and Equals: the two methods behind it all
+
+Two methods make hashing work, and they work as a pair:
+
+- **`GetHashCode()`** produces the number that picks the bucket.
+- **`Equals()`** confirms the exact item once the bucket is found — because a bucket can hold several items (collisions), the collection still needs to check which one actually matches.
+
+So a lookup is "hash to the bucket (`GetHashCode`), then find the right item in it (`Equals`)." This leads to the one rule that must never be broken:
+
+> **Equal objects must return equal hash codes.** If two values are considered equal by `Equals`, they must produce the same `GetHashCode`. Otherwise they would hash to different buckets, and the collection would look in the wrong place and never realise they are the same — an item added under one would be invisible under the other. `GetHashCode` finds the bucket; `Equals` confirms the match; the two must agree.
+
+## Built-in types just work
+
+For `int`, `string`, `Guid`, `DateTime`, and the other built-in types, `GetHashCode` and `Equals` are already implemented correctly and consistently — equal values hash equally. So `HashSet<string>` and `Dictionary<int, ...>` behave perfectly with no extra work. The trouble starts only with custom types.
+
+## Custom types as keys: the big gotcha
+
+A normal `class` uses **reference equality** by default: two different objects are "equal" only if they are literally the same instance. That is almost never what a key should mean, and it breaks dictionaries silently:
+
+```csharp
+class Point
+{
+    public int X;
+    public int Y;
+    public Point(int x, int y) { X = x; Y = y; }
+}
+
+var map = new Dictionary<Point, string>();
+map[new Point(1, 2)] = "here";
+
+Console.WriteLine(map.ContainsKey(new Point(1, 2)));  // False!
+```
+
+`ContainsKey` returns `False` even though the coordinates match, because the second `Point(1, 2)` is a *different object*, and the default `GetHashCode`/`Equals` are based on object identity, not the X and Y values.
+
+There are two clean fixes. **Override both methods** so equality is based on the fields:
+
+```csharp
+class Point
+{
+    public int X;
+    public int Y;
+    public Point(int x, int y) { X = x; Y = y; }
+
+    public override bool Equals(object? obj) =>
+        obj is Point p && p.X == X && p.Y == Y;
+
+    public override int GetHashCode() => HashCode.Combine(X, Y);  // consistent with Equals
+}
+// now ContainsKey(new Point(1, 2)) returns True
+```
+
+`HashCode.Combine` builds a good hash code from the fields, keeping it consistent with `Equals`. Even simpler, **use a `record`**, which generates value-based `Equals` and `GetHashCode` automatically:
+
+```csharp
+record Point(int X, int Y);   // value equality and a matching hash code, for free
+```
+
+A `record` is usually the right choice for a key type, precisely because it does this correctly without any hand-written code.
+
+## The mutable-key trap
+
+Because a key's bucket is decided by its hash code *at the moment it is added*, changing a key after inserting it moves where it *should* live without moving where it *actually* is — and it becomes lost:
+
+```csharp
+var p = new Point(1, 2);      // the overridden class version
+var map = new Dictionary<Point, string>();
+map[p] = "here";
+
+p.X = 99;                     // the key's fields changed -> its hash code changed
+
+Console.WriteLine(map.ContainsKey(p));  // False! it now hashes to a different bucket
+```
+
+The entry is stranded in the old bucket, unreachable. The rule that follows: **keys must be immutable.** A `record` with `init`-only properties, or simply never mutating a key after using it, avoids this entirely.
+
+## Custom equality with IEqualityComparer
+
+Sometimes the type is fine but a *different* notion of equality is wanted — most commonly case-insensitive string keys. An `IEqualityComparer<T>` supplies alternative `Equals`/`GetHashCode` without touching the type:
+
+```csharp
+var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+map["Sam"] = 30;
+
+Console.WriteLine(map["SAM"]);   // 30 — keys compared case-insensitively
+```
+
+`StringComparer.OrdinalIgnoreCase` is the everyday example — it makes `"Sam"`, `"SAM"`, and `"sam"` the same key. The same mechanism (`HashSet<T>` also accepts a comparer) lets any custom equality drive a hash collection.
+
+## No order
+
+Hash-based collections trade ordering for speed. Items are placed by hash code, not by when they were added, so **iteration order is unspecified** — do not rely on a `HashSet` or `Dictionary` coming out in insertion order or any order at all:
+
+```csharp
+foreach (var pair in ages)   // order is NOT guaranteed
+    Console.WriteLine($"{pair.Key} = {pair.Value}");
+```
+
+When order matters, a different structure is needed — which is exactly Part 8.
+
+## Growth and load factor
+
+Like `List<T>`, a hash collection grows when it gets too full (its **load factor** crosses a threshold). Growing means allocating more buckets and **rehashing** every item into the new layout — an O(n) operation that happens rarely, so adds stay amortized O(1). Pre-sizing with a capacity (`new Dictionary<string, int>(10_000)`) avoids repeated rehashing when the size is roughly known.
+
+## The Big-O
+
+| Operation | Average | Worst case (bad hashing) |
+|---|---|---|
+| `Contains` / lookup by key | O(1) | O(n) |
+| `Add` | O(1) | O(n) |
+| `Remove` | O(1) | O(n) |
+| Access by position / index | not supported | not supported |
+| Iterate in a defined order | not supported | not supported |
+
+The averages are what these types are for; the worst case only appears with a poor `GetHashCode`, which is why a consistent, well-distributed hash matters.
+
+## When to use which
+
+- **`HashSet<T>`** — for uniqueness and fast membership: "have I seen this?", de-duplication, set operations.
+- **`Dictionary<K,V>`** — for fast lookup of a value by a key: caches, indexes, counting occurrences, any map from one thing to another.
+- **`List<T>` instead** — when order or position matters more than lookup speed, or the collection is small enough that an O(n) scan is irrelevant.
+
+## The one idea to hold onto
+
+> `HashSet` and `Dictionary` replace an O(n) scan with an O(1) calculation: `GetHashCode` turns a value into a bucket, and `Equals` confirms the exact match inside it. The two must agree — equal objects need equal hash codes — which is why custom key types must override both (or be a `record`), and why keys must be immutable. The price is that these collections keep no order.
+
+## What comes next
+
+Hash collections are fast but unordered. **Part 8** covers the structures that keep their items **sorted** — `SortedSet<T>`, `SortedDictionary<K,V>`, and `SortedList<K,V>`. It explains the trade they make (O(log n) instead of O(1), in exchange for order), the difference between the tree-based and array-based ones, and when paying for sorted order is worth it.

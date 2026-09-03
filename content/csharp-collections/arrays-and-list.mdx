@@ -1,0 +1,196 @@
+---
+title: "Arrays and List: contiguous memory, and everything that follows"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 6
+lead: 'Arrays and List both store their items in one contiguous block of memory, and that single fact explains everything about them: why reaching an item by index is instant, why searching for a value is slow, and why List can grow at all. This part looks inside both, with the Big-O that falls straight out of the storage.'
+---
+
+Part 5 ended with a promise: every concrete collection is understood as "which interfaces it implements, plus how it stores its items." This part applies that to the two most common structures, arrays and `List<T>`. Both implement `IList<T>` (ordered, indexable), and both store their items the same way — in a **contiguous block of memory**. Understanding that one storage choice explains all of their behaviour.
+
+## Arrays: a fixed block of memory
+
+An array (`T[]`) is a single, unbroken block of memory holding a fixed number of same-typed slots. Its size is chosen when it is created and can never change.
+
+```csharp
+int[] nums = new int[4];        // 4 slots, all default (0)
+int[] more = { 10, 20, 30 };    // size taken from the initializer -> 3 slots
+
+Console.WriteLine(more[1]);     // 20 — read by index
+more[1] = 99;                   // write by index -> 10, 99, 30
+
+// more.Add(40);   // no such method — an array's size is fixed
+```
+
+An array implements `IList<T>`, `IReadOnlyList<T>`, `ICollection<T>`, and `IEnumerable<T>` — but because its size is fixed, the mutating members like `Add`, `Insert`, and `Remove` throw at runtime. It is indexable and enumerable, not growable.
+
+## Why indexing is instant
+
+The contiguous layout is the whole reason `array[i]` is O(1). Because every element is the same size and they sit back-to-back, the address of any element is a single calculation — no searching:
+
+```text
+An array of 4 ints (each int = 4 bytes):
+
+index:     0        1        2        3
+         +--------+--------+--------+--------+
+values:  |   10   |   20   |   30   |   40   |
+         +--------+--------+--------+--------+
+address: 1000     1004     1008     1012
+
+address of item[i] = start + i * elementSize
+item[2] = 1000 + 2 * 4 = 1008   -> one multiply-and-add, no scanning
+```
+
+Whether the array has 10 elements or 10 million, reaching element `i` costs the same. That constant-time random access is the array's superpower.
+
+## Why searching is slow
+
+The flip side: finding an item *by its value* (rather than its index) has no shortcut. `Contains` and `IndexOf` must walk the array element by element until they find a match or reach the end — O(n).
+
+```csharp
+int[] nums = { 10, 20, 30, 40 };
+bool has30 = Array.IndexOf(nums, 30) >= 0;   // scans: 10? 20? 30! — O(n)
+```
+
+Contiguous memory makes "give me position `i`" instant but does nothing for "is the value 30 in here." That trade-off is exactly what the hash-based types in Part 7 exist to fix.
+
+## List: a growable wrapper around an array
+
+A `List<T>` is an array that can grow. Internally it holds two things: a backing array `T[]` that does the actual storing, and a count of how many slots are currently used.
+
+<Diagram title="List is a growable wrapper around an array">
+  <DiagramRow>
+    <DiagramNode title="List<T>" sub="Count + Capacity" />
+    <DiagramArrow label="wraps" />
+    <DiagramNode title="T[] backing array" sub="the real storage" />
+  </DiagramRow>
+</Diagram>
+
+Because the storage is still an array, `List<T>` inherits the array's O(1) indexing and O(n) search. What it adds is the ability to grow, which is where `Capacity` comes in.
+
+```csharp
+var list = new List<int>();
+list.Add(10);
+list.Add(20);
+
+Console.WriteLine(list[0]);            // 10 — O(1), just like an array
+Console.WriteLine(list.Contains(20));  // O(n) — still a scan
+```
+
+## Capacity versus Count
+
+Two numbers describe a `List<T>`, and confusing them is a common beginner slip:
+
+- **`Count`** is how many items are actually in the list.
+- **`Capacity`** is how many slots the backing array currently has — how many items fit *before* it must grow.
+
+```csharp
+var list = new List<int>(1000);   // capacity 1000, but empty
+Console.WriteLine(list.Count);    // 0  — no items yet
+Console.WriteLine(list.Capacity); // 1000 — room for 1000 before regrowth
+```
+
+Capacity is always at least `Count`, and usually larger. The gap is spare room so that adding does not have to grow the array every single time.
+
+## How growth works
+
+When `Add` is called and the backing array is full, the list cannot just extend the block (the memory after it may be taken). Instead it:
+
+```text
+List<int>, Capacity 4, Count 4:   [10][20][30][40]
+
+Add(50)  -> the array is full, so:
+  1. allocate a NEW array, larger (typically double: size 8)
+  2. copy the 4 existing items into it
+  3. put 50 in the next slot
+  Capacity 8, Count 5:   [10][20][30][40][50][ ][ ][ ]
+```
+
+Growing means allocating a bigger array and copying everything over — an O(n) operation. But it only happens occasionally (each time capacity doubles), so across many adds the cost averages out. That is why adding to the end of a `List<T>` is called **amortized O(1)**: most adds are instant, the rare growth-and-copy is O(n), and the average per add is constant.
+
+The growth is visible in code:
+
+```csharp
+var list = new List<int>();
+int lastCapacity = list.Capacity;
+for (int i = 0; i < 20; i++)
+{
+    list.Add(i);
+    if (list.Capacity != lastCapacity)
+    {
+        Console.WriteLine($"count {list.Count}: capacity grew to {list.Capacity}");
+        lastCapacity = list.Capacity;
+    }
+}
+// capacity climbs 0 -> 4 -> 8 -> 16 -> 32 ... each time it fills up
+```
+
+## Insert and remove shift everything
+
+Adding at the *end* is cheap, but inserting or removing in the *middle* is not. Because the items are packed contiguously with no gaps, everything after the change has to move:
+
+```text
+Insert 99 at index 1 into [10][20][30]:
+  make room by shifting 20 and 30 right ->  [10][  ][20][30]
+  place 99                              ->  [10][99][20][30]
+
+Remove at index 0 from [10][99][20][30]:
+  shift 99, 20, 30 left  ->  [99][20][30]
+```
+
+Every element after the touched position shifts by one, so `Insert` and `RemoveAt` in the middle are O(n). Removing from the very end is O(1), because nothing needs to move.
+
+```csharp
+var list = new List<int> { 10, 20, 30 };
+list.Insert(1, 99);   // 10, 99, 20, 30 — O(n), shifts 20 and 30
+list.RemoveAt(0);     // 99, 20, 30    — O(n), shifts everything left
+list.Add(40);         // 99, 20, 30, 40 — O(1) amortized, at the end
+```
+
+## The Big-O, together
+
+All of it falls out of "items live in a contiguous array":
+
+| Operation | Array (`T[]`) | `List<T>` |
+|---|---|---|
+| Access by index (`x[i]`) | O(1) | O(1) |
+| Search by value (`Contains`, `IndexOf`) | O(n) | O(n) |
+| Add at end | fixed size | O(1) amortized |
+| Insert at a position | fixed size | O(n) |
+| Remove at end | fixed size | O(1) |
+| Remove at a position | fixed size | O(n) |
+| Count | O(1) | O(1) |
+
+The pattern: contiguous storage makes **position-based** access fast and **value-based** search and **middle** edits slow.
+
+## Managing capacity
+
+For a `List<T>` whose final size is roughly known, telling it up front avoids repeated grow-and-copy cycles:
+
+```csharp
+var list = new List<int>(10_000);   // one allocation, no regrowth while filling
+```
+
+And `TrimExcess()` shrinks the backing array down to `Count` when a list has grown large and then shed most of its items, reclaiming the spare capacity. Neither is needed often, but pre-sizing a list that will take many items is a cheap, real win in hot code.
+
+## When to use which
+
+- **Array** — when the count is fixed and known, for performance-sensitive or low-level code, or because an API hands one back. Not for collections that grow.
+- **`List<T>`** — the default ordered, growable collection. Reach for it unless a specific need points elsewhere.
+- **Neither, for fast lookup by value** — if the main operation is "is this value present?" or "find the item with this key," a contiguous scan is O(n) and the wrong tool. That is what `HashSet<T>` and `Dictionary<K,V>` are for, in Part 7.
+
+## Gotchas worth remembering
+
+- **Capacity is not Count.** A `new List<int>(1000)` has room for 1000 but contains 0.
+- **`Contains` on a `List` is O(n).** Repeatedly checking membership of a large list is a common hidden performance bug; a `HashSet<T>` makes it O(1).
+- **Do not remove while iterating.** As Part 2 covered, editing a list during a `foreach` throws; collect changes and apply them after, or loop an index backward.
+- **Inserting at the front is expensive.** `Insert(0, x)` shifts the entire list every time — for heavy front-insertion, a different structure (a `Queue`, or `LinkedList`) fits better.
+
+## The one idea to hold onto
+
+> Arrays and `List<T>` store items in one **contiguous block of memory**. That makes access by index O(1) (the address is a calculation) and search by value O(n) (a scan). `List<T>` adds growth by allocating a larger array and copying — cheap on average (amortized O(1) at the end), O(n) for inserts and removals in the middle.
+
+## What comes next
+
+Contiguous storage is fast to index but slow to search. **Part 7** is the answer to that weakness: `HashSet<T>` and `Dictionary<K,V>`, built on **hashing**. It covers how a hash code turns a value straight into a storage location for roughly O(1) lookup, what buckets and collisions are, and why `GetHashCode` and `Equals` are the methods that make it all work — the single most important performance idea in everyday collections.

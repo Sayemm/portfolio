@@ -93,8 +93,8 @@ export const topics: Topic[] = [
     chip: { bg: "#e4efe0", fg: "#2f5720" },
   },
   {
-    id: "ienumerable",
-    name: "IEnumerable",
+    id: "csharp-collections",
+    name: "C# Collections",
     blurb: "Iteration from first principles — foreach, yield, LINQ, laziness.",
     order: 1.6,
     chip: { bg: "#fae9ec", fg: "#9b1c3d" },

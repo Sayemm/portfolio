@@ -1,0 +1,157 @@
+---
+title: "Queue, Stack, and LinkedList: order out, and cheap splicing"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 9
+lead: 'Queue, Stack, and LinkedList are not about finding items fast — they are about controlling the order items come out and adding or removing cheaply at the ends. Queue is first-in-first-out, Stack is last-in-first-out, and LinkedList joins items with pointers for O(1) splicing. This part covers how each works and when it is the right tool.'
+---
+
+The structures so far were about **storing and finding** items — by index, by hash, in sorted order. The three in this part have a different job. `Queue<T>` and `Stack<T>` control the **order items come back out**, and `LinkedList<T>` makes **inserting and removing** at a known spot cheap. None of them is built for fast lookup, and that is fine — that is not what they are for.
+
+## Queue: first in, first out
+
+A `Queue<T>` serves items in the order they arrived — **FIFO**, first in, first out, like a line at a counter. Items are added at the back with `Enqueue` and removed from the front with `Dequeue`; `Peek` looks at the front without removing it. All three are O(1).
+
+```text
+Queue (FIFO): Enqueue adds at the back, Dequeue removes from the front
+
+Enqueue A, B, C:
+  front [ A ][ B ][ C ] back
+
+Dequeue -> returns A (the first one in):
+  front [ B ][ C ] back
+```
+
+```csharp
+var q = new Queue<string>();
+q.Enqueue("first");
+q.Enqueue("second");
+
+Console.WriteLine(q.Peek());     // "first"  — look at the front, do not remove
+Console.WriteLine(q.Dequeue());  // "first"  — remove from the front
+Console.WriteLine(q.Dequeue());  // "second"
+```
+
+Queues fit anything processed in arrival order: work or job queues, message buffers, and breadth-first search.
+
+## Stack: last in, first out
+
+A `Stack<T>` serves the **most recent** item first — **LIFO**, last in, first out, like a stack of plates. `Push` adds on top, `Pop` removes the top, `Peek` looks at the top. All O(1).
+
+```text
+Stack (LIFO): Push adds on top, Pop removes from the top
+
+Push A, B, C:        Pop -> returns C (the last one in):
+  top -> C             top -> B
+         B                    A
+         A
+```
+
+```csharp
+var s = new Stack<string>();
+s.Push("first");
+s.Push("second");
+
+Console.WriteLine(s.Peek());  // "second" — the top
+Console.WriteLine(s.Pop());   // "second" — remove the top
+Console.WriteLine(s.Pop());   // "first"
+```
+
+Stacks fit anything processed most-recent-first: undo history, depth-first search, backtracking, and evaluating nested or bracketed expressions.
+
+<Diagram title="Queue is FIFO, Stack is LIFO">
+  <DiagramRow>
+    <DiagramNode title="Queue" sub="in the back, out the front" />
+    <DiagramArrow label="vs" />
+    <DiagramNode title="Stack" sub="in and out the top" />
+  </DiagramRow>
+</Diagram>
+
+## Peeking, and the safe Try methods
+
+`Dequeue`, `Pop`, and `Peek` all **throw** if the collection is empty. When emptiness is possible, the `Try...` versions return `false` instead of throwing:
+
+```csharp
+if (q.TryDequeue(out var item))   // false (no throw) when the queue is empty
+    Console.WriteLine(item);
+
+if (s.TryPop(out var top))        // same idea for a stack
+    Console.WriteLine(top);
+```
+
+Reaching for `TryDequeue`/`TryPop`/`TryPeek` in a loop that drains a queue or stack is the safe, idiomatic pattern.
+
+## How Queue and Stack store their items
+
+Both are array-backed, which is why their operations are O(1):
+
+- A **`Stack<T>`** is an array with a "top" index. `Push` writes at the top and bumps the index; `Pop` reads and lowers it. Adding and removing happen only at the end of the array, so nothing shifts.
+- A **`Queue<T>`** is a **circular buffer** — an array with a head index and a tail index. `Enqueue` writes at the tail, `Dequeue` reads at the head, and both indices wrap around to the start of the array when they reach the end. Because nothing shifts, both ends are O(1).
+
+Both grow the same way `List<T>` does when they fill up: allocate a bigger array and copy, making adds amortized O(1).
+
+## LinkedList: nodes joined by pointers
+
+A `LinkedList<T>` stores each item in its own **node**, and each node holds a pointer to the previous and the next node (a *doubly* linked list). There is no backing array and no contiguous block:
+
+```text
+LinkedList: each node points to the previous and next node
+
+  null <- [A] <-> [B] <-> [C] -> null
+           head            tail
+
+Insert X after A: just relink A.next and B.prev to point at X  -> O(1)
+  null <- [A] <-> [X] <-> [B] <-> [C] -> null
+```
+
+Because inserting or removing only relinks a couple of pointers, it is O(1) — *if the node is already in hand*. The methods work with `LinkedListNode<T>` objects:
+
+```csharp
+var list = new LinkedList<int>();
+LinkedListNode<int> nodeB = list.AddLast(20);   // returns the node
+list.AddFirst(10);                              // 10, 20
+list.AddAfter(nodeB, 30);                       // 10, 20, 30 — O(1), nodeB in hand
+list.Remove(nodeB);                             // 10, 30      — O(1), node in hand
+```
+
+The catch: **finding** a node in the first place is O(n). There is no index and no hashing — reaching a position means walking from the head one node at a time. `list.Find(value)` scans, and there is no `list[i]`.
+
+## LinkedList versus List: the practical reality
+
+On paper `LinkedList<T>` has O(1) inserts and `List<T>` has O(n) inserts, which suggests the linked list should win. In practice it usually does **not**. A `List<T>` stores items contiguously, which modern CPUs walk extremely fast (good cache locality), while a linked list scatters nodes across memory and adds two pointers of overhead per item. Reaching the insertion point in a linked list is also O(n), which often erases the O(1) insert.
+
+So `LinkedList<T>` is rarely the right choice. It earns its place only when there are **many insertions and removals at positions whose nodes are already held** — for example, an LRU cache that keeps node references, or splicing sequences together. For almost everything else, `List<T>` is faster and simpler.
+
+## Why none of these implement IList
+
+All three deliberately omit indexing. Reaching item `i` directly would break the FIFO/LIFO discipline of a queue and stack, and a linked list cannot do it in O(1) anyway. So none implement `IList<T>`. `Queue<T>` and `Stack<T>` expose only `IEnumerable<T>` and `IReadOnlyCollection<T>` (they can be walked and counted, not indexed or freely mutated); `LinkedList<T>` implements `ICollection<T>` (it has `Add`/`Remove`/`Count`) but still not `IList<T>`. The missing indexer is a feature — it enforces how each structure is meant to be used.
+
+## The Big-O
+
+| Type | Add | Remove | Peek / front | Find a value | Index access |
+|---|---|---|---|---|---|
+| `Queue<T>` | O(1) at back (`Enqueue`) | O(1) at front (`Dequeue`) | O(1) | O(n) | no |
+| `Stack<T>` | O(1) on top (`Push`) | O(1) on top (`Pop`) | O(1) | O(n) | no |
+| `LinkedList<T>` | O(1) at ends or a known node | O(1) at a known node | O(1) at ends | O(n) | no |
+
+## When to use which
+
+- **`Queue<T>`** — process items in the order they arrived: task queues, buffering, breadth-first traversal.
+- **`Stack<T>`** — process the most recent item first: undo, depth-first traversal, backtracking, expression parsing.
+- **`LinkedList<T>`** — only for frequent insert/remove at positions whose nodes are already held; otherwise prefer `List<T>`.
+
+## Gotchas worth remembering
+
+- **Empty `Dequeue`/`Pop`/`Peek` throws.** Use `TryDequeue`/`TryPop`/`TryPeek` when the collection may be empty.
+- **No indexing or random access on `Queue`/`Stack`.** That is by design — reach for a `List<T>` if positions are needed.
+- **`LinkedList` is rarely worth it.** Its theoretical O(1) inserts usually lose to `List<T>`'s cache-friendly layout; do not choose it expecting speed without holding node references.
+- **`LinkedList` has no index.** Treating it like a `List` (`Find` in a loop to reach positions) is O(n) each time.
+
+## The one idea to hold onto
+
+> `Queue` (FIFO) and `Stack` (LIFO) are array-backed structures that control the **order items come out**, with O(1) operations at their working end and no indexing by design. `LinkedList` joins items with pointers for O(1) insert/remove **at a node already in hand**, but O(n) to find one — and in practice `List<T>` usually beats it. Match the structure to the access pattern, not to its Big-O on paper.
+
+## What comes next
+
+**Part 10** closes the series by tying the loose ends together: the difference between a **read-only view** and a truly **immutable** collection (and the `System.Collections.Immutable` types), `IQueryable<T>` versus `IEnumerable<T>` for database queries, and `IAsyncEnumerable<T>` for data that arrives over time. It also revisits the capabilities map from Part 5 as a final decision guide for choosing any collection.

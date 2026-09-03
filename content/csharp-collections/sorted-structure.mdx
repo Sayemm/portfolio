@@ -1,0 +1,159 @@
+---
+title: "Sorted structures: keeping order at O(log n)"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 8
+lead: 'Hash collections are fast but keep no order. Sorted structures keep every item in order at all times, in exchange for O(log n) instead of O(1). This part covers the three — SortedSet, SortedDictionary, and SortedList — how a tree and a sorted array each stay ordered, and when paying for order is worth it.'
+---
+
+Part 7 traded order for speed: `HashSet` and `Dictionary` are O(1) but come out in no particular order. This part is the other side of that trade. When items need to be kept **in order** — smallest to largest, alphabetical, by date — the sorted structures do it, at a cost of O(log n) instead of O(1). There are three of them, and they split into two internal designs.
+
+## The trade: order for speed
+
+Every sorted structure makes the same bargain. Instead of computing an item's location directly (hashing, O(1)), it keeps everything arranged in order so that any lookup can home in by repeatedly halving the search — O(log n). The payoff is that iteration always comes out sorted, and range questions ("everything between X and Y", "the smallest", "the next one up") become easy.
+
+<Diagram title="Sorted structures trade speed for order">
+  <DiagramRow>
+    <DiagramNode title="hash: O(1)" sub="no order" />
+    <DiagramArrow label="trade" />
+    <DiagramNode title="sorted: O(log n)" sub="always ordered" />
+  </DiagramRow>
+</Diagram>
+
+O(log n) is still very fast — for a million items it is about twenty steps, not a million. It is slower than O(1) but a world away from O(n).
+
+## Why a sorted search stays fast: halving
+
+The reason order buys O(log n) is that a sorted arrangement can be searched by **binary search** — look at the middle, then throw away half. It is how a person finds a word in a physical dictionary: open the middle, decide left or right, repeat.
+
+```text
+Find 60 in a sorted array [10, 20, 30, 40, 50, 60, 70]:
+
+  middle is 40 -> 60 > 40, discard the left half
+  now [50, 60, 70], middle is 60 -> found
+
+Each step halves what is left. 1,000,000 items -> ~20 steps.
+```
+
+Halving the remaining items each step is what "log n" means. Every sorted structure is some way of keeping data arranged so this halving is always possible.
+
+## Trees keep order: SortedSet and SortedDictionary
+
+`SortedSet<T>` and `SortedDictionary<K,V>` store their items in a **self-balancing binary search tree**. Each node's left subtree holds smaller items and its right subtree holds larger ones, and the tree keeps itself balanced so no branch grows too deep:
+
+```text
+SortedSet holding 10, 20, 30, 40, 50:
+
+           30
+          /  \
+        20    40
+       /        \
+      10         50
+
+- walking left-node-right yields: 10, 20, 30, 40, 50   (sorted!)
+- to find 40: start at 30, 40 > 30 go right, land on 40 -> 2 steps
+```
+
+Searching, adding, and removing all follow the branches — halving the remaining tree each step — so they are O(log n). Walking the tree in order produces the sorted sequence for free.
+
+```csharp
+var set = new SortedSet<int> { 30, 10, 20, 10 };
+foreach (var n in set)
+    Console.WriteLine(n);     // 10, 20, 30 — sorted, and the duplicate 10 dropped
+
+Console.WriteLine(set.Min);   // 10
+Console.WriteLine(set.Max);   // 30
+```
+
+`SortedDictionary<K,V>` is the same idea for key/value pairs — sorted by key:
+
+```csharp
+var scores = new SortedDictionary<string, int>();
+scores["Sam"] = 30;
+scores["Ada"] = 41;
+scores["Bo"]  = 19;
+
+foreach (var pair in scores)
+    Console.WriteLine($"{pair.Key} = {pair.Value}");   // Ada, Bo, Sam — sorted by key
+```
+
+## SortedList: order in an array
+
+`SortedList<K,V>` reaches the same sorted result a different way: it keeps its keys in a **sorted array** (with a parallel array of values). Lookup is a binary search over that array — O(log n) — but *inserting* or *removing* means shifting elements to keep the array packed and ordered, which is O(n), exactly like `List<T>` from Part 6.
+
+```csharp
+var list = new SortedList<string, int>();
+list["Sam"] = 30;
+list["Ada"] = 41;   // inserted before "Sam" to keep keys sorted -> shifts
+
+// unlike SortedDictionary, a SortedList can be reached by position:
+Console.WriteLine(list.Keys[0]);     // "Ada" — first key in sorted order
+Console.WriteLine(list.Values[0]);   // 41
+```
+
+In exchange for slow inserts, `SortedList` uses less memory (two compact arrays, no tree nodes) and supports access by index (`Keys[i]`, `Values[i]`), which the tree-based `SortedDictionary` does not.
+
+## SortedDictionary versus SortedList
+
+They map keys to values with the same sorted result, so the choice is about *how the data is used*:
+
+| | `SortedDictionary<K,V>` | `SortedList<K,V>` |
+|---|---|---|
+| Internal structure | balanced tree | two sorted arrays |
+| Lookup by key | O(log n) | O(log n) |
+| Insert / Remove | O(log n) | O(n) (shifts the array) |
+| Memory use | more (tree nodes) | less (compact arrays) |
+| Access by index/position | no | yes |
+| Best when | many inserts and removals over time | built once then mostly read; memory matters |
+
+The rule of thumb: **`SortedDictionary` for data that changes a lot; `SortedList` for data built once and then read**, or when memory and index access matter.
+
+## How order is decided: IComparable and IComparer
+
+Hash collections needed `GetHashCode` and `Equals` (Part 7). Sorted structures need something different: a way to **compare** two items to decide which comes first. By default they use the type's natural ordering through `IComparable<T>` (its `CompareTo` method), which `int`, `string`, `DateTime`, and other built-ins already implement.
+
+For a custom order — or a type that is not naturally comparable — an `IComparer<T>` is supplied instead:
+
+```csharp
+// order strings by length instead of alphabetically:
+var byLength = new SortedSet<string>(
+    Comparer<string>.Create((a, b) => a.Length - b.Length));
+
+byLength.Add("bee");
+byLength.Add("ox");
+byLength.Add("lion");
+// iterates as: ox, bee, lion   (2, 3, 4 letters)
+```
+
+A custom *type* used as a sorted key must either implement `IComparable<T>` or come with an `IComparer<T>` — otherwise the structure has no way to order it and throws at runtime.
+
+## The Big-O
+
+| Type | Structure | Lookup | Insert / Remove | Index access | Order |
+|---|---|---|---|---|---|
+| `SortedSet<T>` | tree | O(log n) | O(log n) | no | sorted values |
+| `SortedDictionary<K,V>` | tree | O(log n) | O(log n) | no | sorted by key |
+| `SortedList<K,V>` | sorted arrays | O(log n) | O(n) | yes | sorted by key |
+
+## When to use which
+
+- **`SortedSet<T>`** — unique values that must stay in order, or when `Min`/`Max`/range queries matter.
+- **`SortedDictionary<K,V>`** — a key/value map that must iterate in key order, with frequent inserts and removals.
+- **`SortedList<K,V>`** — a key/value map that must stay in key order but is built once and mostly read, or where low memory and index access are valuable.
+- **A hash type instead (`HashSet`/`Dictionary`)** — whenever order is *not* needed. O(1) beats O(log n), so only pay for sorting when the order is actually used.
+
+## Gotchas worth remembering
+
+- **Sorted is slower than hash.** Do not reach for a sorted structure by default — only when the ordering is genuinely needed. Otherwise `HashSet`/`Dictionary` are faster.
+- **Keys and values must be comparable.** A custom key type needs `IComparable<T>` or a supplied `IComparer<T>`, or it throws.
+- **`SortedList` inserts are O(n).** Repeatedly inserting into a large `SortedList` in random key order is slow; use `SortedDictionary` for that pattern.
+- **Comparison must be consistent.** A comparer that says two different items are "equal" (returns 0) will treat them as the same key or drop one from a set.
+
+## The one idea to hold onto
+
+> Sorted structures keep items ordered at all times, searched by halving (O(log n)) instead of by hashing (O(1)). `SortedSet` and `SortedDictionary` use a balanced tree; `SortedList` uses a sorted array — trees for frequent edits, the array for build-once-read-often and lower memory. Ordering comes from `IComparable`/`IComparer`, not `GetHashCode`. Only pay for sorting when the order is used.
+
+## What comes next
+
+The structures so far have been about storing and finding items. **Part 9** covers three with a different purpose — controlling the *order things come out*: `Queue<T>` (first in, first out), `Stack<T>` (last in, first out), and `LinkedList<T>` (fast insertion and removal at any point via linked nodes). They round out the built-in collection types before the series wraps up.

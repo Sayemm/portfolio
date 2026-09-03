@@ -1,0 +1,157 @@
+---
+title: "Immutable, IQueryable, and async: tying the series together"
+date: 2026-09-03
+status: written
+minutes: 15
+order: 10
+lead: 'The series closes by tying three threads together: the difference between a read-only view and a truly immutable collection, why IQueryable runs a query in the database while IEnumerable runs it in memory, and how IAsyncEnumerable streams data that arrives over time. Then a single decision guide for choosing any collection in C#.'
+---
+
+Nine parts covered `IEnumerable<T>` and every common concrete structure. This final part ties off three threads that keep coming up — immutability, database queries, and asynchronous sequences — and then gives one decision guide for choosing any collection. It is the place everything from the series meets.
+
+## Read-only view versus truly immutable
+
+Part 5 flagged a trap worth settling here: a **read-only view** is not an **immutable collection**. An `IReadOnlyList<T>` only means *this reference* cannot change the data — the underlying object may still be a mutable `List<T>` that someone else edits.
+
+A genuinely immutable collection is a different type entirely, from `System.Collections.Immutable`: `ImmutableArray<T>`, `ImmutableList<T>`, `ImmutableHashSet<T>`, `ImmutableDictionary<K,V>`, and the rest. "Modifying" one does not change it — it returns a **new** collection, leaving the original untouched:
+
+```csharp
+var list = ImmutableList.Create(1, 2, 3);
+var list2 = list.Add(4);           // returns a NEW list
+
+Console.WriteLine(list.Count);     // 3 — the original is unchanged
+Console.WriteLine(list2.Count);    // 4 — the change lives in the new one
+```
+
+The difference laid out:
+
+| | Read-only view (`IReadOnly...`) | Immutable (`Immutable...`) |
+|---|---|---|
+| Can *this reference* change it? | no | no |
+| Can *anyone* change the underlying data? | yes | no |
+| "Modifying" it | not possible through the view | returns a brand-new collection |
+| Safe to share across threads | no — the data can change | yes — it never changes |
+
+Immutable collections shine for **thread safety** (nothing can change under another thread), snapshots, and functional-style code. The cost is that each change produces a new collection — though most of them use *structural sharing* (the new collection reuses most of the old one internally), so a change is O(log n), not a full copy. `ImmutableArray<T>` is the exception: it is optimised for fast reading and copies on change, so it suits read-heavy data that rarely updates.
+
+For many changes at once, a **builder** avoids allocating a new collection per step:
+
+```csharp
+var builder = ImmutableList.CreateBuilder<int>();
+builder.Add(1);
+builder.Add(2);
+builder.Add(3);
+ImmutableList<int> result = builder.ToImmutable();   // one immutable result at the end
+```
+
+## IEnumerable versus IQueryable: where the query runs
+
+Both `IEnumerable<T>` and `IQueryable<T>` support LINQ and both are deferred (Part 4), but they run the query in completely different **places**.
+
+<Diagram title="IEnumerable runs in memory; IQueryable runs in the database">
+  <DiagramRow>
+    <DiagramNode title="IEnumerable" sub="LINQ runs in C#, in memory" />
+    <DiagramArrow label="vs" />
+    <DiagramNode title="IQueryable" sub="LINQ becomes SQL, runs in the DB" />
+  </DiagramRow>
+</Diagram>
+
+- **`IEnumerable<T>`** is *LINQ to Objects*. The data is already in memory, and operators like `Where` run as compiled C# — the iterator machinery from Parts 2 and 3, walking items in the process.
+- **`IQueryable<T>`** (what EF Core returns) is *LINQ to a provider*. The operators are not run in C# at all. They are captured as an **expression tree** — a data description of the query — which the provider translates into SQL and sends to the database. Only the matching rows come back.
+
+This is why the same-looking query behaves very differently:
+
+```csharp
+// db.Books is IQueryable<Book>
+var titles = db.Books
+    .Where(b => b.Year > 2000)   // becomes part of the SQL WHERE clause
+    .Select(b => b.Title)        // becomes the SQL SELECT
+    .ToList();                   // NOW the SQL runs; only matching titles return
+// SELECT Title FROM Books WHERE Year > 2000
+```
+
+The filter runs *in the database*, so only the needed rows travel back. Break that by materialising too early and it turns into a serious performance bug:
+
+```csharp
+var titles = db.Books
+    .ToList()                    // pulls EVERY book into memory first
+    .Where(b => b.Year > 2000);  // now an in-memory (IEnumerable) filter — too late
+```
+
+Once `ToList()` runs, the query left `IQueryable` and became an in-memory `IEnumerable`, so the whole table was loaded before filtering. The rule: **keep a database query as `IQueryable` until the filtering and shaping are done, then materialise.**
+
+## IAsyncEnumerable: sequences that arrive over time
+
+`IEnumerable<T>` pulls the next item *synchronously* — `MoveNext()` returns immediately. But some sequences produce each item by awaiting I/O: rows streaming from a database, pages fetched from an API, lines read from a slow file. Blocking a thread on each item wastes it. `IAsyncEnumerable<T>` is the asynchronous version, consumed with `await foreach`.
+
+An async iterator combines `async`, `yield return`, and `await` — the `yield` state machine from Part 3, made asynchronous:
+
+```csharp
+async IAsyncEnumerable<int> GetNumbersAsync()
+{
+    for (int i = 1; i <= 3; i++)
+    {
+        await Task.Delay(100);   // stand-in for awaiting real I/O
+        yield return i;          // stream each value as it becomes ready
+    }
+}
+
+await foreach (var n in GetNumbersAsync())
+    Console.WriteLine(n);        // 1, 2, 3 — one at a time, without blocking a thread
+```
+
+It is the same "one item at a time, lazily" idea as `IEnumerable`, extended so that producing each item can `await`. It matters most in a web API or service that streams data — the thread is released while waiting for each item instead of being held. Async streams also accept a `CancellationToken` so a long stream can be stopped cleanly.
+
+## Choosing any collection: the final guide
+
+Everything in the series reduces to two questions and a lookup. First, the capabilities question from Part 5 — *what does the code need to do?* Then, the concrete choice from Parts 6 through 9 — *which storage fits?*
+
+```text
+Do I need key -> value lookup?
+  yes, unordered, fastest      -> Dictionary<K,V>
+  yes, sorted by key, editing  -> SortedDictionary<K,V>
+  yes, sorted by key, read-mostly -> SortedList<K,V>
+
+Just values?
+  need fast membership / uniqueness
+     unordered -> HashSet<T>
+     sorted    -> SortedSet<T>
+  need order/position
+     growable, indexable -> List<T>
+     fixed size          -> array
+  need a processing order
+     first-in-first-out -> Queue<T>
+     last-in-first-out  -> Stack<T>
+
+Must it never change (thread-safe sharing)?  -> Immutable...
+```
+
+As a single reference — every structure the series covered, and what it is for:
+
+| Need | Reach for |
+|---|---|
+| Ordered, indexable, growable | `List<T>` |
+| Fixed size, known count | array (`T[]`) |
+| Fast membership / uniqueness | `HashSet<T>` |
+| Fast lookup by key | `Dictionary<K,V>` |
+| Sorted unique values | `SortedSet<T>` |
+| Sorted key→value, many edits | `SortedDictionary<K,V>` |
+| Sorted key→value, build-once-read-often | `SortedList<K,V>` |
+| First-in-first-out processing | `Queue<T>` |
+| Last-in-first-out processing | `Stack<T>` |
+| O(1) splice at nodes already held | `LinkedList<T>` |
+| Never changes, safe to share | `Immutable...` |
+| A parameter that only gets walked | `IEnumerable<T>` (accept the weakest) |
+
+## The whole series, in one view
+
+Ten parts, one idea built up layer by layer:
+
+- **1–4** — what `IEnumerable<T>` is and why it is special: interfaces and the type-versus-object distinction, the cursor (`IEnumerator<T>`), `yield return`, and deferred execution.
+- **5** — the collection interface family, chosen by capability rather than memory.
+- **6–9** — the concrete structures, each understood as "which interfaces it implements, plus how it stores its items": arrays and `List<T>` (contiguous memory), `Dictionary`/`HashSet` (hashing), the sorted structures (trees and sorted arrays), and `Queue`/`Stack`/`LinkedList` (order and splicing).
+- **10** — immutability, `IQueryable`, `IAsyncEnumerable`, and the decision guide above.
+
+## The one idea to hold onto
+
+> Every collection in C# is an `IEnumerable<T>` first — something that hands out a cursor — and everything else is a layer on top: more interface promises for what can be done, and a storage choice for how fast and in what order. Pick the interface by what the code needs to do, and the concrete type by how the data is accessed. That single frame explains the whole collection system, from a humble array to an immutable dictionary streamed asynchronously from a database.

@@ -1,0 +1,215 @@
+---
+title: "The collection interface family: pick by capability, not by memory"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 5
+lead: 'Beyond IEnumerable sits a family of collection interfaces — ICollection, IList, ISet, the read-only twins, and dictionaries. Each is just IEnumerable plus a few more promises. Rather than memorising the tree, this part gives a way to pick the right one by asking what the code needs to do — the map for every concrete data structure that follows.'
+---
+
+Parts 1 through 4 were about `IEnumerable<T>` itself — the promise to hand out a cursor, and the laziness that comes with it. This part widens the view to the whole **family** of collection interfaces that build on it. It is the bridge to the concrete data structures (`List`, `Dictionary`, `HashSet`, and the rest), because each of those is understood through the interfaces it implements.
+
+The goal here is not to memorise a hierarchy. It is to learn a single question — *what does the code need to do?* — and let that pick the interface.
+
+## The whole family is just "IEnumerable plus more"
+
+Every collection interface is `IEnumerable<T>` with extra promises stacked on top. `IEnumerable<T>` promises the least — "you can walk my items." Each interface above it adds one more capability:
+
+<Diagram title="Each interface adds a capability to the one before">
+  <DiagramRow>
+    <DiagramNode title="IEnumerable" sub="walk items" />
+    <DiagramArrow label="+ count, change" />
+    <DiagramNode title="ICollection" sub="modify it" />
+    <DiagramArrow label="+ index" />
+    <DiagramNode title="IList" sub="reach by position" />
+  </DiagramRow>
+</Diagram>
+
+That is the mental frame for the whole part: read each interface as "everything below, plus this new thing." A method should then ask for the *weakest* one that covers what it actually does — which is the same "depend on the smallest promise" idea from Part 1.
+
+## ICollection: count it and change it
+
+`ICollection<T>` adds the ability to know the size and to modify the collection: `Count`, `Add`, `Remove`, `Clear`, `Contains`, `CopyTo`. This is the "I can change it" level.
+
+```csharp
+ICollection<string> c = new List<string>();
+c.Add("apple");
+c.Add("pear");
+Console.WriteLine(c.Count);        // 2
+Console.WriteLine(c.Contains("apple"));  // True
+c.Remove("apple");
+```
+
+Notice the variable is typed `ICollection<string>`, but the object is a `List<string>`. Through this reference only the `ICollection` promises are reachable (Part 1's rule) — no indexing yet, because `ICollection` does not promise it.
+
+## IList: reach items by position
+
+`IList<T>` adds *position*: an indexer `list[i]`, plus `Insert`, `RemoveAt`, and `IndexOf`. Use it when order matters and items are reached by their slot. `List<T>` and arrays live here.
+
+```csharp
+IList<string> list = new List<string> { "x", "y", "z" };
+
+Console.WriteLine(list[0]);    // "x" — reach by position
+list.Insert(1, "new");         // x, new, y, z
+list.RemoveAt(0);              // new, y, z
+Console.WriteLine(list.IndexOf("y"));  // 1
+```
+
+An `IList<T>` can do everything an `ICollection<T>` can (it is built on it) and adds indexing on top.
+
+## ISet: unique items and set math
+
+`ISet<T>` is a different specialisation of `ICollection<T>`. It keeps items **unique** and adds set operations: `UnionWith`, `IntersectWith`, `ExceptWith`, `IsSubsetOf`, `IsSupersetOf`. Its `Add` returns a `bool` saying whether the item was actually new.
+
+```csharp
+ISet<int> set = new HashSet<int> { 1, 2, 3 };
+
+bool added = set.Add(3);        // false — 3 was already there, still unique
+set.Add(4);                     // true
+set.UnionWith(new[] { 4, 5 });  // now 1, 2, 3, 4, 5
+Console.WriteLine(set.IsSupersetOf(new[] { 1, 2 }));  // True
+```
+
+`HashSet<T>` and `SortedSet<T>` implement `ISet<T>`.
+
+## The read-only twins
+
+Alongside the mutable interfaces sits a parallel set that promise reading but not changing: `IReadOnlyCollection<T>` (adds `Count`), `IReadOnlyList<T>` (adds an indexer), and `IReadOnlySet<T>` (adds `Contains`, `IsSubsetOf`, and the other read-only set checks). They expose no `Add`, `Remove`, or `Clear`.
+
+They are for handing a collection to code that should look but not touch. But there is one trap that catches everyone:
+
+> **Read-only is a view, not a guarantee of immutability.** `IReadOnlyList<T>` means "*this reference* cannot change the collection" — not "the collection cannot change." The object underneath may still be a mutable `List<T>` that someone else edits:
+>
+> The list can be handed out as a read-only view, yet the original owner can still add to it, and the view will see the change. For a collection that truly cannot change no matter who holds it, the answer is a different thing entirely — the `Immutable...` types in `System.Collections.Immutable`, which return a new collection instead of mutating the old one.
+
+```csharp
+var list = new List<int> { 1, 2, 3 };
+IReadOnlyList<int> view = list;   // a read-only VIEW of the same object
+
+// view.Add(4);   // does not exist — the view cannot change it
+list.Add(4);      // but the original reference still can
+
+Console.WriteLine(view.Count);    // 4 — the view saw the change
+```
+
+## Dictionaries: key to value
+
+Dictionaries are a separate branch, because their items are key/value pairs. Same pattern — a mutable interface and a read-only twin:
+
+```csharp
+IDictionary<string, int> ages = new Dictionary<string, int>();
+ages["Sam"] = 30;                       // set by key
+ages.Add("Ada", 41);
+
+if (ages.TryGetValue("Sam", out int a)) // safe lookup, no exception if missing
+    Console.WriteLine(a);               // 30
+
+Console.WriteLine(ages.ContainsKey("Ada"));  // True
+```
+
+`IDictionary<K,V>` is "look up by key, and change." `IReadOnlyDictionary<K,V>` is the look-but-do-not-touch version. `Dictionary<K,V>` implements both, so the same object can be handed out as either, depending on what the receiver is allowed to do.
+
+## The trees, for reference
+
+Seen as inheritance, the mutable side looks like this — each level a superset of the one above:
+
+```text
+IEnumerable<T>                 walk items, one at a time
+|
++- ICollection<T>             + Count, Add, Remove, Clear, Contains
+   |
+   +- IList<T>                + list[i], Insert, RemoveAt      (ordered, indexable)
+   +- ISet<T>                 + UnionWith, IntersectWith       (unique items)
+```
+
+The read-only side mirrors it:
+
+```text
+IEnumerable<T>
+|
++- IReadOnlyCollection<T>     + Count
+   |
+   +- IReadOnlyList<T>        + list[i]
+   +- IReadOnlySet<T>         + Contains, IsSubsetOf
+```
+
+And dictionaries, whose items are key/value pairs, form their own branch:
+
+```text
+IEnumerable<KeyValuePair<K,V>>
+|
++- IDictionary<K,V>            + dict[key], Keys, Values, TryGetValue, Add, Remove
+|
++- IReadOnlyDictionary<K,V>    + dict[key], Keys, Values, TryGetValue   (read-only)
+```
+
+## The model to actually remember
+
+Do not start from the interfaces and try to recall the tree. Start from **what the code needs to do**, and let the answer name the interface:
+
+```text
+What does the code need to do with the items?
+
+"Just walk through them"
+    -> IEnumerable<T>
+
+"Also count, add, or remove"
+    -> ICollection<T>
+        "...and reach one by position, like list[3]"  -> IList<T>
+        "...and keep them unique / do set math"        -> ISet<T>
+
+"Only read them, never change them"  (a read-only view)
+    -> IReadOnlyCollection<T>
+        "...by position"      -> IReadOnlyList<T>
+        "...as a unique set"  -> IReadOnlySet<T>
+
+"Look things up by a key"
+    -> IDictionary<K,V>           (read and write)
+    -> IReadOnlyDictionary<K,V>   (read-only view)
+```
+
+Two questions decide almost everything: *read-only, or able to change it?* and *how are items reached — walk to them, by position, by key, or as a unique set?* Answer those and the interface falls out. There is nothing else to memorise.
+
+## Choosing the right one in your own code
+
+The family pays off in method signatures:
+
+```csharp
+// Only loops -> ask for the weakest interface, so any collection can be passed:
+void PrintAll(IEnumerable<string> items)
+{
+    foreach (var i in items)
+        Console.WriteLine(i);
+}
+
+// Needs a count but not mutation -> IReadOnlyCollection<T>
+// Needs indexing but not mutation -> IReadOnlyList<T>
+// Needs to add/remove            -> ICollection<T> or IList<T>
+```
+
+- **For parameters, ask for the weakest interface the method actually uses.** Requiring `List<T>` when only looping shuts out arrays and every other collection for no reason.
+- **For return types, let the type signal intent.** `IEnumerable<T>` says "a sequence, maybe lazy, walk it" (with the Part 4 caveats); `IReadOnlyList<T>` says "a finished collection, safe to index and re-read."
+
+## A capabilities reference
+
+One table to skim when unsure — the question each interface answers and the members it adds:
+
+| Interface | The question it answers | Key members it adds |
+|---|---|---|
+| `IEnumerable<T>` | can I walk it? | `GetEnumerator` |
+| `ICollection<T>` | can I count and change it? | `Count`, `Add`, `Remove`, `Clear`, `Contains` |
+| `IList<T>` | can I reach items by position? | `list[i]`, `Insert`, `RemoveAt`, `IndexOf` |
+| `ISet<T>` | are items unique, with set math? | `Add` (returns bool), `UnionWith`, `IntersectWith` |
+| `IReadOnlyCollection<T>` | can I count it, read-only? | `Count` |
+| `IReadOnlyList<T>` | can I index it, read-only? | `list[i]` |
+| `IReadOnlySet<T>` | set checks, read-only? | `Contains`, `IsSubsetOf` |
+| `IDictionary<K,V>` | look up and change by key? | `dict[key]`, `Add`, `Remove`, `TryGetValue`, `Keys`, `Values` |
+| `IReadOnlyDictionary<K,V>` | look up by key, read-only? | `dict[key]`, `TryGetValue`, `Keys`, `Values` |
+
+## The one idea to hold onto
+
+> Every collection interface is `IEnumerable<T>` plus a few more promises. Do not memorise the tree — ask two questions: *read-only or changeable?* and *reached by walking, by position, by key, or as a unique set?* The answers name the interface. Concrete types (next) are these capabilities made real, each with its own speed and ordering.
+
+## What comes next
+
+With the interfaces mapped, the rest of the series fills them with concrete types and looks inside each one. **Part 6** starts with the array-backed structures — plain arrays and `List<T>`: how `List<T>` grows, why indexing is instant but searching is not, what "capacity" means, and the Big-O that follows from being backed by a contiguous array. From here on, every structure is understood as "which interfaces it implements, plus how it stores its items."
