@@ -1,0 +1,154 @@
+---
+title: "Azure RBAC roles: the other permission system"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 6
+lead: 'API permissions let an app call an API. Azure RBAC roles are the other, separate system: they control who can manage and use Azure resources — deploy an app, read a secret, write to storage. Every assignment is a who, a what, and a where. This part explains roles like Contributor, the control-plane versus data-plane trap, and how a deployment pipeline uses this system rather than API permissions.'
+---
+
+Part 5 covered the first permission system — API permissions, for *calling* APIs like Microsoft Graph. This part covers the second, completely separate one: **Azure RBAC**, for *managing and using Azure resources*. This is the system a deployment pipeline uses, and keeping it distinct from API permissions is the single most valuable thing to take away, because confusing the two is the most common authorization mistake there is.
+
+## What Azure RBAC is
+
+**RBAC** stands for **Role-Based Access Control**. It governs who is allowed to do what to **Azure resources** — App Services, storage accounts, Key Vaults, virtual machines, databases, and the resource groups and subscriptions that contain them. Where API permissions answer "what APIs may I call?", RBAC answers "what Azure resources may I manage and use?"
+
+RBAC works by *assigning roles*. Nobody has access to a resource until a role is assigned that grants it.
+
+## Every assignment is who + what + where
+
+A role assignment is always three things together, and knowing this triple is most of what RBAC is:
+
+<Diagram title="Every role assignment is who + what + where">
+  <DiagramRow>
+    <DiagramNode title="who" sub="a security principal" />
+    <DiagramArrow label="gets" />
+    <DiagramNode title="what" sub="a role" />
+    <DiagramArrow label="at" />
+    <DiagramNode title="where" sub="a scope" />
+  </DiagramRow>
+</Diagram>
+
+"This principal has this role at this scope." Change any of the three and it is a different assignment. The next three sections take each in turn.
+
+## Who: security principals
+
+The **who** is a *security principal* — any identity RBAC can grant access to:
+
+- a **user** (a human identity),
+- a **group** (assign once, everyone in it inherits — the tidy way),
+- a **service principal** (an app's identity, from Part 3),
+- a **managed identity** (a special service principal, Part 8).
+
+For everything in this series, the interesting principals are the last two: an app or pipeline identity getting a role so it can manage or use a resource.
+
+## What: role definitions
+
+The **what** is a *role definition* — a named bundle of allowed actions. A handful of built-in roles cover most needs:
+
+| Role | Grants | Note |
+|---|---|---|
+| Owner | full access, **plus** granting roles to others | the most powerful — assign sparingly |
+| Contributor | create, change, and delete resources | but **cannot** grant roles to others |
+| Reader | view resources only | no changes |
+| Storage Blob Data Reader | read blob **data** | a data-plane role (see below) |
+| Key Vault Secrets User | read secret **values** | a data-plane role |
+
+The one that trips people up early: **Contributor can do almost everything except grant access to others.** Managing role assignments is reserved for Owner (or the dedicated User Access Administrator role). "I'm Contributor but I can't give my colleague access" is expected, not a bug.
+
+## Where: scope and inheritance
+
+The **where** is a *scope* — the level the assignment applies at. Scopes form a hierarchy, and a role assigned at one level is **inherited by everything beneath it**:
+
+```text
+Management group          (broadest)
+  |
+  +- Subscription
+       |
+       +- Resource group        <- assign here -> applies to every resource inside
+            |
+            +- Resource         (narrowest — least privilege)
+
+A role assigned at any level is inherited by everything below it.
+```
+
+Assigning Contributor at a *resource group* grants it over every resource in that group. Assigning it on a *single resource* grants it there only. The guiding principle is **least privilege**: assign at the narrowest scope that does the job, so an identity can touch only what it must.
+
+## Control plane versus data plane
+
+This is the RBAC trap that catches nearly everyone, so it gets its own section. There are two different kinds of access to a resource:
+
+```text
+Control plane (MANAGE the resource):   create / delete / configure a storage account
+   -> Contributor covers this
+
+Data plane (USE the data inside):       read the actual blobs stored in that account
+   -> needs a DATA role, e.g. Storage Blob Data Reader
+
+Being Contributor does NOT let you read the data. Different plane, different role.
+```
+
+- The **control plane** is managing the resource itself — creating it, deleting it, changing its settings. This goes through Azure Resource Manager, and `Contributor` covers it.
+- The **data plane** is using the data *inside* the resource — reading a blob, fetching a secret, reading a queue message. This needs a **data-plane role** such as `Storage Blob Data Reader` or `Key Vault Secrets User`.
+
+> **The failure to recognise:** "I gave the app Contributor on the storage account but it still gets 403 reading blobs." Contributor is a *control-plane* role — it lets the app manage the account, not read the data in it. Reading blob data needs a *data-plane* role like `Storage Blob Data Reader`. The same split applies to Key Vault, queues, and more. When access to *data* fails despite a management role, the missing piece is almost always a data-plane role.
+
+## The two permission systems, side by side
+
+Now the resolution of the confusion that has run through the series. An app's service principal can hold permissions from **both** systems at once, and they are granted in different places and answer different questions:
+
+| | API permissions (Part 5) | Azure RBAC roles (this part) |
+|---|---|---|
+| Controls | calling an API (Graph, etc.) | managing and using Azure resources |
+| Examples | `Mail.Read`, `User.Read.All` | `Contributor`, `Reader`, `Key Vault Secrets User` |
+| Granted where | the app registration's API permissions, plus consent | the resource's **Access control (IAM)** |
+| Question answered | what APIs may I call? | what Azure resources may I touch? |
+| A background email reader | uses this | — |
+| A deployment pipeline | — | uses this |
+
+Same badge (service principal), two different door systems. An email-reading app uses API permissions; a pipeline that deploys an app uses RBAC. If access is failing, the very first question is *which system* the operation needs — because a missing Graph permission and a missing Azure role look similar (both 403) but are fixed in completely different places.
+
+## How this maps to a deployment pipeline
+
+A pipeline that deploys to Azure — a GitHub Actions workflow publishing to an App Service (Part 11) — is pure RBAC. Its identity (a service principal, ideally authenticated by federated credentials from Part 4) needs a **role assignment** on the target: typically `Contributor` on the App Service, or on the resource group that contains it. It does **not** need any Graph API permission, because it is managing an Azure resource, not calling Graph.
+
+That is the whole reason the deploy scenario and the email scenario felt unrelated: they use the same *kind* of identity through two different *permission systems*. Seeing that they are the same identity, granted differently, is the point where both projects finally click together.
+
+## Where in the portal
+
+Location makes the split obvious once known:
+
+- **API permissions** live on the **app registration** (requested there) and are consented on the **Enterprise application**.
+- **RBAC roles** live on the **resource** — its **Access control (IAM)** blade — or on the resource group or subscription. That is where a role is assigned to a principal, and where existing assignments are reviewed.
+
+Looking for a deploy permission under API permissions (or a Graph permission under IAM) is a common wrong turn; each system has its own home.
+
+## In code
+
+Assigning a role is the who-what-where triple, made literal:
+
+```bash
+# give a service principal the Contributor role, scoped to one resource group:
+az role assignment create \
+  --assignee <clientId-or-objectId> \
+  --role "Contributor" \
+  --scope /subscriptions/<sub-id>/resourceGroups/<rg-name>
+```
+
+`--assignee` is the *who*, `--role` is the *what*, `--scope` is the *where* — the same three pieces from the diagram. Note that RBAC changes can take a short while to propagate, so a freshly assigned role occasionally is not effective for a minute or two.
+
+## Gotchas worth remembering
+
+- **Control plane is not data plane.** A management role like Contributor does not grant access to the data inside a resource; that needs a data-plane role.
+- **Contributor cannot grant roles.** Only Owner (or User Access Administrator) can manage access assignments.
+- **Scope narrowly.** Assign at the smallest scope that works; a role at the subscription level is inherited by everything under it.
+- **RBAC is not API permissions.** A deploy needs an Azure role; a Graph call needs an API permission. Same 403 symptom, different fix and different place.
+- **Assignments can take a moment to propagate.** A brand-new role assignment may not take effect instantly.
+
+## The one idea to hold onto
+
+> Azure RBAC controls access to Azure **resources**, and every grant is a triple: a **principal** (who) gets a **role** (what) at a **scope** (where), inherited downward. `Contributor` manages a resource but does not read its data — that needs a data-plane role. RBAC is a *separate system* from the API permissions of Part 5: same service principal, different doors. A deployment pipeline uses RBAC; a Graph-calling app uses API permissions.
+
+## What comes next
+
+Both permission systems are now covered — but a permission is only useful once the app actually holds proof it may act. **Part 7** goes to the protocol underneath everything: **OAuth 2.0 and tokens**. It traces the client-credentials flow step by step — credential in, token out, token used — explains the `.default` scope, and shows how to decode a token and read its claims, where the permissions from Parts 5 and 6 finally become visible as concrete data.

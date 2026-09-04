@@ -1,0 +1,137 @@
+---
+title: "App registration vs service principal: blueprint and identity"
+date: 2026-09-03
+status: written
+minutes: 13
+order: 3
+lead: 'An app registration is the blueprint of an application; a service principal is the actual identity that lives in a tenant and holds permissions. One is the badge design, the other is the issued badge. For a single-tenant app they feel like one thing — which is exactly why they confuse everyone. This part separates them for good.'
+---
+
+Inside a tenant (Part 2) sit the app identities. But an app's identity is really *two* related objects, and conflating them is the single most common stumbling block in Azure identity. This part separates them once and for all — because once the split is clear, single-tenant, multi-tenant, and permission-granting all suddenly make sense.
+
+## The distinction: blueprint versus instance
+
+There are two objects, with two jobs:
+
+- An **app registration** is the **definition** of an application — its blueprint. It says "an app called X exists, here is its ID, here are its credentials, here is what it wants to do." It lives in the tenant where it was created (its *home* tenant).
+- A **service principal** is the **identity instance** of that app *inside a specific tenant* — the concrete thing that actually holds permissions, gets role assignments, and receives tokens.
+
+<Diagram title="One blueprint, one identity per tenant">
+  <DiagramRow>
+    <DiagramNode title="App registration" sub="the blueprint (home tenant)" />
+    <DiagramArrow label="instantiated as" />
+    <DiagramNode title="Service principal" sub="the identity (per tenant)" />
+  </DiagramRow>
+</Diagram>
+
+If the class-versus-object idea from programming is familiar, it maps exactly: the **app registration is the class** (the definition), and the **service principal is an object** (an instance created from it). In the badge analogy: the app registration is the *badge design*, and the service principal is an *actual issued badge* that opens real doors.
+
+## Why two objects at all?
+
+The split exists so one application can work across **multiple tenants**. A single app registration — one blueprint — can be instantiated as a separate service principal in each tenant that uses it:
+
+```text
+App registration  (defined once, in the home tenant)
+   |
+   +-- Service principal in the home tenant      (created automatically)
+   +-- Service principal in customer A's tenant  (created when A adds the app)
+   +-- Service principal in customer B's tenant  (created when B adds the app)
+
+One blueprint, many per-tenant identities. Each service principal holds the
+permissions granted in ITS OWN tenant.
+```
+
+This is why a SaaS product can be built once and used by many organizations: the vendor maintains one app registration, and every customer organization gets its own service principal — its own local identity with its own locally granted permissions. Separating "the definition" from "the per-tenant identity" is what makes that possible.
+
+## Why they feel like one thing
+
+For a single-tenant app — most internal work — the two objects feel like one, and here is why: creating an app registration **automatically creates a service principal for it in the same tenant**. There is exactly one of each, in one tenant, sharing one `ClientId`. Nothing in the everyday experience forces them apart.
+
+So the conflation is understandable. It only becomes a problem when something asks specifically about the service principal (granting it a role, disabling it) and the distinction suddenly matters. Knowing that the single-tenant case is "one registration + one auto-created service principal" is usually enough to stay oriented.
+
+## What is in an app registration
+
+The app registration holds the app's *definition* — everything about what the app is and wants:
+
+- **Overview** — the `Application (client) ID` (the `ClientId`) and the home `TenantId`.
+- **Certificates and secrets** — the credentials the app uses to prove itself (Part 4), and their expiry dates.
+- **API permissions** — the permissions the app *requests*, such as `Mail.Read` (Part 5).
+- **Authentication** — redirect URIs, and whether the app is single- or multi-tenant.
+- **Expose an API / App roles** — used when the app itself is a resource others call, or defines its own roles.
+
+Think of all of this as design-time configuration: what the app is, what credentials it carries, and what it would like to be allowed to do.
+
+## What a service principal holds and does
+
+The service principal is the *runtime identity*. It is the object that actually participates in authentication and authorization:
+
+- It **holds the granted permissions** — when an admin consents to `Mail.Read`, that grant attaches to the service principal, not the registration.
+- It **holds role assignments** — when the app is given an Azure role like `Contributor` (Part 6), that assignment targets the service principal.
+- It is **what tokens are issued to** — a token represents the service principal acting in its tenant.
+- It can be **enabled or disabled** to switch the identity on or off in that tenant.
+
+In short: the registration *describes* the app; the service principal *is* the app, as an actor inside a tenant.
+
+## The portal trap: two blades, one app
+
+This causes real confusion, so it is worth stating directly. In the Entra portal the same app appears under **two different blades**:
+
+- **App registrations** — shows the app **registration** (the blueprint). This is where credentials and requested permissions are managed.
+- **Enterprise applications** — shows the **service principal** (the identity). This is where consent, sign-in activity, and enabling/disabling live.
+
+Searching one blade and not finding what is expected is common — role assignments and consent live on the Enterprise applications (service principal) side, while secrets and requested permissions live on the App registrations side. Same app, two views, split by which object owns the setting.
+
+## The IDs: ClientId versus object IDs
+
+There is more than one GUID in play, which adds to the confusion. Knowing which is which keeps it manageable:
+
+| ID | Belongs to | Used for |
+|---|---|---|
+| Application (client) ID | shared — the app's global id | code and configuration: "which app is this?" |
+| App registration Object ID | the registration | managing the registration via the API |
+| Service principal Object ID | the service principal | role assignments and some directory operations |
+
+The **`Application (client) ID`** is the one that goes into code (it is the `ClientId`), and it is the *same* across the registration and every service principal made from it. The two **Object IDs** are different GUIDs for the two different objects — needed occasionally for administrative or scripting tasks, but not for everyday authentication.
+
+## Managed identity is a service principal too
+
+A forward pointer that ties things together: a **managed identity** (Part 8) is a special kind of service principal that Azure creates and manages automatically, with no app registration to maintain and no secret to handle. That it is "just a service principal underneath" is why it can hold role assignments and receive tokens exactly like the app identities here — same runtime identity object, created a different way.
+
+## In code
+
+Only the `ClientId` appears directly; the service principal is implied:
+
+```csharp
+var app = ConfidentialClientApplicationBuilder
+    .Create(clientId)          // clientId = the app registration's Application (client) ID
+    .WithClientSecret(clientSecret)
+    .WithAuthority(authority)  // targets a specific tenant (Part 2)
+    .Build();
+
+// The token returned is issued to the SERVICE PRINCIPAL in that tenant,
+// carrying the permissions granted to that service principal.
+```
+
+From the command line, creating the app can create both objects (and a credential and role) in one step:
+
+```bash
+# creates an app registration, its service principal, a secret, and a role assignment:
+az ad sp create-for-rbac --name "my-app"
+```
+
+The name of that command is itself the lesson: it creates a *service principal* (the identity) for an app registration, because the service principal is the thing that gets a role and does the work.
+
+## Gotchas worth remembering
+
+- **Permissions and roles attach to the service principal.** Granting consent or an Azure role targets the Enterprise application (service principal), not the App registration — a frequent "I granted it but it still fails" cause is editing the wrong object.
+- **Two blades, one app.** Look under App registrations for secrets and requested permissions; under Enterprise applications for consent, role assignments, and enable/disable.
+- **`ClientId` is shared; object IDs are not.** Use the Application (client) ID in code; the object IDs are separate GUIDs for admin tasks.
+- **Deleting the registration removes the app everywhere.** The registration is the source of truth; delete it and the service principals derived from it stop working.
+
+## The one idea to hold onto
+
+> An **app registration** is the blueprint of an application (the class, the badge design), living in its home tenant. A **service principal** is the identity instance of that app inside a tenant (the object, the issued badge) — the thing that holds permissions, takes role assignments, and receives tokens. Single-tenant apps have one of each and feel unified; multi-tenant apps have one registration and a service principal per tenant. Permissions always attach to the service principal.
+
+## What comes next
+
+An app now has an identity — but it still has to *prove* it is that identity. **Part 4** covers credentials: the **client secret** (a password for an app, with an expiry that causes real outages), **certificates** (a stronger alternative), and **federated credentials** (the modern, secretless way, where no credential is stored at all). It is the "PIN on the badge," and the choices here shape everything about how securely an app authenticates.

@@ -1,0 +1,133 @@
+---
+title: "Tenants: the directory every identity lives in"
+date: 2026-09-04
+status: written
+minutes: 12
+order: 2
+lead: 'A tenant is an isolated directory in Entra — the building from the badge analogy — that holds every identity an organization owns: users, groups, and apps. Authentication always targets a specific tenant by its GUID, which is why this is the container everything else lives in.'
+---
+
+Part 1 established that identities live in Entra ID, separate from the Azure platform where code runs. This part zooms into Entra and asks: *where exactly does an identity live?* The answer is a **tenant** — the "building" from the badge analogy. Everything in the rest of the series exists inside one, so it is the right place to start building from the bottom.
+
+## What a tenant is
+
+A **tenant** is one organization's own isolated directory inside Entra. When an organization signs up for a Microsoft cloud service, it gets a tenant: a dedicated space that holds every identity that organization owns — its users, its groups, and the app identities it creates.
+
+"Directory" is the key word. A tenant is essentially a **database of identities and their relationships** — who exists, which groups they belong to, which apps are registered, and what each is allowed to do. When Part 1 said identities live in Entra, this is where: in a tenant's directory.
+
+## What lives in a tenant
+
+Nearly everything the rest of this series talks about is an entry in some tenant's directory:
+
+```text
+Tenant  (one organization's directory, identified by a GUID = TenantId)
+|
++- Users              people: alice@example.com, bob@example.com
++- Groups             collections of users: Engineering, Admins
++- App registrations  the blueprints of the org's applications
++- Service principals the app identities that actually hold permissions
++- Enterprise apps    apps from elsewhere that have been added to this tenant
+```
+
+Users are human identities; app registrations and service principals are workload identities (Part 1). All of them sit inside the one tenant. That co-location is what makes the tenant matter so much: things in the same tenant can be connected to each other, and things in different tenants are walled off.
+
+## How a tenant is identified
+
+A tenant has more than one name, and it helps to know which is which:
+
+| Identifier | Example | Notes |
+|---|---|---|
+| Tenant ID (a GUID) | `8f9a1c2d-...-...` | globally unique, never changes — the canonical id |
+| Default domain | `example.onmicrosoft.com` | created automatically with the tenant |
+| Custom domain | `example.com` | a real domain, verified and added later |
+
+The **`TenantId`** GUID is the identifier that appears in code and configuration. The domains are human-friendly aliases for the same tenant — a custom domain like `example.com` is just a verified label pointing at the same directory the GUID identifies.
+
+## Isolation: the security boundary
+
+A tenant is a hard **security boundary**. Identities in one tenant cannot see or touch resources in another tenant by default. An app registered in `example.com` has no reach into `othercompany.com`, and a user in one has no standing in the other.
+
+This isolation is deliberate and strong — it is what lets thousands of organizations share the same Microsoft cloud without leaking into each other. Crossing the boundary is possible but always explicit: inviting an outside user as a **guest** (B2B collaboration), or publishing an app as **multi-tenant** so other organizations can add it. Nothing crosses tenants by accident.
+
+## Authenticating always targets a tenant
+
+Because identities live in a tenant, authentication is always aimed *at* a specific tenant. The app effectively says "check my credential against this directory." In code, the tenant appears in the **authority URL**:
+
+<Diagram title="Authenticating always targets a specific tenant">
+  <DiagramRow>
+    <DiagramNode title="your app" sub="clientId + credential" />
+    <DiagramArrow label="authenticate against" />
+    <DiagramNode title="a tenant" sub="TenantId in the authority" />
+  </DiagramRow>
+</Diagram>
+
+```csharp
+var authority = $"https://login.microsoftonline.com/{tenantId}";
+
+var app = ConfidentialClientApplicationBuilder
+    .Create(clientId)
+    .WithClientSecret(clientSecret)
+    .WithAuthority(authority)   // "authenticate against THIS directory"
+    .Build();
+```
+
+That authority URL is why `TenantId` shows up in identity code at all: it tells the login service *which directory* to look in for the app and its permissions. Point it at the wrong tenant and authentication fails, because the app does not exist there.
+
+## Why one app reaches many resources in the same tenant
+
+Here is the practical payoff, and the thing that confuses newcomers. A single app identity, once it has a permission, can reach *every* matching resource **in its own tenant** — no new credentials per resource.
+
+```csharp
+// same app, same tenant, same credential -> different resources, no new setup
+graph.Users["alice@example.com"].Messages;   // one mailbox
+graph.Users["bob@example.com"].Messages;      // another mailbox
+```
+
+Both mailboxes are rooms in the same building, and the app is holding a building badge. The tenant is what they share, so one identity spans all of them. This is exactly why adding a second resource of the same kind (another mailbox, another storage account) needs no additional `ClientId`, `TenantId`, or secret — only the permission, which was already granted at the tenant level.
+
+## Single-tenant versus multi-tenant apps
+
+An app registration declares who is allowed to use it, which is where single- and multi-tenant come in:
+
+| | Single-tenant | Multi-tenant |
+|---|---|---|
+| Who can use the app | only its home tenant | many organizations' tenants |
+| Service principal exists in | just the home tenant | each tenant that adds it |
+| Typical use | internal apps, jobs, pipelines | SaaS products sold to other orgs |
+| Authority typically uses | the specific `TenantId` | `organizations` or `common` |
+
+Most apps written for one organization are **single-tenant** — they exist and work only in their home tenant, and the authority is that tenant's GUID. **Multi-tenant** apps are built to be used by *other* organizations; when another org's admin adds the app, a service principal for it is created in *their* tenant (the app registration is shared, the identity is per-tenant — the subject of Part 3).
+
+For multi-tenant scenarios, special authority values replace a specific GUID:
+
+```csharp
+// instead of a specific tenant GUID, the authority can be:
+//   .../organizations   any work or school tenant
+//   .../common          any work/school OR personal Microsoft account
+//   .../consumers       personal Microsoft accounts only
+```
+
+For a single-tenant app — most internal work — always use the specific `TenantId`, which is both more secure and less ambiguous.
+
+## Tenant types, in brief
+
+One more distinction to be aware of, though it rarely matters day to day. The tenant described here is a **workforce tenant** — for an organization's own employees and apps. There is also a separate kind, an **external tenant** (Entra External ID, formerly Azure AD B2C), built to hold an app's *customers* as identities rather than employees. Same core idea — an isolated directory — aimed at a different population. For internal apps and automation, the workforce tenant is the one in play.
+
+## Finding your tenant
+
+In the Entra portal, the tenant's **Overview** page shows its `TenantId` (GUID), its default `onmicrosoft.com` domain, and any verified custom domains. That GUID is the value that goes into an app's authority or configuration. It is worth locating once so that "which tenant am I in?" is never a mystery later.
+
+## Gotchas worth remembering
+
+- **The wrong `TenantId` fails authentication.** If the authority points at a tenant where the app is not registered, login fails before any permission is even checked.
+- **Domain or GUID both work, GUID is safest.** The authority accepts the tenant's domain or its GUID; the GUID is unambiguous and does not change if domains are added or removed.
+- **`common` is not a tenant.** It is a placeholder meaning "figure out the tenant from who signs in" — fine for multi-tenant apps, wrong for a single-tenant workload that should target one specific directory.
+- **Isolation is real.** If an app needs to reach another organization's resources, that is a deliberate multi-tenant or guest setup, never an accident of configuration.
+
+## The one idea to hold onto
+
+> A tenant is one organization's isolated directory in Entra — the building. Every user, group, app registration, and service principal lives inside one, identified by a `TenantId` GUID. Authentication always targets a specific tenant, and an identity's reach stops at its tenant's walls, which is exactly why one app with one credential can serve every matching resource in that tenant and none outside it.
+
+## What comes next
+
+Inside the tenant sit the app identities themselves. **Part 3** unpacks the pair that confuses almost everyone: the **app registration** (the blueprint of an application, the same in every tenant) versus the **service principal** (the actual identity instance inside a tenant that holds permissions). It is the badge-versus-blueprint distinction, and getting it straight makes single-tenant, multi-tenant, and permission-granting all fall into place.

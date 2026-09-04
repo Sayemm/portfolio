@@ -1,0 +1,137 @@
+---
+title: "Why software needs an identity, and why Azure is not Entra"
+date: 2026-09-04
+status: written
+minutes: 12
+order: 1
+lead: 'Software needs an identity, exactly like a person does — it has to prove who it is and what it is allowed to do, without ever typing a password. This first part builds that mental model, separates authentication from authorization, and clears up the most common confusion of all: Azure is not Entra. Everything else in the series builds on this.'
+---
+
+This is the first part of a bottom-up series on Azure identity. It starts here, with no jargon, because every confusing term later — app registration, service principal, tenant, token, RBAC — exists to solve one problem introduced in this part. Get the mental model straight and the rest is detail hanging off it.
+
+The ideas here are also deliberately generic. They are framed around Microsoft's tools, but the same concepts — identities, authentication, authorization, tokens — apply to Google Cloud, AWS, Okta, and any modern system. Learning them once transfers everywhere.
+
+## The one idea: software needs an identity
+
+A person proves who they are by logging in — a username, a password, maybe a code from their phone. Software cannot do any of that. A running program cannot type a password or tap "approve" on a prompt. Yet it constantly needs to do things that require permission: read a database, send an email, deploy to a server.
+
+So software is given an **identity** of its own — a way to prove, without a human present, "I am this particular application, and I am allowed to do this." Every term in this series is part of the machinery that makes that possible.
+
+> **Hold onto this one sentence:** whenever a term feels arbitrary later, ask *"how does this help a piece of code prove who it is and what it may do?"* Tenant, app registration, secret, token, role — each is an answer to that single question. If a term does not seem to fit, that is the layer to slow down on.
+
+## Every identity answers two questions
+
+Identity splits into two separate questions, and keeping them apart prevents most confusion down the line:
+
+<Diagram title="Every identity answers two questions">
+  <DiagramRow>
+    <DiagramNode title="Who are you?" sub="authentication" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="What may you do?" sub="authorization" />
+  </DiagramRow>
+</Diagram>
+
+- **Authentication** (often shortened to *authn*) — proving *who* you are. For a person, logging in. For an app, presenting its credential.
+- **Authorization** (*authz*) — deciding *what* you are allowed to do once your identity is known. For a person, "you can view this file but not delete it." For an app, "this app may read mail but not send it."
+
+| | Authentication (authn) | Authorization (authz) |
+|---|---|---|
+| The question | who are you? | what may you do? |
+| Happens | first | after authentication |
+| For a person | log in with a password | granted access to specific files |
+| For an app | present a credential | granted specific permissions |
+| Fails with | "I do not know who you are" (401) | "I know you, but you cannot do that" (403) |
+
+That last row is worth remembering now: a **401** means authentication failed (unknown identity), a **403** means authorization failed (known identity, not allowed). Telling those two apart is half of all debugging in this space, and the series returns to it at the end.
+
+## The badge analogy
+
+One analogy maps cleanly onto every real term, so it is worth memorising up front. Think of an office building with badge access:
+
+| Concept | Badge analogy | Shows up later as |
+|---|---|---|
+| Directory / tenant | the building | `TenantId` |
+| App registration | the badge itself | `ClientId` |
+| Credential | the PIN on the badge | `ClientSecret` (or a certificate) |
+| Permission / role | which doors the badge opens | `Mail.Read`, `Contributor` |
+| Target resource | the specific room you enter | a mailbox, a web app, a database |
+
+Every later part fills in one row of this table. When the vocabulary gets thick, come back here.
+
+## Human identities and workload identities
+
+There are two kinds of identity, and the industry has names for them:
+
+- A **human identity** (a *user*) — a person, who logs in interactively.
+- A **workload identity** — a piece of software: an app, a service, a script, an automated job. It authenticates with a stored credential, not a live login.
+
+Both live in the same identity system and get permissions the same way. The difference is only *how they prove who they are* — a human types a password, a workload presents a credential it was given.
+
+| | Human identity (user) | Workload identity (app/service) |
+|---|---|---|
+| Who it represents | a person | a program |
+| Proves identity by | interactive login, password, MFA | a stored credential or an injected identity |
+| Needs a human present? | yes | no |
+| Example | you signing into a portal | a background job reading data |
+
+Almost everything in this series is about **workload identity** — how to give a program its own identity so it can act on its own, with no user involved. That is exactly what a deployment pipeline or a background email reader needs.
+
+## Azure versus Entra ID
+
+Now the single most common point of confusion, and it is worth being blunt about: **Azure and Entra ID are two different products.** People talk about them as one thing, but they do different jobs.
+
+<Diagram title="Two different products, often confused">
+  <DiagramRow>
+    <DiagramNode title="Azure" sub="the platform: where code and data live" />
+    <DiagramArrow label="relies on" />
+    <DiagramNode title="Entra ID" sub="the identity service: who can do what" />
+  </DiagramRow>
+</Diagram>
+
+- **Azure** is the **cloud platform** — the place where code and data live. Virtual machines, App Service, Functions, Storage, databases, Key Vault. When something *runs* or is *stored*, that is Azure.
+- **Microsoft Entra ID** is the **identity service** — the place where identities and their permissions live. Users, groups, app registrations, roles. When the question is *who is allowed to do what*, that is Entra.
+
+One naming note that trips up everyone reading older material: **Entra ID was called Azure Active Directory (Azure AD, or AAD) until 2023.** They are the same product, renamed. Documentation, library names (`Azure.Identity`, `Microsoft.Identity.*`), and error messages still say "Azure AD" all over the place — mentally substitute "Entra ID."
+
+## Where things actually live
+
+The clean way to hold the split: **an app runs in Azure, but its identity lives in Entra.**
+
+Deploying a web app, creating a Function, provisioning a database — those touch **Azure**, because they are about running and storing things. Defining an app's identity, granting it permission to read data, deciding who may deploy — those touch **Entra**, because they are about who-can-do-what.
+
+In code, an app's identity usually shows up as a small set of values, which map straight onto the badge analogy:
+
+```csharp
+var tenantId     = "...";   // which directory  -> the building
+var clientId     = "...";   // which app        -> the badge
+var clientSecret = "...";   // the credential   -> the PIN on the badge
+```
+
+Those three values are enough for a program to prove "I am this app, in this directory." How they are used — and how to avoid storing that secret at all — is the substance of the parts that follow.
+
+## This pattern is not Azure-specific
+
+Worth knowing early, so the learning transfers: Entra is an **identity provider** (an *IdP*) — a system that authenticates identities and issues proof of who they are. The whole shape of this — an identity provider, credentials, permissions, and short-lived **tokens** as proof — is an industry standard built on **OAuth 2.0** and **OpenID Connect**, not a Microsoft invention.
+
+Google Cloud, AWS, Okta, Auth0, and countless apps use the same concepts with different names. So the tenant/app-registration/token model learned here is the Microsoft dialect of a language spoken everywhere. Learning it is not learning "an Azure thing" — it is learning how software identity works, with Azure as the concrete example.
+
+## The map of this series
+
+The path from here, each part building on the last:
+
+- **Tenant** — the directory an identity lives in (Part 2).
+- **App registration and service principal** — how an app's identity is defined and instantiated (Part 3).
+- **Credentials** — how an app proves who it is: secrets, certificates, and the secretless options (Part 4).
+- **Permissions** — the two separate systems: API permissions like `Mail.Read` (Part 5) and Azure roles like `Contributor` (Part 6).
+- **OAuth and tokens** — the protocol that turns a credential into proof (Part 7).
+- **Managed Identity** — an identity Azure injects so there is no secret at all (Part 8).
+- **Using it** — calling an API such as Microsoft Graph (Part 9), storing secrets in Key Vault (Part 10), and authenticating a deployment pipeline (Part 11).
+- **Debugging** — the failure modes, ending where this part started: 401 versus 403 (Part 12).
+
+## The one idea to hold onto
+
+> Software needs an identity because it cannot log in like a person. That identity answers two questions — **who are you** (authentication) and **what may you do** (authorization). It lives in an identity service (**Entra ID**), separate from the platform the code runs on (**Azure**). Every later term — tenant, app registration, credential, token, role — is a piece of the machinery that lets a program prove who it is and what it is allowed to do.
+
+## What comes next
+
+**Part 2** starts building the machinery from the bottom: the **tenant** — the isolated directory that an organization's identities live in. It explains what a tenant actually is, why it has a GUID (`TenantId`), the difference between single-tenant and multi-tenant, and why every identity and permission in the series exists *inside* one. It is the "building" from the badge analogy, made concrete.

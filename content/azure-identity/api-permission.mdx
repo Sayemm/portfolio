@@ -1,0 +1,138 @@
+---
+title: "API permissions: delegated versus application"
+date: 2026-09-03
+status: written
+minutes: 14
+order: 5
+lead: 'Once an app can prove who it is, the next question is what it may do. API permissions let an app call an API like Microsoft Graph — and they come in two kinds. Delegated means the app acts as a signed-in user; application means it acts as itself, with no user at all. That single distinction explains why a background app needs no user password.'
+---
+
+Parts 1 to 4 covered *authentication* — proving who an app is. This part starts *authorization* — deciding what it may do. It is also the concept that clears up the confusion at the heart of a background app: why there is no user, no password, and no MFA anywhere in an app that reads data on its own. Get the delegated-versus-application split, and the whole thing makes sense.
+
+## First, there are two permission systems
+
+Before the details, one framing that prevents a lot of confusion later: an app identity can be granted permission through **two entirely separate systems**, and they are not interchangeable.
+
+- **API permissions** — permission to *call an API*, such as Microsoft Graph (reading mail, users, files). This part.
+- **Azure RBAC roles** — permission to *manage Azure resources*, such as deploying to an App Service or reading a Key Vault. That is Part 6.
+
+They live in different places in the portal, are granted differently, and answer different questions ("what APIs may I call?" versus "what Azure resources may I manage?"). Mixing them up is a classic beginner trap. This part is entirely about the first one.
+
+## API permissions: permission to call an API
+
+An **API permission** grants an app the right to call some capability of another API. Microsoft Graph, for example, defines permissions like `Mail.Read`, `User.Read.All`, and `Files.ReadWrite.All`. An app declares which ones it wants under **API permissions** on its app registration.
+
+Each permission is narrow and specific — `Mail.Read` grants reading mail and nothing else. This is the "which doors the badge opens" row of the badge analogy: a permission is one door.
+
+## The split: delegated versus application
+
+Every API permission comes in one of two forms, and this is the distinction that matters most:
+
+<Diagram title="Two ways an app gets API permission">
+  <DiagramRow>
+    <DiagramNode title="Delegated" sub="acts as a signed-in user" />
+    <DiagramArrow label="vs" />
+    <DiagramNode title="Application" sub="acts as itself, no user" />
+  </DiagramRow>
+</Diagram>
+
+- **Delegated** — the app acts *on behalf of a signed-in user*. There is a real person in the flow, and the app can only do what *that user* is allowed to do. Used by interactive, user-facing apps.
+- **Application** (often called *app-only*) — the app acts *as itself*, with **no user present**. Its permission is exactly what was granted, across the whole tenant. Used by background jobs, daemons, services, and automation.
+
+| | Delegated | Application (app-only) |
+|---|---|---|
+| Acts as | a signed-in user | the app itself |
+| User present? | yes | no |
+| Effective permission | app's grant **and** the user's own rights | exactly the app's grant, tenant-wide |
+| Consent | user or admin | admin only |
+| Appears in the token as | `scp` (scopes) | `roles` |
+| Typical use | interactive, user-facing apps | daemons, background jobs, CI, services |
+
+## Effective permissions: why the split matters
+
+The deepest difference is what the permission *actually lets the app touch*. For **delegated**, the effective permission is the **overlap** of two things: what the app was granted, and what the signed-in user can do. For **application**, there is no user to narrow it, so the effective permission is simply the full grant:
+
+```text
+Delegated Mail.Read:
+   what the APP may do (Mail.Read)   AND   what the USER may access
+   -> effective = the overlap: only the mailboxes THIS user can read
+
+Application Mail.Read:
+   what the APP may do (Mail.Read)          (no user in the picture)
+   -> effective = exactly that: EVERY mailbox in the tenant
+```
+
+So the same permission name means very different reach depending on the kind. Delegated `Mail.Read` in a user-facing app reads only the current user's mail; application `Mail.Read` in a background service can read *all* mail in the tenant, because nothing scopes it to a person.
+
+## Why app-only needs no user password
+
+Here is the payoff — the thing that confuses newcomers about a background app. With **application** permissions, there is **no user in the flow at all**. The app authenticates as itself (with its credential from Part 4) and acts under its own granted permission. There is no user to sign in, so:
+
+- no user password is needed (or wanted),
+- no MFA prompt happens,
+- any mailbox address in the code is just *which resource to act on*, not a login.
+
+That is why a background email reader has a `ClientId`, `TenantId`, and a credential, but nowhere for a mailbox password to go — the mailbox address is the *target*, and the app's own identity is the *actor*. If a design seems to be missing "the user's password," the answer is almost always that it is app-only, and there is no user by design.
+
+## Consent: requested is not granted
+
+Listing a permission on the app registration only *requests* it — it does nothing until someone **consents**. Consent is what actually creates the grant, and (tying back to Part 3) the grant attaches to the **service principal**, not the registration.
+
+- **Delegated** permissions can often be consented by the *user* the first time they sign in (just for themselves), or by an admin for the whole tenant.
+- **Application** permissions **always require an admin** to consent, because an app-only permission is tenant-wide and powerful — far too much for a regular user to approve.
+
+Admin consent is the green "Granted for [tenant]" state in the portal. Its absence is a top cause of "I added the permission but calls still fail": the permission was requested but never granted.
+
+> **The failure to recognise:** an app that authenticates fine (it got a token) but is refused when it calls the API — a 403 — usually has an unconsented or missing permission, not a credential problem. Authentication succeeded (Part 4); authorization did not. Check that the permission is present *and* shows admin consent granted.
+
+## In the token: scopes versus roles
+
+The two kinds show up differently inside the access token (which Part 7 covers in full). Delegated permissions appear in a `scp` (scopes) claim; application permissions appear in a `roles` claim. Decoding a token and seeing `Mail.Read` sitting in the `roles` array is the concrete confirmation that an app-only permission is really in effect — a genuinely useful debugging move.
+
+## How to choose
+
+The decision is simple once the split is clear:
+
+- **Is there a signed-in user whose data the app acts on?** Use **delegated** — the app should be limited to what that user can do.
+- **Is the app running on its own — a background job, a scheduled task, a service, a pipeline?** Use **application** — there is no user, and the app acts as itself.
+
+A user-facing web app that shows someone their own mail is delegated. A nightly service that processes many mailboxes is application.
+
+## Scoping app-only permissions
+
+Because application permissions are tenant-wide, a natural worry follows: app-only `Mail.Read` can read *every* mailbox, which is often more than intended. The permission system alone does not narrow it — there is no user to limit it. Restricting an app-only identity to specific resources requires **resource-specific controls** layered on top. For mail, Exchange offers mechanisms to scope an app to particular mailboxes; other services have their own. The key awareness now: app-only is broad by default, and narrowing it is a separate, deliberate step, not something the permission grant does by itself.
+
+## In code
+
+The kind of permission drives how a token is requested. **Application** permissions use the client-credentials flow and the `.default` scope:
+
+```csharp
+// app-only: no user, .default scope, client-credentials flow
+string[] scopes = { "https://graph.microsoft.com/.default" };
+var result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
+// the returned token carries the app's APPLICATION permissions in its "roles" claim
+```
+
+`.default` means "every application permission already consented for this app" (more on it in Part 7). **Delegated** permissions instead name specific scopes and are acquired through a user sign-in flow, not `AcquireTokenForClient`:
+
+```csharp
+// delegated: specific scopes, acquired through a user sign-in flow (not client credentials)
+string[] scopes = { "Mail.Read" };
+// the resulting token carries these in its "scp" claim, limited by the user's own access
+```
+
+## Gotchas worth remembering
+
+- **Requesting is not granting.** Adding a permission does nothing until it is consented; application permissions always need *admin* consent.
+- **A 403 after a successful login is usually a permission problem**, not a credential one — authentication worked, authorization did not.
+- **Do not expect app-only to be self-limiting.** Application `Mail.Read` is tenant-wide; scoping it to specific resources is a separate step.
+- **Delegated is capped by the user.** A delegated permission never grants more than the signed-in user already has, no matter what the app was granted.
+- **These are not Azure roles.** API permissions let an app call an API; they do not let it manage Azure resources — that is the other system, next.
+
+## The one idea to hold onto
+
+> API permissions let an app call an API, in one of two kinds. **Delegated** means the app acts as a signed-in user, limited to that user's own access. **Application** means the app acts as itself, with no user — which is exactly why an app-only workload needs no user password, and why its permission is tenant-wide. Permissions must be *consented*, and application permissions always require an admin.
+
+## What comes next
+
+That was the first permission system — for calling APIs. **Part 6** covers the second, completely separate one: **Azure RBAC roles**, which govern *managing Azure resources* (deploying an app, reading a Key Vault, writing to storage). It explains roles like `Contributor` and `Reader`, the levels at which they can be assigned, and — most importantly — how to keep these straight from the API permissions in this part, since confusing the two is the most common authorization mistake of all.

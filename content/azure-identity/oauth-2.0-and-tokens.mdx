@@ -1,0 +1,158 @@
+---
+title: "OAuth 2.0 and tokens: how permission becomes access"
+date: 2026-09-04
+status: written
+minutes: 15
+order: 7
+lead: 'An app has an identity, a credential, and permissions. OAuth 2.0 is the protocol that turns those into actual access, and the token is the currency. The app trades its credential for a short-lived, signed token, then presents that token to the API on every call. This part traces the client-credentials flow end to end and opens a token up to read the permissions inside it.'
+---
+
+By now an app has an identity (Parts 1 to 3), a way to prove it (Part 4), and permissions (Parts 5 and 6). This part connects them: the protocol that turns "I am this app and I am allowed to do X" into an actual, accepted API call. That protocol is **OAuth 2.0**, and its currency is the **token**. Understanding the token flow is what makes every earlier piece finally do something.
+
+## What OAuth 2.0 is
+
+**OAuth 2.0** is an industry-standard protocol for *authorization* — for letting an app obtain access to a resource without the app handling that resource's own credentials. It is not a Microsoft invention; Entra is one implementation of it, the same as Google, Okta, and Auth0. Learning the flow here transfers directly to any of them.
+
+The core idea: an app does not send its credential to the *API* it wants to call. It sends its credential to a trusted **identity provider** (Entra), which hands back a **token** — a short-lived proof of permission. The app then presents that token to the API. The API never sees the app's credential; it only sees, and trusts, the token.
+
+## The token: short-lived signed proof
+
+A **token** (specifically an *access token*) is a small, signed string that says "the bearer of this is allowed to do these things, until this time." Two properties make it work:
+
+- **It is signed** by the identity provider, so the API can verify it is genuine and unaltered.
+- **It is short-lived** — typically about an hour — so a leaked token is only briefly useful.
+
+The app gets one, uses it on API calls until it nears expiry, then gets a fresh one. That is the whole rhythm.
+
+## The client-credentials flow, step by step
+
+For an app acting as itself (application permissions, Part 5), the relevant OAuth flow is **client credentials**. It has four steps:
+
+```text
+1. App -> Entra:  "here is my ClientId + credential; I want a token for <resource>/.default"
+2. Entra -> App:  validates the credential and consented permissions,
+                  returns a signed JWT access token (valid ~1 hour)
+3. App -> API:    sends the token in the header  ->  Authorization: Bearer <token>
+4. API:           checks the signature, audience, and expiry,
+                  reads the permission claims, allows or denies
+```
+
+Split into two phases — get the token, then use it:
+
+<Diagram title="Credential in, token out, token used">
+  <DiagramRow>
+    <DiagramNode title="app" sub="ClientId + credential" />
+    <DiagramArrow label="credential -> token" />
+    <DiagramNode title="Entra" sub="issues a signed token" />
+  </DiagramRow>
+  <DiagramArrow down label="the app then carries the token" align="start" />
+  <DiagramRow>
+    <DiagramNode title="app" sub="holds the token" />
+    <DiagramArrow label="Bearer token" />
+    <DiagramNode title="API" sub="validates and allows" />
+  </DiagramRow>
+</Diagram>
+
+Client credentials is the flow for app-only workloads. Other OAuth flows exist for other situations — the *authorization code* flow for interactive user sign-in (delegated), *on-behalf-of* for an API calling another API as the user, *device code* for input-limited devices — but for a background app acting as itself, client credentials is the one.
+
+## What is inside a token
+
+A token is a **JWT** (JSON Web Token). It has three parts separated by dots:
+
+```text
+A JWT:   header . payload . signature
+            |        |          |
+       algorithm   claims    proof it was signed by Entra
+                   (aud, iss, tid, appid, exp, roles / scp)
+```
+
+The **payload** is just Base64-encoded JSON — a set of **claims** describing the token. The most useful ones:
+
+| Claim | Meaning |
+|---|---|
+| `iss` | issuer — who created the token (Entra, for a specific tenant) |
+| `aud` | audience — which API the token is for |
+| `tid` | tenant id |
+| `appid` | the app's ClientId |
+| `exp` | expiry time |
+| `roles` | **application** permissions (app-only) |
+| `scp` | **delegated** scopes (acting as a user) |
+
+The single most clarifying exercise in this whole series: acquire a token and paste it into **jwt.ms**. Reading `Mail.Read` sitting inside the `roles` array makes every abstraction from Parts 5 and 6 concrete — the permission is not a setting somewhere, it is *data carried in the token*, and that is exactly what the API reads to decide.
+
+## How the API trusts it
+
+The API accepts a token without ever contacting the app, because of the signature. Entra signs each token with a private key and publishes the matching public keys. When a token arrives, the API:
+
+- verifies the **signature** against Entra's public keys (proving Entra issued it and it was not tampered with),
+- checks the **audience** (`aud`) is itself — a token for one API must not be accepted by another,
+- checks the **issuer** (`iss`) is a trusted tenant,
+- checks it has not **expired** (`exp`).
+
+Only then does it read the `roles`/`scp` claims and decide. This is why tokens cannot be forged and why an app cannot simply grant itself permission — the claims are inside a signed blob it cannot alter.
+
+## Access, ID, and refresh tokens
+
+"Token" is used loosely, but there are three distinct kinds, and mixing them up causes confusion:
+
+| Token | Proves | Used for |
+|---|---|---|
+| Access token | permission to call an API | the Bearer token on API calls — the focus of this part |
+| ID token | who a *user* is | user sign-in (OpenID Connect), not for calling APIs |
+| Refresh token | the right to get new access tokens | renewing access without re-authenticating (user flows) |
+
+For app-only client credentials, only the **access token** matters. There is no ID token (no user to identify) and no refresh token — when the access token expires, the app simply requests a new one with its credential. Refresh tokens exist for *delegated* flows, so a user does not have to sign in again every hour.
+
+## The .default scope
+
+In the flow above, the requested scope is `<resource>/.default` — for Graph, `https://graph.microsoft.com/.default`. For client credentials this special scope means **"every application permission already consented for this app"**, rather than naming individual permissions in the request.
+
+That is the right shape for app-only: the permissions were fixed and admin-consented ahead of time (Part 5), so the token request just asks for "all of them for this resource." Naming individual scopes is a *delegated* pattern; `.default` is the app-only one.
+
+## Token lifetime and caching
+
+An access token lasts roughly an hour. That does **not** mean requesting a new one on every API call — that would be slow and needless. Identity libraries like MSAL **cache** the token and hand back the cached one until it nears expiry, then transparently fetch a fresh one:
+
+```csharp
+string[] scopes = { "https://graph.microsoft.com/.default" };
+AuthenticationResult result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
+// MSAL caches this; calling AcquireTokenForClient again returns the cached token
+// until it is about to expire, then quietly gets a new one
+```
+
+The practical rule: call `AcquireTokenForClient` freely and let the library manage caching and renewal. Do not build custom token-expiry logic; the library already does it correctly.
+
+## Bearer means bearer
+
+The header is `Authorization: Bearer` followed by the token, and "bearer" is literal: **whoever holds the token can use it**, no further proof required, until it expires. That makes a token as sensitive as a credential for its lifetime. So: always send it over HTTPS, never log it, and never put it in a URL. A leaked access token is a temporary skeleton key.
+
+## In code
+
+The two halves — get the token, use the token — are short:
+
+```csharp
+// 1. get a token (client-credentials flow)
+string[] scopes = { "https://graph.microsoft.com/.default" };
+AuthenticationResult result = await app.AcquireTokenForClient(scopes).ExecuteAsync();
+
+// 2. present it on the API call
+request.Headers.Add("Authorization", $"Bearer {result.AccessToken}");
+```
+
+Everything from the earlier parts converges here: the app (Part 3) proves itself with its credential (Part 4), Entra checks its consented permissions (Parts 5 and 6), and the resulting token carries those permissions as claims the API reads. Paste that `result.AccessToken` into jwt.ms once and the whole series becomes visible in one screen.
+
+## Gotchas worth remembering
+
+- **Audience mismatch is a 401.** A token minted for one resource will be rejected by another — the `aud` must match the API being called. Requesting the token for the wrong resource is a common cause.
+- **Expired tokens fail.** Let the library cache and renew; do not reuse a token past its lifetime by hand.
+- **`.default` for app-only, named scopes for delegated.** Requesting individual scopes in a client-credentials call is usually the wrong pattern.
+- **Do not hand-manage tokens.** MSAL caches and refreshes correctly; custom caching tends to introduce bugs.
+- **Protect the token.** It is a bearer credential — HTTPS only, never logged, never in a URL.
+
+## The one idea to hold onto
+
+> OAuth 2.0 turns identity and permission into access through a **token**. In the client-credentials flow, an app trades its credential for a short-lived, signed **JWT access token**, whose claims (`aud`, `roles`/`scp`, `exp`) carry exactly what it may do. The API trusts the token because Entra signed it, checks the audience and expiry, and reads the claims to allow or deny. Use `.default` for app-only, let the library cache the token, and guard it like a credential.
+
+## What comes next
+
+Every credential so far has been something the app stores and manages — a secret, a certificate, or a federated trust. **Part 8** covers the option that removes even that: **Managed Identity**, where Azure creates a service principal for a hosted resource and handles the entire token flow invisibly, so there is no credential in the code at all. It is the cleanest answer to "how does my app authenticate?" for anything running inside Azure.

@@ -1,0 +1,176 @@
+---
+title: "Microsoft Graph: calling the API with the identity you built"
+date: 2026-09-04
+status: written
+minutes: 14
+order: 9
+lead: 'Microsoft Graph is one REST API over all of Microsoft 365 — mail, users, calendar, files — reached with a single token. The fluent SDK looks magical but is really just building URLs. This part shows that mapping, how the token from earlier attaches to each call, and the query and paging details a first Graph integration almost always gets wrong.'
+---
+
+The identity machinery is complete: an app can prove who it is, hold permissions, and get a token. This part spends it — calling an actual API. **Microsoft Graph** is the most common target and the canonical example, so it is where everything from the earlier parts turns into working requests.
+
+## What Microsoft Graph is
+
+**Microsoft Graph** is a single, unified REST API over all of Microsoft 365 — mail, calendar, users, groups, files, Teams, and more. Rather than a separate API per service, there is one endpoint (`https://graph.microsoft.com`) and one kind of token. Learn to call Graph once and the same pattern reaches every Microsoft 365 capability.
+
+## It is just HTTP plus a token
+
+Underneath any SDK, every Graph call is an ordinary HTTP request: a URL, a method, and an `Authorization` header carrying the Bearer token from Part 7. Reading a user's messages is literally:
+
+```text
+GET https://graph.microsoft.com/v1.0/users/alice@example.com/messages
+Authorization: Bearer <access-token>
+```
+
+That is the whole shape. Everything else — the SDK, the query parameters, the paging — is convenience layered on top of this one idea: an HTTP request to a URL, carrying a token.
+
+## The SDK is URL construction
+
+The fluent SDK can look like magic, but it is not. Each `.Something[...]` in the chain adds a segment to a URL, and the final call sends the HTTP request:
+
+<Diagram title="The fluent SDK just builds a URL">
+  <DiagramRow>
+    <DiagramNode title="graph.Users[alice].Messages" sub="fluent code" />
+    <DiagramArrow label="becomes" />
+    <DiagramNode title="GET /users/alice/messages" sub="an HTTP call" />
+  </DiagramRow>
+</Diagram>
+
+So this fluent expression:
+
+```csharp
+graph.Users["alice@example.com"].MailFolders["Inbox"].Messages
+```
+
+is simply building this request:
+
+```text
+GET https://graph.microsoft.com/v1.0/users/alice@example.com/mailFolders/Inbox/messages
+```
+
+Once the SDK is seen as a URL builder, it stops being mysterious. Any Graph documentation is written in terms of URLs, and translating a URL into the fluent chain (or back) is a mechanical step.
+
+## Attaching the token
+
+The SDK attaches the Bearer token automatically through an *authentication provider* built from a credential. The credential is exactly the one from the earlier parts — a client secret, a certificate, or a managed identity:
+
+```csharp
+// the credential from Parts 4 and 8 drives the token acquisition (Part 7)
+var credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+var graph = new GraphServiceClient(credential);
+```
+
+From here, every call the `graph` client makes acquires a token behind the scenes (caching and renewing it per Part 7) and adds the `Authorization: Bearer` header. The whole identity chain converges on this line: the credential proves the app, the token carries its permissions, and the SDK puts that token on each request.
+
+## v1.0 versus beta
+
+Graph has two versions in its URLs: **`v1.0`** is stable and supported for production; **`beta`** is preview — newer features, but subject to change and not for production use. Default to `v1.0` and only reach for `beta` when a needed capability exists nowhere else, knowing it may change.
+
+## Shaping the request: OData query parameters
+
+Graph uses **OData** query parameters to shape what a call returns. They are appended to the URL (and exposed as options in the SDK). The ones worth knowing:
+
+| Parameter | What it does | Example |
+|---|---|---|
+| `$select` | return only the fields you need | `$select=subject,from` |
+| `$filter` | filter which items come back | `$filter=isRead eq false` |
+| `$top` | how many items per page | `$top=50` |
+| `$orderby` | sort the results | `$orderby=receivedDateTime desc` |
+| `$count` | include a total count | `$count=true` |
+| `$expand` | include related data inline | `$expand=attachments` |
+
+The one to build a habit around is **`$select`**. By default Graph returns every field of every object, which can be a large payload; asking for only the fields actually used makes calls faster and lighter. Treat "always `$select` what you need" as a default.
+
+## Paging: the thing first integrations miss
+
+This is the single most common Graph mistake, so it gets its own section. Graph does **not** return all results at once. It returns them in **pages**, and a response includes an **`@odata.nextLink`** if more results exist. To get everything, that link must be followed, repeatedly, until there is no next link:
+
+```text
+GET /users/alice@example.com/messages
+  -> a page of messages, plus an @odata.nextLink (when more exist)
+
+follow the @odata.nextLink
+  -> the next page, plus another @odata.nextLink
+
+repeat until there is no @odata.nextLink  -> all messages retrieved
+```
+
+An integration that reads only the first page silently misses data — it looks like it works, but it only ever sees the first (often 10 or a few dozen) items. The SDK provides a `PageIterator` that follows the links automatically:
+
+```csharp
+var pageIterator = PageIterator<Message, MessageCollectionResponse>
+    .CreatePageIterator(graph, firstPage, message =>
+    {
+        Console.WriteLine(message.Subject);
+        return true;   // return true to keep going, false to stop
+    });
+
+await pageIterator.IterateAsync();   // walks EVERY page, not just the first
+```
+
+> **The failure to recognise:** "my query only returns a handful of results even though there are hundreds." That is almost always unhandled paging — the code read one page and stopped. Follow `@odata.nextLink` (or use `PageIterator`) to retrieve the full set.
+
+## /me versus /users: delegated and application in Graph
+
+Part 5's delegated-versus-application split shows up concretely in Graph, and trips up app-only code. The **`/me`** endpoint means "the currently signed-in user" — it *only works with delegated permissions*, because there has to be a user for "me" to refer to. An **app-only** call has no user, so `/me` fails; it must address a specific user instead:
+
+```csharp
+// delegated (a user is signed in): /me works
+graph.Me.Messages;                          // "the signed-in user's messages"
+
+// application (app-only, no user): /me does NOT work — name the user
+graph.Users["alice@example.com"].Messages;  // "this specific user's messages"
+```
+
+"Why does `/me` throw in my background service?" is a frequent question, and the answer is always the same: app-only has no "me." Address the user explicitly.
+
+## Graph Explorer
+
+For learning and prototyping, **Graph Explorer** (a browser tool) runs Graph calls interactively, signed in as you (delegated). Running `GET /me/messages` there, then adding `$filter=isRead eq false`, shows a query taking shape and returning real data — a fast way to work out a request before writing any code. Just remember it uses *delegated* auth as you, which is a useful contrast to app-only code.
+
+## In code
+
+The full shape, app-only, with selection, filtering, and paging:
+
+```csharp
+var credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+var graph = new GraphServiceClient(credential);
+
+// app-only: address a specific user; shape the request with OData options
+var firstPage = await graph.Users["alice@example.com"].Messages
+    .GetAsync(config =>
+    {
+        config.QueryParameters.Select = new[] { "subject", "from", "receivedDateTime" };
+        config.QueryParameters.Filter = "isRead eq false";
+        config.QueryParameters.Top = 50;
+    });
+
+// follow every page, not just the first
+var iterator = PageIterator<Message, MessageCollectionResponse>
+    .CreatePageIterator(graph, firstPage, m =>
+    {
+        Console.WriteLine(m.Subject);
+        return true;
+    });
+
+await iterator.IterateAsync();
+```
+
+Everything from the series is in these lines: the credential (Parts 4/8) drives the token (Part 7), the app's consented permission (Part 5) is what lets the call succeed, the SDK builds the URL, and paging retrieves the whole result.
+
+## Gotchas worth remembering
+
+- **`/me` fails in app-only.** There is no signed-in user; address `/users/<the user>` explicitly.
+- **Handle paging.** Follow `@odata.nextLink` or use `PageIterator`, or the code silently sees only the first page.
+- **Always `$select`.** Returning every field by default makes calls heavy; request only what is used.
+- **A 403 is a permission problem.** The call authenticated but lacks the needed Graph permission (Part 5) — check it is granted and consented.
+- **Prefer `v1.0`.** Use `beta` only when necessary, aware it can change.
+- **Expect throttling.** Graph can return `429 Too Many Requests` under load; respect the `Retry-After` header and back off.
+
+## The one idea to hold onto
+
+> Microsoft Graph is one HTTP API over Microsoft 365, and the fluent SDK is just a URL builder that attaches the Bearer token automatically. Shape requests with OData (`$select`, `$filter`, `$top`), and always handle paging via `@odata.nextLink`. In app-only code there is no `/me` — address users explicitly. Every earlier part converges on the single call: credential to token to a URL carrying that token.
+
+## What comes next
+
+Graph calls need a credential, and credentials should not live in code or config. **Part 10** covers **Azure Key Vault** — storing secrets, certificates, and keys outside the application, the `--` to `:` naming convention that binds a vault secret to .NET configuration, and the way managed identity (Part 8) lets an app read from Key Vault with no secret of its own. It closes the loop on where credentials belong.

@@ -1,0 +1,130 @@
+---
+title: "Managed Identity: authentication with no credential to manage"
+date: 2026-09-04
+status: written
+minutes: 13
+order: 8
+lead: 'Every credential so far is something the app stores and rotates. Managed identity removes even that: for code running inside Azure, the platform creates an identity, holds its credential, and hands out tokens invisibly, so there is no secret in the code at all. This part covers how it works, the two types, and why it is the recommended default for anything hosted in Azure.'
+---
+
+Part 4 walked up a ladder of credentials — secret, certificate, federated — each stronger than the last, but every one still *something the app manages*. This part covers the option at the top of that ladder for Azure-hosted code: **managed identity**, where there is no credential to store, rotate, or leak, because Azure handles all of it. For anything running inside Azure, this is the cleanest possible answer to "how does my app authenticate?"
+
+## What managed identity is
+
+A **managed identity** is an identity that Azure creates and manages for an Azure-hosted resource — an App Service, a Function, a virtual machine, a Container App. Azure takes care of the entire credential lifecycle: creating it, storing it, rotating it, all invisibly. The app itself never sees, holds, or handles a secret.
+
+The contrast with everything before: a client secret or certificate is a credential *the developer* creates and puts somewhere; a managed identity is a credential *Azure* creates and keeps entirely to itself. The app just gets to say "give me a token" and Azure obliges, having already established who the resource is.
+
+## How it works: Azure injects the identity
+
+The mechanism is simple from the app's side. The Azure hosting platform exposes a **local token endpoint** to the resource. The app asks that endpoint for a token; the platform, which already knows the resource's managed identity, returns one. No `ClientId`, no secret, no authority URL in the code:
+
+<Diagram title="Azure injects the identity, the app just asks for a token">
+  <DiagramRow>
+    <DiagramNode title="your app" sub="running in Azure" />
+    <DiagramArrow label="ask locally" />
+    <DiagramNode title="Azure platform" sub="managed identity" />
+    <DiagramArrow label="token" />
+    <DiagramNode title="a resource" sub="Key Vault, Storage" />
+  </DiagramRow>
+</Diagram>
+
+The Azure SDK does the asking automatically — code uses a credential type (`DefaultAzureCredential` or `ManagedIdentityCredential`) that talks to that local endpoint behind the scenes. From the developer's point of view, authentication just happens, with nothing to configure.
+
+## It is a service principal underneath
+
+Tying back to Part 3: a managed identity is a **special kind of service principal** in the tenant. Azure creates it and owns its credential, but underneath it is the same runtime identity object as any app's service principal. That matters because it means a managed identity works with everything already covered — it can be granted **RBAC roles** (Part 6) and receive **tokens** (Part 7) exactly like any other service principal.
+
+So a managed identity is not a separate, lesser thing. It is a normal service principal whose credential Azure manages for you.
+
+## System-assigned versus user-assigned
+
+There are two kinds, differing in lifecycle and how many resources can share them:
+
+| | System-assigned | User-assigned |
+|---|---|---|
+| Lifecycle | tied to one resource | independent, standalone |
+| Attached to | exactly one resource | one *or many* resources |
+| Created | by enabling it on the resource | created on its own, then attached |
+| Deleted | automatically, with the resource | manually |
+| Best for | a single resource's own identity | one identity shared across resources |
+
+- A **system-assigned** identity is created by flipping it on for a specific resource, and it lives and dies with that resource. One resource, one identity, shared lifecycle.
+- A **user-assigned** identity is a standalone Azure resource created on its own, which can then be attached to many resources. It survives independently, and lets several resources act as the *same* identity — useful when a fleet of services should share one set of permissions.
+
+For a single app, system-assigned is the simplest choice. For several apps that should share an identity, or when the identity must exist before the resource does, user-assigned fits.
+
+## Granting it access
+
+A critical point that catches people: **enabling a managed identity does not, by itself, grant any access.** It creates the identity, nothing more. The identity still has to be *given* permissions the same way any service principal is — most commonly by assigning an **RBAC role** (Part 6) on the target resource.
+
+So making a Function read a Key Vault is two steps: enable the Function's managed identity, then assign that identity a role like `Key Vault Secrets User` on the vault. Skip the second step and the identity exists but is refused everywhere — a 403, because authentication works but authorization was never granted.
+
+## The payoff: no secret, ever
+
+Everything managed identity removes is a real, recurring source of pain:
+
+- **No secret to store** — nothing in configuration, nothing in a repository to leak.
+- **No rotation** — Azure rotates the underlying credential automatically.
+- **No expiry outages** — the class of failure from Part 4 (an expired secret taking down a working app) simply cannot happen.
+
+For code running in Azure, this makes managed identity the recommended default. Reach for a secret or certificate only when managed identity is not available for the scenario.
+
+## Managed identity versus federated credentials
+
+Managed identity and federated credentials (Part 4) share a goal — no stored secret — and differ only in *where the code runs*:
+
+| | Managed identity | Federated credential |
+|---|---|---|
+| For code running | **inside** Azure | **outside** Azure |
+| How identity is proven | Azure injects it into the resource | an external provider (e.g. GitHub) vouches |
+| Example | a Function reading Key Vault | a GitHub Actions workflow deploying |
+| Credential stored | none | none |
+
+Both are the secretless answer; the deciding question is simply whether the workload is Azure-hosted (managed identity) or external (federated credential). A deployment pipeline running on GitHub uses federation; the app it deploys, once running in Azure, uses managed identity.
+
+## Local development: DefaultAzureCredential
+
+There is one catch: a managed identity only exists **inside Azure** — there is no platform to inject it on a local machine. `DefaultAzureCredential` bridges that gap. It tries a chain of credential sources and uses whichever is available: the managed identity when running in Azure, and a developer's local sign-in (from the Azure CLI or an IDE) when running on a laptop.
+
+The result is that the *same code* authenticates correctly in both places, with no branching — managed identity in production, the developer's own identity in development.
+
+## In code
+
+Reading a secret from Key Vault with no stored credential at all:
+
+```csharp
+// no ClientId, no secret. DefaultAzureCredential uses the managed identity in Azure,
+// and falls back to the developer's local sign-in when running on a dev machine.
+var credential = new DefaultAzureCredential();
+
+var client = new SecretClient(
+    new Uri("https://my-vault.vault.azure.net/"),
+    credential);
+
+KeyVaultSecret secret = await client.GetSecretAsync("MySecret");
+```
+
+When a resource has *several* user-assigned identities attached, name the one to use so there is no ambiguity:
+
+```csharp
+var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+{
+    ManagedIdentityClientId = "the-user-assigned-identity-client-id"
+});
+```
+
+## Gotchas worth remembering
+
+- **Enabling an identity is not granting access.** A managed identity with no role assignment can authenticate but is refused everywhere — assign it a role on the target resource.
+- **It only works inside Azure.** Locally, rely on `DefaultAzureCredential`'s fallback to a developer sign-in; a bare `ManagedIdentityCredential` will fail off-Azure.
+- **Name the identity when there are several.** With multiple user-assigned identities, specify which `ClientId` to use, or the token request is ambiguous.
+- **New assignments can take a moment.** A freshly enabled identity or role assignment may need a short time to propagate before it works.
+
+## The one idea to hold onto
+
+> A managed identity is a service principal whose credential **Azure creates and manages**, for a resource running inside Azure — so there is no secret to store, rotate, or leak, and no expiry outage. It still needs roles assigned like any service principal (enabling it grants nothing on its own). It is the secretless option for Azure-hosted code, the sibling of federated credentials for external workloads, and `DefaultAzureCredential` makes the same code work locally too.
+
+## What comes next
+
+The identity machinery is now complete — an app can prove who it is (with or without a stored secret), hold permissions in both systems, and obtain tokens. The remaining parts put it to use. **Part 9** looks at the most common target of all this: **Microsoft Graph**, the unified API over Microsoft 365. It shows how the fluent SDK is really just URL construction, how the token from Part 7 is attached to each call, and the query and paging details that a first Graph integration usually gets wrong.

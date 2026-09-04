@@ -1,0 +1,148 @@
+---
+title: "Failure modes and debugging: 401, 403, and where to look"
+date: 2026-09-04
+status: written
+minutes: 15
+order: 12
+lead: 'When identity breaks, one question sorts almost everything: is it a 401 or a 403? A 401 means authentication failed — the system does not know who you are. A 403 means authorization failed — it knows you, but you are not allowed. This final part uses that fork to route every common failure to the exact layer that fixes it, and closes the series.'
+---
+
+Everything in the series is now built and used. This final part is the one that pays off most in daily work: when something breaks, how to find the cause fast. It returns to where Part 1 began — the split between authentication and authorization — because that single distinction, read straight off the error code, routes almost every failure to the right layer.
+
+## The first question: 401 or 403?
+
+Before anything else, look at the status code. It tells you *which half* of the system failed:
+
+<Diagram title="The first question: 401 or 403?">
+  <DiagramRow>
+    <DiagramNode title="401" sub="authentication failed: who are you?" />
+    <DiagramArrow label="vs" />
+    <DiagramNode title="403" sub="authorization failed: not allowed" />
+  </DiagramRow>
+</Diagram>
+
+- **401 Unauthorized** — *authentication* failed. The system does not know who you are: the token is missing, invalid, expired, or for the wrong audience. The problem is in the **identity, credential, or token** layers (Parts 3, 4, 7).
+- **403 Forbidden** — *authorization* failed. The system knows exactly who you are, but you are not allowed to do this. The identity is valid; it lacks the **permission or role**. The problem is in the **permissions** layers (Parts 5, 6).
+
+Getting this right first saves enormous time. A 401 is never fixed by adding a permission, and a 403 is never fixed by changing a credential. The code points at the half to investigate.
+
+## The diagnostic flow
+
+From the code, narrow to the cause:
+
+```text
+Got an error calling the API or deploying?
+
+  401 Unauthorized  ->  authentication problem (identity / credential / token)
+     - expired or wrong secret?          -> rotate or fix the credential (Part 4)
+     - wrong tenant in the authority?    -> fix the TenantId (Part 2)
+     - token for the wrong resource?     -> fix the scope / audience (Part 7)
+     - no token attached at all?         -> check the Bearer header / auth provider
+
+  403 Forbidden     ->  authorization problem (permissions / roles)
+     - calling an API such as Graph?     -> grant AND consent the permission (Part 5)
+     - managing an Azure resource?       -> assign an RBAC role (Part 6)
+     - reading resource DATA?            -> assign a DATA-plane role (Part 6)
+     - delegated call sees nothing?      -> it is the app-and-user overlap (Part 5)
+```
+
+## Common 401 causes
+
+Authentication failures — the system cannot establish who the caller is:
+
+| Symptom | Likely cause | Fix (layer) |
+|---|---|---|
+| "invalid client secret" error | secret expired or wrong | rotate or correct the secret (Part 4) |
+| "application not found in tenant" | wrong `TenantId` in the authority | fix the tenant (Part 2) |
+| the API rejects the token | audience mismatch — token for the wrong resource | request the token for the right resource `/.default` (Part 7) |
+| 401 with little detail | no token, or an expired token, attached | check token acquisition and the Bearer header (Part 7) |
+
+The most common of all is the **expired client secret** — an app that ran fine for months suddenly returning 401. It is not a code change; the secret lapsed. The medium-term fix is to move off stored secrets entirely (managed identity, Part 8, or federation, Part 4).
+
+## Common 403 causes
+
+Authorization failures — the identity is known but not permitted. This is where the two-permission-systems distinction earns its keep:
+
+| Symptom | Likely cause | Fix (layer) |
+|---|---|---|
+| 403 calling Graph | API permission not granted or not consented | grant it and give admin consent (Part 5) |
+| 403 deploying to Azure | no RBAC role on the target | assign a role on the resource or group (Part 6) |
+| 403 reading blob or secret data | only a control-plane role assigned | assign a **data-plane** role (Part 6) |
+| a delegated call returns nothing | the signed-in user lacks that access | remember the effect is app-and-user overlap (Part 5) |
+
+The trap worth repeating: a 403 when *calling an API* is a missing **API permission** (Part 5); a 403 when *managing or reading an Azure resource* is a missing **RBAC role** (Part 6). Same status code, two completely different fixes in two different places. Ask "which system does this operation use?" before touching anything.
+
+## Read the token to settle it
+
+When the cause is unclear, decode the access token — paste it into **jwt.ms** — and read four claims. This resolves most confusion outright:
+
+| Claim | Check |
+|---|---|
+| `aud` | is the audience the API actually being called? (a mismatch is a 401) |
+| `tid` | is it the expected tenant? |
+| `roles` / `scp` | is the needed permission actually present? (absence explains a 403) |
+| `exp` | has the token expired? |
+
+If the permission the app supposedly has is *not* in the `roles` array, it was never effectively granted — the fix is consent (Part 5), not code. If `aud` is not the target API, the token was requested for the wrong resource (Part 7). The token turns "why is it failing?" into a fact instead of a guess.
+
+## The AADSTS error codes
+
+Entra's authentication errors carry an **`AADSTS`** code and a message. The prefix alone tells you it is an Entra sign-in error; the message usually names the cause. A few common ones:
+
+- **AADSTS7000215** — invalid client secret (expired or wrong).
+- **AADSTS700016** — application not found in the tenant (wrong `TenantId`, or the app is not in that directory).
+- **AADSTS50013** — assertion/credential validation failed (often a certificate or federation issue).
+- **AADSTS70021** — no matching federated identity record (a federated-credential *subject mismatch*, Part 11).
+
+The exact numbers are not worth memorising; the habit is: an `AADSTS` code means look at the *authentication* side, and the accompanying message points at which part.
+
+## Propagation delays
+
+Some failures fix themselves after a short wait, which is genuinely confusing the first time. Newly granted consent, a fresh RBAC role assignment, and a just-created federated credential can each take a moment to take effect. "It started working after a couple of minutes" is a real outcome, not imagination. When a change *should* be correct but is not working yet, waiting briefly and retrying is a legitimate step before deeper digging.
+
+## Federation-specific failures
+
+The deployment scenario (Part 11) has two failure modes worth naming directly:
+
+- **Subject mismatch** — the federated credential's subject does not match what GitHub sends (wrong branch, or an environment credential used from a branch trigger). Sign-in fails; the fix is a federated credential whose subject matches the trigger.
+- **Missing `id-token: write`** — without that workflow permission, GitHub never issues an OIDC token, so `azure/login` has nothing to present. Add the permission.
+
+Both surface at the login step, before any deploy — consistent with the 401-side rule: it is an authentication problem.
+
+## A debugging checklist
+
+When identity fails, in order:
+
+1. **Read the status code.** 401 (authentication) or 403 (authorization)? This chooses the half to investigate.
+2. **For a 401**, check the credential (expired secret?), the tenant, and the token's audience — decode it in jwt.ms.
+3. **For a 403**, decide which permission system the operation uses — an API call (Part 5) or an Azure resource action (Part 6) — and check that permission or role.
+4. **Confirm consent or assignment.** An API permission needs admin consent; an RBAC role needs to be assigned at the right scope, with the right plane (data versus control).
+5. **Wait and retry** if a change was just made — propagation is real.
+6. **Read the AADSTS message** for authentication errors; it usually names the cause.
+
+## The whole series, in one view
+
+Twelve parts, built bottom-up into one system:
+
+- **1** — why software needs an identity, and Azure versus Entra.
+- **2** — the tenant: the directory every identity lives in.
+- **3** — app registration (blueprint) versus service principal (identity).
+- **4** — credentials: secret, certificate, and secretless federation.
+- **5** — API permissions: delegated versus application.
+- **6** — Azure RBAC roles: the other permission system.
+- **7** — OAuth 2.0 and tokens: how permission becomes access.
+- **8** — managed identity: authentication with no credential to manage.
+- **9** — Microsoft Graph: calling an API with the identity built.
+- **10** — Key Vault: where secrets belong.
+- **11** — GitHub Actions to Azure: the same identity, the other permission system.
+- **12** — failure modes: 401, 403, and where to look.
+
+The two real projects — a Graph email reader and a GitHub Actions deployment — are the same identity system throughout, differing only in how they authenticate (secret, managed identity, or federation) and which permission system authorizes them (API permissions or RBAC).
+
+## The one idea to hold onto
+
+> When identity fails, read the status code first. **401 is authentication** — the system does not know who you are; look at the credential, tenant, and token (Parts 2, 3, 4, 7). **403 is authorization** — it knows you but you are not allowed; look at the permission or role, and which of the two systems the operation uses (Parts 5, 6). Decode the token to turn guesses into facts, remember that changes take a moment to propagate, and let the `AADSTS` message point the way. Every failure maps back to a layer of this series.
+
+## Series complete
+
+That is the whole of Azure identity, from "software needs an identity" to diagnosing a 403 in production. The concepts — identities, tenants, credentials, permissions, tokens — are the Microsoft dialect of a language every modern platform speaks, so the understanding built here carries well beyond Azure. The best final exercise is the one from the start: open a real project that uses this, and narrate every line — why the tenant is in the authority, why there is no user password, which permission system each call uses, and why a second resource needs no new credential. When no line feels arbitrary, the system is yours.

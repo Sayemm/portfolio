@@ -114,6 +114,13 @@ export const topics: Topic[] = [
     chip: { bg: "#eae6f0", fg: "#4c3470" },
   },
   {
+    id: "azure-identity",
+    name: "Azure Identity",
+    blurb: "Who is calling, and how the token proving it gets there.",
+    order: 2.8,
+    chip: { bg: "#e3eef0", fg: "#0e5566" },
+  },
+  {
     id: "azure-queue-storage",
     name: "Azure Queue Storage",
     blurb: "Messages, visibility timeouts and at-least-once delivery.",

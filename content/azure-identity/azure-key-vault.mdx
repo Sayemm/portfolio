@@ -1,0 +1,131 @@
+---
+title: "Key Vault: where secrets belong, and how an app reads them"
+date: 2026-09-04
+status: written
+minutes: 13
+order: 10
+lead: 'Secrets must not live in code or config — Key Vault is where they belong instead. It stores secrets, keys, and certificates outside the app, and an app reads them using its own identity, so there is no secret needed to fetch the secrets. This part covers how that works, the access model, and the naming convention that binds a vault secret straight into .NET configuration.'
+---
+
+Part 4 ended with a rule: credentials never belong in source code or config. This part is where they *do* belong — **Azure Key Vault** — and it closes a loop that runs through the whole series, including the neat trick that solves an obvious chicken-and-egg problem: if secrets live in Key Vault, how does the app get in without a secret?
+
+## What Key Vault is
+
+**Azure Key Vault** is a service for storing sensitive material securely, outside the application. It holds three kinds of object:
+
+| Type | Holds | Example |
+|---|---|---|
+| Secret | any sensitive string | a connection string, an API key, a client secret |
+| Key | a cryptographic key | an encryption or signing key (never leaves the vault) |
+| Certificate | an X.509 certificate | the certificate credential from Part 4 |
+
+For most app work, **secrets** are the everyday case — connection strings, API keys, and the client secrets that authenticate other services.
+
+## Why use it
+
+Putting secrets in a vault instead of in code or config files buys several things at once: they stay **out of source control** (no leaked credentials in a repository), they live in **one managed place** that can be rotated and audited, access to them is **controlled by identity** rather than by who can read a file, and every access can be **logged**. It turns "a secret sitting in a config file that anyone with the repo can read" into "a secret only a specific identity may fetch, with a record of every fetch."
+
+## How an app reads from it: its identity is the key
+
+Here is the elegant part. An app does not present a password to Key Vault. It authenticates with its **own identity** — ideally a managed identity (Part 8) — and Key Vault checks whether that identity has permission to read the secret:
+
+<Diagram title="The app's identity is the key to the vault">
+  <DiagramRow>
+    <DiagramNode title="your app" sub="managed identity, no secret" />
+    <DiagramArrow label="authenticates" />
+    <DiagramNode title="Key Vault" sub="checks the role" />
+    <DiagramArrow label="returns" />
+    <DiagramNode title="the secret" sub="e.g. a connection string" />
+  </DiagramRow>
+</Diagram>
+
+The app proves who it is (Parts 4 and 8), the vault authorizes based on that identity (Part 6), and the secret comes back. No secret was needed to obtain the secrets — the *identity itself* is the access.
+
+## The bootstrapping insight
+
+This resolves the obvious objection: "if all my secrets go in Key Vault, what secret does the app use to *reach* Key Vault?" If the answer were "another secret," nothing would be gained — the problem would just move.
+
+The answer is **managed identity**: the app reaches Key Vault with a credential it does not hold and Azure manages invisibly (Part 8). There is no bootstrap secret at all. This is why managed identity and Key Vault are the canonical pairing — together they take an app from "secrets scattered in config" to "no secret stored anywhere," with the platform identity as the only key.
+
+## The access model: RBAC and data-plane roles
+
+Reaching Key Vault is authentication; being *allowed* to read a secret is authorization, and it uses the RBAC system from Part 6. The recommended model grants roles such as:
+
+- **Key Vault Secrets User** — read secret *values* (what an app usually needs),
+- **Key Vault Secrets Officer** — manage secrets (create, update, delete).
+
+These are **data-plane** roles, which is the exact control-plane-versus-data-plane distinction from Part 6. Being `Contributor` on the Key Vault (a *control-plane* role) lets an identity manage the vault resource but **not** read the secrets inside it — reading values needs the data-plane `Key Vault Secrets User` role. "I have access to the vault but get 403 reading a secret" is almost always this: a management role where a data role is needed.
+
+## The .NET configuration integration
+
+The most convenient way to use a vault in .NET is to load its secrets into configuration at startup, where they become ordinary config values indistinguishable from anything in `appsettings.json`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Configuration.AddAzureKeyVault(
+    new Uri("https://my-vault.vault.azure.net/"),
+    new DefaultAzureCredential());   // managed identity in Azure, dev sign-in locally
+
+// vault secrets are now just configuration values:
+string clientId = builder.Configuration["EmailSettings:ClientId"];
+```
+
+There is one naming rule to know, because a secret name cannot contain the colon that .NET config uses for nesting. The convention is that a **double dash (`--`) in a secret name becomes a colon (`:`) in configuration**:
+
+```text
+Key Vault secret name:   EmailSettings--ClientId
+                                       |
+                          --  maps to  :  in .NET configuration
+                                       |
+.NET configuration key:  EmailSettings:ClientId
+```
+
+So a secret stored as `EmailSettings--ClientId` in the vault is read in code as `EmailSettings:ClientId` — a nested config value, sourced transparently from the vault.
+
+## Binding to typed options
+
+Because vault secrets arrive as ordinary configuration, they bind to a strongly-typed options class exactly like any other config — the Options pattern applies unchanged:
+
+```csharp
+// EmailSettings--ClientId, EmailSettings--ClientSecret, etc. in the vault
+// bind straight into a typed options class:
+builder.Services.Configure<EmailOptions>(
+    builder.Configuration.GetSection("EmailSettings"));
+```
+
+The application code that consumes `EmailOptions` neither knows nor cares that the values came from Key Vault rather than a file. Where secrets are stored becomes a deployment concern, fully separated from how the code reads them.
+
+## Direct reads and App Service references
+
+Loading everything into configuration is not the only option. A secret can be fetched directly when needed with a `SecretClient` (the Part 8 example):
+
+```csharp
+var client = new SecretClient(
+    new Uri("https://my-vault.vault.azure.net/"),
+    new DefaultAzureCredential());
+
+KeyVaultSecret secret = await client.GetSecretAsync("MySecret");
+```
+
+And outside code entirely, an **App Service** can reference a vault secret from its own application settings using a Key Vault reference, resolved by the App Service's managed identity — so even the platform configuration holds a pointer, not the secret itself.
+
+## Rotation and versioning
+
+Key Vault keeps **versions** of each secret. Rotating a secret adds a new version rather than overwriting; by default an app reading the secret gets the latest version. This is what makes rotation safe: a new value can be published to the vault, and apps pick it up (on their next read or restart) without a code change. It is the clean answer to the expiring-secret problem from Part 4 — the secret still expires, but it is rotated in one place, not chased across config files.
+
+## Gotchas worth remembering
+
+- **Access must still be granted.** Creating a vault and enabling an identity grants nothing; assign the identity a data-plane role like `Key Vault Secrets User`.
+- **Data role, not management role.** `Contributor` on the vault manages the resource but cannot read secret values — reading needs `Key Vault Secrets User`.
+- **`--` becomes `:`.** Name nested secrets with double dashes so they bind to nested configuration keys.
+- **Config loads at startup.** Secrets pulled into `IConfiguration` are read once at startup by default; picking up a changed secret needs a restart, or an explicitly configured reload.
+- **The vault URL is not a secret.** The vault's address is public information and belongs in normal config — only the *contents* are sensitive. (The same "credential versus address" logic that keeps a client secret in the vault but a resource URL in plain config.)
+
+## The one idea to hold onto
+
+> Key Vault stores secrets, keys, and certificates outside the app, and an app reads them with its **own identity** — no secret needed to fetch the secrets, because managed identity is the way in. Grant the identity a **data-plane role** (`Key Vault Secrets User`), and secrets flow into .NET configuration (with `--` becoming `:`) to bind like any other setting. It is where the credentials from every earlier part are meant to live.
+
+## What comes next
+
+The whole series has built toward two real scenarios; **Part 11** is the second of them: authenticating a **GitHub Actions deployment to Azure**. It pulls together federated credentials (Part 4, no stored secret), the service principal (Part 3), and an RBAC role (Part 6) into a working pipeline that deploys an app to App Service — and shows, finally, that it is the same identity system as the Graph app, used through the other permission system.

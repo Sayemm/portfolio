@@ -1,0 +1,167 @@
+---
+title: "GitHub Actions to Azure: the same identity, the other permission system"
+date: 2026-09-03
+status: written
+minutes: 15
+order: 11
+lead: 'A GitHub Actions workflow that deploys to Azure uses the exact same identity system as everything else — a service principal, authenticated by a federated credential with no stored secret, authorized by an RBAC role. This part builds that pipeline end to end and shows, finally, that the deploy and the Graph app are one identity system used through two different permission systems.'
+---
+
+This part is the second of the two real scenarios the series has built toward: a **GitHub Actions workflow that deploys an app to Azure App Service**. Everything converges here — service principals, federated credentials, RBAC — and the payoff is seeing that this pipeline and the Graph email reader are *the same identity system*, just used through the other permission system.
+
+## The goal
+
+A workflow that, on every push to the main branch, builds the app and deploys it to an Azure App Service — authenticating as a workload identity, ideally with **no stored secret** anywhere in the repository. That "no stored secret" part is the modern standard, and it is entirely achievable with the pieces already covered.
+
+## It is the same identity system
+
+The single most important realisation: deploying to Azure uses the **same identity machinery** as calling Graph, assembled differently:
+
+- the identity is a **service principal** (Part 3),
+- it authenticates with a **federated credential** (Part 4) — no stored secret,
+- it is authorized by an **Azure RBAC role** (Part 6) — *not* a Graph API permission.
+
+The Graph app and the deploy pipeline felt like unrelated topics only because they use different *permission systems* (Part 5 versus Part 6) against different *targets* (the Graph API versus Azure Resource Manager). Underneath, both are a service principal proving itself and being authorized. Once that clicks, the two projects are one.
+
+## Three ways to authenticate a deploy
+
+There are three common approaches, worth knowing in order of how modern and secure they are:
+
+| Option | Stored secret? | Uses a service principal? | Best for |
+|---|---|---|---|
+| Publish profile | yes — a credentials file | no | quick or personal projects |
+| Service principal + secret | yes — a client secret | yes | works everywhere, but the secret expires |
+| OIDC federated credentials | **no** | yes | the recommended modern way |
+
+- A **publish profile** is a credentials file pasted into a GitHub secret. Simple, but it is a stored credential with broad access and no service principal — fine for a personal project, not for anything serious.
+- A **service principal with a client secret** is the same shape as the Graph email app's credentials: store `ClientId`, `TenantId`, and a secret as GitHub secrets and sign in with them. It works everywhere, but it carries the Part 4 problem — the secret expires and must be rotated.
+- **OIDC federated credentials** store nothing. This is the recommended approach, and the rest of this part uses it.
+
+## How OIDC federation works here
+
+This is the federated-credential flow from Part 4, made concrete. GitHub proves the workflow's identity, Entra trusts GitHub, and no secret is stored:
+
+<Diagram title="GitHub vouches, Entra trusts, no secret stored">
+  <DiagramRow>
+    <DiagramNode title="GitHub Actions" sub="issues an OIDC token" />
+    <DiagramArrow label="present it" />
+    <DiagramNode title="Entra" sub="checks federated trust" />
+    <DiagramArrow label="access token" />
+    <DiagramNode title="Azure" sub="deploy the app" />
+  </DiagramRow>
+</Diagram>
+
+Step by step:
+
+```text
+1. A federated credential is configured on the app registration, describing which
+   GitHub identity to trust:
+     issuer:   https://token.actions.githubusercontent.com
+     subject:  repo:my-org/my-repo:ref:refs/heads/main
+     audience: api://AzureADTokenExchange
+
+2. The workflow requests permission to get a GitHub OIDC token (id-token: write).
+
+3. azure/login takes GitHub's OIDC token (no secret) and presents it to Entra.
+   Entra checks it against the federated credential above; if issuer, subject,
+   and audience match, it issues an Azure access token.
+
+4. The following steps (build, deploy) use that Azure access token.
+```
+
+No client secret is created, stored, or rotated. The trust is set up once as a federated credential, and from then on GitHub vouches for the workflow.
+
+## The subject must match
+
+The most common federation failure is a **subject mismatch**. The `subject` in the federated credential must exactly match what GitHub puts in its token, and the format depends on the trigger:
+
+- a branch: `repo:my-org/my-repo:ref:refs/heads/main`
+- a GitHub environment: `repo:my-org/my-repo:environment:production`
+- a pull request: `repo:my-org/my-repo:pull_request`
+
+If the workflow runs on a branch but the federated credential was set up for an environment (or a different branch), the subjects do not match and `azure/login` fails. When federation fails at sign-in, the subject is the first thing to check — and a repo often needs *several* federated credentials, one per trigger it deploys from.
+
+## The RBAC role: authenticated is not authorized
+
+Federation gets the pipeline *signed in*, but signing in grants no access — exactly the lesson from managed identity (Part 8). The service principal still needs an **RBAC role** on the deployment target: typically `Contributor` on the App Service, or on the resource group that contains it (a narrower role like `Website Contributor` is better if it suffices).
+
+Without the role, the pipeline authenticates successfully and then fails the deploy with a **403** — authenticated, but not authorized. Assigning the role (Part 6) is a required, separate step, and forgetting it is a classic "login worked but deploy is forbidden" cause.
+
+## The workflow
+
+Put together, the workflow is short. Note there is **no client secret** anywhere — only the (non-sensitive) IDs, and the `id-token: write` permission that enables OIDC:
+
+```yaml
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write      # REQUIRED: lets the workflow request a GitHub OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to Azure (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: my-web-app
+          package: ./publish
+```
+
+The values stored in GitHub — `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` — are identifiers, not credentials. There is nothing secret to leak. `azure/login` sees no `client-secret` input, so it uses the OIDC flow automatically.
+
+## The setup, end to end
+
+The full pipeline is five pieces, assembled once:
+
+1. **An app registration** (Part 3) — the deploy identity's blueprint, which creates its service principal.
+2. **A federated credential** on that registration (Part 4) — trusting the specific GitHub repo, branch, or environment.
+3. **An RBAC role assignment** (Part 6) — giving the service principal `Contributor` (or narrower) on the App Service or resource group.
+4. **GitHub configuration** — the client, tenant, and subscription IDs stored as repository secrets (identifiers only, no client secret).
+5. **The workflow** — with `id-token: write`, `azure/login`, and a deploy step.
+
+Miss any one and it fails in a recognisable way: no federated credential or a subject mismatch fails at sign-in; no role fails at deploy with a 403; no `id-token: write` fails to get a GitHub token at all.
+
+## The two projects, side by side
+
+Here, at last, is the whole point of the series in one table — the Graph app and the deploy pipeline, revealed as one identity system:
+
+| | Graph email reader | GitHub Actions deploy |
+|---|---|---|
+| Identity | a service principal | a service principal |
+| Authenticated by | client secret or managed identity | OIDC federated credential (no secret) |
+| Authorized by | a **Graph API permission** (`Mail.Read`) | an **Azure RBAC role** (`Contributor`) |
+| Talks to | the Microsoft Graph API | Azure Resource Manager (to deploy) |
+| Permission system | Part 5 | Part 6 |
+
+Same badge. Two different door systems, for two different buildings. Every difference between the projects is a difference in *how the one identity is authenticated and authorized*, not a different system.
+
+## Gotchas worth remembering
+
+- **`id-token: write` is required.** Without that workflow permission, GitHub will not issue an OIDC token and `azure/login` cannot use federation.
+- **Subject mismatch fails sign-in.** The federated credential's subject must match the trigger (branch, environment, or pull request); add one credential per trigger you deploy from.
+- **A role is still needed.** Federation authenticates; it does not authorize. Assign an RBAC role, or the deploy 403s after a successful login.
+- **Prefer OIDC over a stored secret.** If a workflow uses a client secret, it inherits the expiry-and-rotation burden federation removes.
+- **Stored IDs are not secrets.** Client, tenant, and subscription IDs are identifiers; treat the *absence* of a stored client secret as the goal.
+
+## The one idea to hold onto
+
+> Deploying to Azure from GitHub Actions is the same identity system as everything else: a **service principal**, authenticated by an **OIDC federated credential** (no stored secret), authorized by an **RBAC role** on the target. It differs from the Graph app only in the permission system (RBAC, not API permissions) and the target (Azure Resource Manager, not Graph). One identity, two door systems — that is the whole series in a sentence.
+
+## What comes next
+
+Everything is now built and used. The final part, **Part 12**, is the one that pays off most in practice: **failure modes and debugging**. It returns to where Part 1 started — the difference between a 401 (authentication failed) and a 403 (authorization failed) — and walks the common failures across the whole series: expired secrets, missing consent, unassigned roles, subject mismatches, and audience errors, each mapped back to the layer that fixes it.
