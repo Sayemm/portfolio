@@ -68,9 +68,13 @@ Authorization failures — the identity is known but not permitted. This is wher
 | 403 calling Graph | API permission not granted or not consented | grant it and give admin consent (Part 5) |
 | 403 deploying to Azure | no RBAC role on the target | assign a role on the resource or group (Part 6) |
 | 403 reading blob or secret data | only a control-plane role assigned | assign a **data-plane** role (Part 6) |
+| app-only mail call blocked *despite* having `Mail.Read` | mailbox is outside the app's access-policy scope | add the mailbox to the policy's group — Exchange admin (Part 5) |
 | a delegated call returns nothing | the signed-in user lacks that access | remember the effect is app-and-user overlap (Part 5) |
 
 The trap worth repeating: a 403 when *calling an API* is a missing **API permission** (Part 5); a 403 when *managing or reading an Azure resource* is a missing **RBAC role** (Part 6). Same status code, two completely different fixes in two different places. Ask "which system does this operation use?" before touching anything.
+
+There is also a third, sneakier variant on the API side: the permission *is* granted, but a **resource-specific scoping policy** excludes the exact resource being accessed. The clearest example is Exchange mail — an app-only identity with `Mail.Read` that reads one mailbox fine but is blocked on another, with a message about a tenant-configured app-only access policy (an Application Access Policy, or its successor RBAC for Applications). Nothing is wrong with the app, the token, or the permission; the mailbox is simply outside the policy's allowed group. The fix is a tenant-configuration change by an Exchange admin, not anything in the code — the tell-tale sign being that the *same code and token* succeed for one resource and fail for another.
+
 
 ## Read the token to settle it
 
