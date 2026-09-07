@@ -93,6 +93,30 @@ Now the single most common point of confusion, and it is worth being blunt about
 
 One naming note that trips up everyone reading older material: **Entra ID was called Azure Active Directory (Azure AD, or AAD) until 2023.** They are the same product, renamed. Documentation, library names (`Azure.Identity`, `Microsoft.Identity.*`), and error messages still say "Azure AD" all over the place — mentally substitute "Entra ID."
 
+## Microsoft 365, the third piece
+
+There is a third name that gets tangled up with these two: **Microsoft 365** (formerly **Office 365**). It is a *bundle of productivity services people use* — Exchange Online (email and mailboxes), the Office apps, Teams, SharePoint, OneDrive. Where Azure is the platform to *build on* and Entra is *identity*, Microsoft 365 is the *stuff end users work in*.
+
+The three relate like this:
+
+| Product | What it is | Analogy |
+|---|---|---|
+| **Microsoft 365** | productivity services people use (email, Office, Teams) | the offices and equipment people work with |
+| **Azure** | the platform where your code and infrastructure run | the construction yard where you build |
+| **Entra ID** | the identity service — users, sign-in, permissions | the badge/security system for the building |
+
+The connection that matters most: **Microsoft 365 runs on Entra for identity.** The users and groups for M365 live in the *same* Entra tenant. And a practical consequence that trips up every first project — an Entra user has no mailbox by itself; a **mailbox comes from Exchange Online**, which is part of Microsoft 365. So an app can only read a user's mail if that user has an M365 license that provisions a mailbox. No license → no mailbox → nothing to read.
+
+Because these are three products, they have **three admin consoles**, which is why setting things up means moving between sites:
+
+| Console | Address | Manages |
+|---|---|---|
+| Entra admin center | entra.microsoft.com | identities: users, app registrations, permissions |
+| Microsoft 365 admin center | admin.microsoft.com | licenses, users, subscriptions and billing |
+| Exchange admin center | admin.exchange.microsoft.com | mailboxes and mail settings |
+
+Same underlying tenant, three consoles for three concerns. Knowing which console owns which job turns the back-and-forth from confusing into routine: identity in Entra, licenses in the M365 admin center, mailboxes in Exchange.
+
 ## Where things actually live
 
 The clean way to hold the split: **an app runs in Azure, but its identity lives in Entra.**

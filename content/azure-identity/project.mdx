@@ -1,0 +1,171 @@
+---
+title: "The mail-reader project: scoping an app to only the mailboxes it needs"
+date: 2026-09-07
+status: written
+minutes: 11
+order: 13
+lead: 'A followable flow: register an app, give it mail access, find that it can read every mailbox, then scope it down to only the mailboxes it should — with the commands at each step. It ends with why the modern RBAC approach is the better way to do the same thing.'
+---
+
+This is the end-to-end flow for building an app that reads mail with Microsoft Graph, and then restricting *which* mailboxes it can read. It uses placeholder values — replace `APP_CLIENT_ID`, `TENANT_ID`, `yourdomain`, and the mailbox and group names with your own. The portal steps are done in the Entra admin center; the scoping steps are done in Exchange Online PowerShell.
+
+## Step 1 — Create the app registration
+
+In the Entra admin center → **App registrations → New registration** (single tenant). From the app's **Overview**, copy two values:
+
+- **Application (client) ID** → `APP_CLIENT_ID`
+- **Directory (tenant) ID** → `TENANT_ID`
+
+Then **Certificates & secrets → New client secret**, and copy the **Value** immediately (it is shown only once) → `CLIENT_SECRET`.
+
+## Step 2 — Add the API permission
+
+In the app → **API permissions → Add a permission → Microsoft Graph → Application permissions → `Mail.Read`** → Add. Then click **Grant admin consent** and confirm — the `Mail.Read` row turns green (**Granted**).
+
+A `User.Read` (Delegated) permission is already present by default; leave it, it is unused by an app-only workload. The one that matters shows **Type: Application**.
+
+> **Admin consent** is the approval that makes a requested permission actually usable. "Grant admin consent for [org]" means approve the app across the whole tenant, and only an administrator can approve an application permission. Until it is granted, the app authenticates but every mail call returns 403.
+
+## Step 3 — Read mail from code
+
+```csharp
+var tenantId = "TENANT_ID";
+var clientId = "APP_CLIENT_ID";
+var clientSecret = "CLIENT_SECRET";   // from user-secrets or an env var, not hardcoded
+
+string[] mailboxes = { "user1@yourdomain", "user2@yourdomain" };
+
+var credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+var graph = new GraphServiceClient(credential);
+
+foreach (var mailbox in mailboxes)
+{
+    var page = await graph.Users[mailbox].Messages.GetAsync(cfg =>
+    {
+        cfg.QueryParameters.Select = new[] { "subject", "receivedDateTime" };
+        cfg.QueryParameters.Top = 10;
+    });
+
+    foreach (var msg in page?.Value ?? new List<Microsoft.Graph.Models.Message>())
+        Console.WriteLine($"{mailbox}: {msg.Subject}");
+}
+```
+
+Run it and it reads the mailboxes. The app authenticates as itself with the secret and reads mail through Graph — no signed-in user, no mailbox password.
+
+## Step 4 — The problem: it can read every mailbox
+
+The `Mail.Read` **application** permission is **tenant-wide**. There is no user to limit it, so the app can read *any* mailbox in the tenant — put any address in the `mailboxes` array and it works, with no extra permission.
+
+> **This is the risk to fix.** If the app's secret leaks, whoever has it can read all company mail. The permission needs to be narrowed to only the mailboxes the app actually needs.
+
+## Step 5 — Scope it with a group and a policy
+
+> **What Exchange Online is, and why these steps use PowerShell.** Exchange Online is the mail system inside Microsoft 365 — it runs the mailboxes and stores the email. The app reads mail *through Graph*, but the mailboxes *live in Exchange*, and the rule for which mailboxes an app may read is enforced by **Exchange**. That rule has **no button in any portal** — it exists only as Exchange Online PowerShell commands. That is why every scoping step below runs in a PowerShell session, and why this control is so hard to find in the UI: there is no UI for it.
+
+The narrowing has two pieces: a **security group** holding the *allowed* mailboxes, and an **application access policy** that ties the app to that group ("this app may read only mailboxes in this group"). Both are set in Exchange Online PowerShell.
+
+Connect first:
+
+```powershell
+Connect-ExchangeOnline -UserPrincipalName admin@yourdomain
+```
+
+Create the allow-group and the restricting policy:
+
+```powershell
+# the group that will hold the allowed mailboxes
+New-DistributionGroup -Name "MailAppAllowed" -Type Security
+
+# tie the app to that group: it may read only mailboxes inside it
+New-ApplicationAccessPolicy -AppId "APP_CLIENT_ID" -PolicyScopeGroupId "MailAppAllowed@yourdomain" -AccessRight RestrictAccess -Description "Restrict app to allowed mailboxes"
+```
+
+The app is now restricted to whatever is in `MailAppAllowed` — which is currently empty, so it can read nothing.
+
+## Step 6 — A mailbox outside the group is blocked (RAOP)
+
+Any mailbox not in the group is now refused. Graph returns a policy-block error:
+
+```text
+[RAOP] : Blocked by tenant configured AppOnly AccessPolicy settings.
+```
+
+This is expected and correct: the app is scoped to the group, and that mailbox is not in it. Check the policy's verdict for any mailbox without running the app:
+
+```powershell
+Test-ApplicationAccessPolicy -AppId "APP_CLIENT_ID" -Identity user1@yourdomain
+# AccessCheckResult : Denied   (mailbox is outside the group)
+```
+
+> Policy changes can take a short while to take effect on live Graph calls (enforcement lags behind `Test-ApplicationAccessPolicy`), so allow a few minutes before expecting the block or the unblock.
+
+## Step 7 — Grant access by adding the mailbox to the group
+
+To let the app read a mailbox, add that mailbox to the allow-group:
+
+```powershell
+Add-DistributionGroupMember -Identity "MailAppAllowed" -Member user1@yourdomain
+```
+
+Now `user1@yourdomain` is inside the group → allowed. To grant another mailbox, add it too:
+
+```powershell
+Add-DistributionGroupMember -Identity "MailAppAllowed" -Member user2@yourdomain
+```
+
+Adding a mailbox to the group grants the app access to it; removing it revokes access:
+
+```powershell
+Remove-DistributionGroupMember -Identity "MailAppAllowed" -Member user2@yourdomain
+```
+
+So the rule is simple: **the app can read exactly the mailboxes that are members of the group.** Anything not added stays blocked with the RAOP message.
+
+## Step 8 — Seeing the group, its members, and which app is tied to it
+
+Three things to inspect, and where:
+
+**The group itself and its members** — visible in the portal (Entra admin center → **Groups → MailAppAllowed → Members**, or Microsoft 365 admin center → Teams & groups), or in PowerShell:
+
+```powershell
+Get-DistributionGroupMember -Identity "MailAppAllowed"
+```
+
+**Which app is connected to the group** — this link lives *only* in the access policy, and there is **no portal page for it**. List the policies to see it:
+
+```powershell
+Get-ApplicationAccessPolicy
+# ScopeName   : MailAppAllowed          <- the group
+# AppId       : APP_CLIENT_ID           <- the app tied to it
+# AccessRight : RestrictAccess
+```
+
+Read that record as: *app `APP_CLIENT_ID` may access only the `MailAppAllowed` group.* The `AppId` is the app and the `ScopeName` is the group — that single record is the connection between them. Because it has no UI, this is the one piece that is easy to overlook: the group is visible, the app is visible, but the *link* between them is only findable with `Get-ApplicationAccessPolicy`.
+
+## Why RBAC for Applications is the better way
+
+Everything above uses the **Application Access Policy** — a *restrict-rule bolted on top* of a tenant-wide grant. It works, but the modern, recommended replacement is **RBAC for Applications**: grant `Mail.Read` **scoped to the group from the start**, with **no** tenant-wide grant behind it.
+
+The reasons to prefer it:
+
+- **Least privilege by default.** The app is never granted tenant-wide access in the first place; it only ever has the scoped grant.
+- **Smaller blast radius.** If the secret leaks, the app can reach only the scoped mailboxes — there is no broad grant to abuse.
+- **It is the current standard.** The Application Access Policy is legacy and being deprecated; RBAC for Applications is what Microsoft supports going forward.
+
+The shape of it (Exchange Online PowerShell) — remove the tenant-wide consent first, then grant scoped:
+
+```powershell
+# 1. register the app as an Exchange service principal (needs the app's service-principal object id)
+New-ServicePrincipal -AppId "APP_CLIENT_ID" -ObjectId "APP_SP_OBJECT_ID" -DisplayName "MailApp"
+
+# 2. a scope: mailboxes that are members of the allow-group
+New-ManagementScope -Name "MailAppScope" -RecipientRestrictionFilter "MemberOfGroup -eq 'GROUP_DISTINGUISHED_NAME'"
+
+# 3. grant Mail.Read, scoped to that scope
+New-ManagementRoleAssignment -App "APP_SP_OBJECT_ID" -Role "Application Mail.Read" -CustomResourceScope "MailAppScope"
+```
+
+One rule makes this work: **an unscoped tenant-wide grant overrides the scope.** If the app keeps its tenant-wide `Mail.Read` consent *and* gets a scoped RBAC grant, the tenant-wide one wins and scoping does nothing. So for RBAC to truly restrict, remove the tenant-wide `Mail.Read` consent in Entra and let the scoped RBAC grant be the app's only mail access.
+
+Either way, the concept is the same as Steps 5–7: **the app reads only the mailboxes in the group, and granting a new mailbox means adding it to the group.** RBAC is the cleaner, supported way to express that.

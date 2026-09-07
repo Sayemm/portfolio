@@ -1,0 +1,177 @@
+---
+title: "Base constructors: why the compiler makes you call them"
+date: 2026-09-06
+status: written
+minutes: 10
+order: 2.1
+lead: 'The error "there is no argument given that corresponds to the required parameter" when inheriting a class confuses almost everyone. It comes down to one rule: every constructor must call a base-class constructor, and C# calls the parameterless one for you — unless there is not one. This clears it up with a generic example and shows exactly when base(...) is needed, and why.'
+---
+
+Inheriting from a class and hitting *"there is no argument given that corresponds to the required parameter"* is one of the most common early C# stumbles. The message sounds like something is missing from the derived class, but the real cause is a rule about how objects get built. Once that rule is clear, the error — and the fix — become obvious.
+
+## The one rule that explains everything
+
+Here is the rule the whole thing hangs on:
+
+> **Every constructor of a derived class must call a constructor of its base class.** Always. Building a `Dog` means building the `Animal` part of it first, and that requires running one of `Animal`'s constructors.
+
+An object built by inheritance is assembled from the base up. A `Dog` is an `Animal` plus some extra `Dog` bits, so the `Animal` part has to be initialized before the `Dog` part — which means an `Animal` constructor has to run. The derived constructor cannot skip it.
+
+## The invisible base() call
+
+Most of the time this rule is invisible, because C# fills it in. When a derived constructor does not say which base constructor to call, C# quietly inserts a call to the **parameterless** one:
+
+```csharp
+public class Animal
+{
+    public Animal() { }        // a parameterless constructor
+}
+
+public class Dog : Animal
+{
+    public Dog() { }           // looks like it calls nothing...
+}
+```
+
+That `Dog()` is treated by the compiler as if it were written:
+
+```csharp
+public Dog() : base() { }      // C# adds ": base()" for you
+```
+
+`base()` means "call the base class's parameterless constructor." Because `Animal` has one, everything works and nobody has to think about it. This is why inheritance often *seems* to need no base-constructor handling at all.
+
+## Why the error happens
+
+The trouble starts when the base class has **no parameterless constructor** — only one that requires arguments:
+
+```csharp
+public class Animal
+{
+    public Animal(string name) { }   // ONLY a parameterized constructor
+}
+
+public class Dog : Animal
+{
+    public Dog() { }                 // ERROR
+}
+```
+
+The compiler still tries to insert the invisible `: base()`. But `Animal` has no `Animal()` to call — only `Animal(string name)`. There is no parameterless base constructor, so the automatic call has nothing to bind to, and the compiler reports:
+
+> there is no argument given that corresponds to the required parameter 'name'
+
+Read in plain terms: *"I am trying to build the Animal part by calling `base()`, but Animal insists on a `name`, and you have not given me one."* The error is not really about the `Dog` class — it is about the automatic base call failing.
+
+## The fix: call the base constructor yourself
+
+The fix is to stop relying on the invisible `base()` and call the base constructor explicitly, supplying what it needs:
+
+```csharp
+public class Dog : Animal
+{
+    public Dog() : base("Buddy") { }   // hand a name to Animal's constructor
+}
+```
+
+`: base("Buddy")` says "when building the Animal part, call `Animal(string name)` with `"Buddy"`." Now the base constructor has its argument, and the error disappears.
+
+## Parameters do not flow automatically
+
+This is the part that trips people up most, so it deserves emphasis. A derived constructor's parameters are **not** secretly passed to the base. Writing this:
+
+```csharp
+public Dog(string name) { }
+```
+
+does **not** quietly become `: base(name)`. It still becomes `: base()` — the parameterless call — which fails exactly as before, even though a `name` is sitting right there in the parameter list. The connection has to be made by hand:
+
+```csharp
+public Dog(string name) : base(name) { }   // explicitly pass name to the base
+```
+
+The `name` on the left (the `Dog` constructor's parameter) and the `name` inside `base(name)` are two separate things that C# will only connect because the code says so. Nothing is automatic across the base boundary.
+
+## When you do not need base(...)
+
+Putting it together, whether an explicit `base(...)` is required depends entirely on the base class:
+
+| The base class has... | Do you need to write `base(...)`? |
+|---|---|
+| a parameterless constructor | no — C# calls `base()` automatically |
+| no constructor at all | no — there is an implicit parameterless one |
+| only a constructor that needs arguments | yes — you must call `base(args)` yourself |
+
+So the earlier example that "worked without passing anything" worked precisely because it *did* pass everything — the explicit `: base(...)` was there, handing the base its arguments. And a class that inherits from a base with a parameterless constructor needs no `base(...)` at all, because the automatic one succeeds.
+
+## The construction order
+
+The rule makes sense once the build order is clear. Creating a `Dog` runs the base constructor first, then the derived one:
+
+<Diagram title="The base part is built before the derived part">
+  <DiagramRow>
+    <DiagramNode title="new Dog(...)" sub="create a Dog" />
+    <DiagramArrow label="runs first" />
+    <DiagramNode title="Animal ctor" sub="the base part" />
+    <DiagramArrow label="then" />
+    <DiagramNode title="Dog ctor" sub="the derived part" />
+  </DiagramRow>
+</Diagram>
+
+```csharp
+class Animal
+{
+    public Animal(string name) => Console.WriteLine($"Animal: {name}");
+}
+
+class Dog : Animal
+{
+    public Dog(string name) : base(name) => Console.WriteLine("Dog");
+}
+
+var d = new Dog("Buddy");
+// prints:
+//   Animal: Buddy      (base runs first)
+//   Dog                (derived runs after)
+```
+
+Because the base part is built first, and the base constructor needs its arguments to do that, the derived constructor must supply them before its own body runs. That ordering is the reason the compiler is strict about it.
+
+## The shape you will actually hit
+
+In real code, the base class usually needs arguments because of **dependency injection** — a base class that takes services or settings through its constructor. The derived class receives the same dependencies and passes them straight through:
+
+```csharp
+public class BaseService
+{
+    public BaseService(ILogger logger, IThingService things) { }  // needs dependencies
+}
+
+public class MyService : BaseService
+{
+    // receive the same dependencies, then hand them to the base:
+    public MyService(ILogger logger, IThingService things)
+        : base(logger, things)
+    { }
+}
+```
+
+This is exactly the situation that produces the error: `BaseService` has no parameterless constructor (it needs its dependencies), so `MyService` cannot rely on the invisible `base()` and must pass the dependencies through explicitly. The long list of parameters in `base(...)` is not boilerplate to be puzzled over — it is the derived class handing the base everything the base asked for.
+
+## One related gotcha
+
+Why does a base class so often lack a parameterless constructor? Because **defining any constructor removes the free one.** A class with no constructors at all gets an implicit `Animal()`, but the moment a constructor like `Animal(string name)` is written, that free parameterless constructor is gone:
+
+```csharp
+public class Animal
+{
+    public Animal(string name) { }
+    // there is now NO implicit Animal() — writing one constructor removed it
+}
+```
+
+That is why adding a parameterized constructor to a base class can suddenly break every class that inherits from it: the invisible `base()` they all relied on no longer exists. If both are wanted, declare both.
+
+## The one idea to hold onto
+
+> Every derived constructor calls a base constructor. If the base has a parameterless one, C# calls it for you (`: base()`) and nothing is needed. If the base only has a constructor that needs arguments, the automatic `base()` fails — that is the "no argument given for the required parameter" error — and the derived constructor must call `base(args)` explicitly, mapping its own parameters across by hand. Parameters never flow to the base on their own.
