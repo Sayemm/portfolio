@@ -1,0 +1,11 @@
+---
+title: "Three base64 strings and a dot: what a JWT actually is"
+status: outline
+order: 1
+lead: "A JWT looks like a random blob, but it is not encrypted and it is not opaque — anyone holding one can read every claim inside it. The signature proves it was not altered, which is a much narrower promise than most people assume."
+outline:
+  - "header.payload.signature — decoding all three by hand, no library"
+  - "Base64url is encoding, not encryption: why a JWT is readable by anyone who holds it"
+  - "What the signature actually proves — integrity and issuer, not secrecy"
+  - "The claims that matter: iss, aud, exp, nbf — and what skipping each one lets through"
+---

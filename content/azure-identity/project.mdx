@@ -53,6 +53,37 @@ foreach (var mailbox in mailboxes)
 
 Run it and it reads the mailboxes. The app authenticates as itself with the secret and reads mail through Graph — no signed-in user, no mailbox password.
 
+**What the credential line actually does (and does not) do.** `new ClientSecretCredential(...)` does **not** fetch a token, and it does not return the JWT. It only creates an object that *holds* the tenant ID, client ID, and secret and *knows how* to get a token later. At that line nothing has been sent to Entra and no token exists yet. Likewise `new GraphServiceClient(credential)` just tells the Graph client "use this credential when you need a token" — still no token.
+
+The access token is fetched **lazily, on the first call that needs it** — here, the first `GetAsync`. At that moment the credential trades the secret with Entra for a **JWT access token**, the Graph client attaches it as an `Authorization: Bearer` header, and Graph reads the token's `roles` claim (for an app-only token, e.g. `Mail.Read`) to allow or deny the call. The token is then cached and reused for about an hour, then refreshed automatically.
+
+So the mental model to correct: the credential is not the token — it is the *thing that can produce* the token. The JWT is created behind the scenes at call time, carries the `roles` claim that says what the app may do, and is what Graph actually checks.
+
+**Who is the caller, and who checks the token.** A confusing point worth pinning down: there are three roles here, not two.
+
+- **The app (your code) is the caller.** It calls *two* different places: first **Entra**, to get a token; then **Graph**, to read mail.
+- **Entra is the authorization server** — it issues (signs) tokens. It holds no mail.
+- **Graph is the resource server** — the API being *called*. It holds the data (mail, served from Exchange behind it). Graph is the destination, not a caller.
+
+The part that trips people up: **Graph does not call Entra to ask "can this app read mail?"** It reads the answer straight from the token the app hands it. The token is a self-contained, signed statement, so no per-request callback to Entra is needed.
+
+**How Graph trusts a token it did not issue.** Entra signs each token with a **private key that only Entra has**. There is a matching **public key that Entra publishes for anyone to download**. The key property of this (asymmetric) signing: the public key can *verify* a signature but cannot *create* one. So Graph verifies the token with Entra's **public key** — confirming Entra signed it and nothing was altered — **without** having Entra's secret and **without** calling Entra. (Like a border guard spotting a genuine passport by its security features, without phoning the issuing country — and unable to forge one, because only the country can produce those features.)
+
+The whole flow, in order:
+
+```text
+app  --(clientId + secret)-->  Entra              "give me a token"
+Entra  --(JWT signed with its PRIVATE key)-->  app
+
+app  --(Bearer JWT)-->  Graph                     "read this mail"
+Graph  verifies the JWT with Entra's PUBLIC key   (locally — no call to Entra)
+Graph  reads roles -> Mail.Read -> allowed
+Graph  --> Exchange                               fetches the actual mail
+Graph  --> app                                    returns it
+```
+
+So `roles: Mail.Read` is trusted because Entra *signed* it and Graph *verified that signature* — not because the app said so, and not because Graph asked Entra. (The full anatomy of the JWT — its three parts, what signing and verifying actually do, and why a claim cannot be forged or edited — is its own topic; here the point is the shape: the app is the caller, and Graph verifies the token itself.)
+
 ## Step 4 — The problem: it can read every mailbox
 
 The `Mail.Read` **application** permission is **tenant-wide**. There is no user to limit it, so the app can read *any* mailbox in the tenant — put any address in the `mailboxes` array and it works, with no extra permission.

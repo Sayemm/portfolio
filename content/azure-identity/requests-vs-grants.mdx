@@ -1,0 +1,60 @@
+---
+title: "A last note: requests vs grants, and what scoping actually targets"
+date: 2026-09-07
+status: written
+minutes: 9
+order: 14
+lead: 'A closing note on two things that trip people up when removing or scoping an app permission: the difference between a permission that is requested and one that is granted, and the fact that access is scoped per app identity, not per caller. The token roles claim is the source of truth for both.'
+---
+
+Two things caused confusion when *removing* and *scoping* an app-only permission, and both are worth pinning down as a last note. Neither is about adding access — that part is straightforward — they are about the details that make removing or narrowing access behave unexpectedly.
+
+## The token's roles claim is the source of truth
+
+The portal's permission list shows what an app *requests*. It does not reliably show what the app can actually *do*. The authoritative answer is in the **access token**: for an app-only workload, the permissions it truly holds appear in the **`roles`** claim (delegated permissions would appear in `scp`, but app-only tokens have no user and no `scp`).
+
+So the check that never lies is: acquire a token, decode it (for example at jwt.ms), and read `roles`.
+
+```text
+"roles": [ "Mail.Read" ]
+```
+
+If a permission is in `roles`, the app can use it — regardless of what the portal's request list shows. If it is absent, the app cannot, and the API returns 403. When "the portal says X but the app does Y," believe the token.
+
+## Requesting a permission and being granted one are two different things
+
+This is the detail that makes "I removed the permission but it still works" happen. A permission lives in **two** places, on two different objects (the app-registration-versus-service-principal split):
+
+| | The request | The grant |
+|---|---|---|
+| Lives on | the **app registration** (the blueprint) | the **service principal** (the Enterprise application) |
+| Portal page | App registration → **API permissions** | Enterprise applications → the app → **Permissions** |
+| What it is | what the app *asks for* | what the app *actually has* (consented) |
+| In the token? | no | yes — as a `roles` entry |
+| To remove access | not enough on its own | revoke it **here** |
+
+When admin consent is granted, it creates a **grant on the service principal** — an app-role assignment. That grant is what tokens carry. Removing the permission from the app registration's **API permissions** list only edits the *request* (the wish list); it does **not** automatically revoke the grant already sitting on the service principal. So tokens keep coming back with the permission in `roles`, and the app keeps working.
+
+> **To actually cut off access, revoke the grant on the service principal** — Enterprise applications → the app → **Permissions** → revoke the consented permission. Only then does the next token come back *without* it in `roles`, and the API start returning 403. Editing the App registration's request list alone leaves the grant, and the access, in place.
+
+This is the same registration-versus-service-principal idea seen from the removal side: consent attaches to the *service principal*, so consent must be revoked from the *service principal*. The registration is the blueprint; changing the blueprint does not retract a permission already handed to the running identity.
+
+## Scoping targets the app identity, not the caller
+
+The second confusion: when a mailbox-scoping policy (or RBAC assignment) grants an app access to a group of mailboxes, does that apply to "all instances of the app," and can it be made finer — per instance?
+
+The unit of scoping is the **app identity — the service principal (its `AppId`)** — and here is what that means:
+
+- **A single-tenant app has exactly one service principal** in the tenant. There is only *one* instance, so scoping the app *is* scoping that instance. There is no other instance to worry about.
+- **A multi-tenant app has one service principal per consuming tenant**, each living in *that* tenant. Each tenant's admin scopes *their* service principal against *their* own resources; a policy in one tenant never governs another tenant's instance. So "one policy affects all instances" does not happen — each instance is scoped independently, in its own tenant.
+- **The policy is keyed by `AppId`.** App A gets its own allowed group; App B gets its own. They are independent.
+
+What cannot be done is give the *same* service principal two different scopes for the same permission at once — one app identity has one effective scope for, say, `Mail.Read`. So the finest grain is "this app identity may read these mailboxes."
+
+**To give different consumers different scopes, use separate app registrations.** One reader that may touch only finance mailboxes and another that may touch only HR mailboxes are **two app registrations**, each with its own service principal and its own scoped policy or RBAC assignment. The isolation is per app, because the identity is per app.
+
+The modern **RBAC for Applications** mechanism is the same shape, just more precise: a scoped role is assigned **to a service principal**, with a resource scope that can be a group *or* a recipient filter (an attribute like department). Finer targeting, but still per service principal — "this app identity, these resources."
+
+## The one idea to hold onto
+
+> The **token's `roles` claim** is the truth about what an app can do — not the portal's request list. A permission is *requested* on the app registration but *granted* on the service principal, so removing access means **revoking the grant on the service principal**, not just deleting the request. And access is scoped **per app identity (service principal / `AppId`)**: one identity, one scope — for different scopes, use different apps.

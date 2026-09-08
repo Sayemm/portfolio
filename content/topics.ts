@@ -114,6 +114,13 @@ export const topics: Topic[] = [
     chip: { bg: "#eae6f0", fg: "#4c3470" },
   },
   {
+    id: "jwt",
+    name: "JWT",
+    blurb: "What is actually in a token, and what signing does and does not prove.",
+    order: 2.9,
+    chip: { bg: "#f2ead9", fg: "#6b4a05" },
+  },
+  {
     id: "azure-identity",
     name: "Azure Identity",
     blurb: "Who is calling, and how the token proving it gets there.",
