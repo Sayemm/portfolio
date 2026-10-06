@@ -1,0 +1,489 @@
+---
+title: "Fields, Properties, static, const and readonly in C#"
+date: 2026-09-22
+status: written
+minutes: 12
+order: 5.6
+lead: "Storage versus an access door, and the four modifiers that confuse people most: who owns the value, when it is decided, and whether it can ever change again."
+---
+
+## The main question
+
+Four declarations that look almost the same:
+
+```csharp
+public int A = 10;
+public static int B = 10;
+public const int C = 10;
+public readonly int D = 10;
+public static readonly int E = 10;
+```
+
+They answer two separate questions, and mixing those questions up is where the confusion starts:
+
+```text
+WHO OWNS THE VALUE?              WHEN IS IT DECIDED, AND CAN IT CHANGE?
+    each object  -> normal           anytime, freely      -> normal
+    the class    -> static           at compile time      -> const
+                                     once, at startup or
+                                     construction         -> readonly
+```
+
+`static` answers the first question. `const` and `readonly` answer the second. That is why `static readonly` is a valid combination, and why `static const` is not: `const` is already owned by the class.
+
+This article starts with fields and properties, then takes the modifiers one at a time, and ends with one small program that uses all of them.
+
+
+## Storage vs access door: field and property
+
+A **field** is a variable that lives inside an object. It stores data directly.
+
+```csharp
+public class Person
+{
+    public string Name;   // field
+    public int Age;       // field
+}
+
+var person = new Person();
+person.Name = "Ada";
+person.Age = 27;
+```
+
+A **property** looks the same when used, but it is really a pair of small methods: a `get` that runs when the value is read, and a `set` that runs when it is written.
+
+```csharp
+public class Person
+{
+    public string Name { get; set; }   // property
+    public int Age { get; set; }       // property
+}
+
+var person = new Person();
+person.Name = "Ada";     // calls the set
+Console.WriteLine(person.Name);   // calls the get
+```
+
+A short way to remember it:
+
+> A field is the storage. A property is the door to the storage.
+
+
+## Why properties instead of public fields
+
+Because a property can run code. The most common use is validation:
+
+```csharp
+var person = new Person();
+
+person.Age = 27;
+Console.WriteLine(person.Age);   // 27
+
+person.Age = -5;                 // rejected by the set
+Console.WriteLine(person.Age);   // 27
+
+public class Person
+{
+    private int _age;            // the real storage, hidden
+
+    public int Age
+    {
+        get { return _age; }
+        set
+        {
+            if (value >= 0)
+                _age = value;
+        }
+    }
+}
+```
+
+Output:
+
+```text
+27
+27
+```
+
+Inside a `set`, the keyword `value` means the value being assigned. A plain field has nowhere to put that check.
+
+Two more things a property can do and a field cannot: be part of an interface, and be `virtual` so a child class can change it.
+
+
+## Auto-properties
+
+Writing a private field plus a get and a set by hand is repetitive, so C# has a shorthand:
+
+```csharp
+public string Name { get; set; }
+```
+
+This is an **auto-property**. The compiler creates the hidden storage automatically. It behaves roughly as if this had been written:
+
+```csharp
+private string _name;
+
+public string Name
+{
+    get { return _name; }
+    set { _name = value; }
+}
+```
+
+The hidden field is called a **backing field**. Nothing else can reach it, not even other code in the same class, which is exactly the point: everything goes through the door.
+
+Start with an auto-property. If validation or logic is needed later, it can be expanded into a full property without changing any of the code that uses it.
+
+
+## Properties that cannot be written from outside
+
+A property does not need both accessors. Three useful shapes:
+
+```csharp
+public class Employee
+{
+    public int Id { get; }                     // 1. set only in the constructor
+    public string Email { get; init; }         // 2. set only while creating the object
+    public string Name { get; private set; }   // 3. changeable, but only from inside this class
+
+    public Employee(int id, string name)
+    {
+        Id = id;        // allowed: this is the constructor
+        Name = name;
+    }
+
+    public void Rename(string name) => Name = name;   // allowed: inside the class
+}
+
+var e = new Employee(101, "Ada") { Email = "ada@example.com" };
+
+e.Rename("Ada Lovelace");   // allowed
+// e.Id = 999;              // error: no set accessor
+// e.Email = "x";           // error: init accessors can only be used during creation
+// e.Name = "Bob";          // error: the set is private
+```
+
+| Shape | Who can write it |
+|---|---|
+| get only | the constructor only |
+| get and init | the constructor, and the code creating the object |
+| get and private set | any code inside the class |
+| get and set | anyone |
+
+A property can also be **computed**, with no storage at all:
+
+```csharp
+public class Employee
+{
+    public string FirstName { get; set; } = "";
+    public string LastName { get; set; } = "";
+
+    public string FullName => $"{FirstName} {LastName}";   // calculated every time it is read
+}
+```
+
+
+## Per object vs per class: static
+
+Normally each object has its own copy of a member:
+
+```csharp
+var p1 = new Person { Name = "Ada" };
+var p2 = new Person { Name = "Linus" };
+// two objects, two separate Name values
+```
+
+A **static** member belongs to the class itself. There is exactly one, shared by everything:
+
+```csharp
+var a = new Counter();
+var b = new Counter();
+
+Console.WriteLine(Counter.Created);   // 2
+
+public class Counter
+{
+    public static int Created;        // one value for the whole class
+
+    public Counter() => Created++;    // every new object increases the same number
+}
+```
+
+Static members are accessed through the **class name**, not through an object: `Counter.Created`, not `a.Created`. In fact writing `a.Created` is a compile error.
+
+Use `static` when the value belongs to the type as a whole rather than to one object: a counter of how many objects exist, a shared setting, a helper method that needs no object such as `Math.Max`.
+
+
+## Decided at compile time: const
+
+A **const** is a fixed value that the compiler already knows:
+
+```csharp
+public class Limits
+{
+    public const int MaxUsers = 100;
+    public const string AppName = "Timekeeper";
+    public const double Pi = 3.14159;
+}
+
+Console.WriteLine(Limits.MaxUsers);   // 100
+// Limits.MaxUsers = 200;             // error: a const cannot be assigned
+```
+
+Three rules to remember:
+
+**1. A const is automatically static.** It belongs to the class, and is accessed through the class name. Writing both keywords is an error:
+
+```csharp
+public static const int MaxUsers = 100;   // error: a const cannot be marked static
+```
+
+**2. The value must be known at compile time.** This means a literal or a calculation the compiler can perform itself. Anything computed while the program runs cannot be a const:
+
+```csharp
+public const int Seconds = 60 * 60;            // fine: the compiler can work this out
+public const DateTime Start = DateTime.Now;    // error: only known while running
+public const int[] Sizes = [1, 2, 3];          // error: creating an object happens at runtime
+```
+
+**3. Only simple types are allowed:** the numeric types, `bool`, `char`, `string`, enums, and `null` for reference types. `DateTime`, arrays, lists, and custom classes cannot be const.
+
+> One extra detail worth knowing. A const value is **copied into the code that uses it** when that code is compiled. Inside one project this never matters. Across projects it can: if a library declares `public const int MaxUsers = 100` and a program using that library is compiled, the number 100 is baked into the program. Shipping a new version of the library with 200 changes nothing until the program is recompiled. For public values that might change one day, `static readonly` avoids this, because its value is read from the library at runtime.
+
+
+## Decided once, then fixed: readonly
+
+A **readonly** field can be assigned in only two places: where it is declared, or inside a constructor. After that it is fixed for the life of the object.
+
+```csharp
+var e = new Employee(101);
+Console.WriteLine(e.Id);   // 101
+// e.Id = 999;             // error: a readonly field cannot be assigned here
+
+public class Employee
+{
+    public readonly int Id;
+
+    public Employee(int id)
+    {
+        Id = id;           // allowed: this is the constructor
+    }
+}
+```
+
+The difference from `const` is important: **each object can have a different readonly value**, and the value can be calculated while the program runs. Three employees can have ids 101, 102 and 103, each fixed once its object exists.
+
+> A common surprise: `readonly` protects the **field**, not the object it points at. A readonly list cannot be replaced with a different list, but items can still be added to it.
+
+```csharp
+var team = new Team();
+team.Members.Add("Ada");              // allowed: the list's contents are not protected
+// team.Members = new List<string>(); // error: the field itself cannot be reassigned
+
+public class Team
+{
+    public readonly List<string> Members = new();
+}
+```
+
+`readonly` is a **field** modifier only. A property cannot be marked readonly:
+
+```csharp
+public readonly string Name { get; set; }   // error
+public string Name { get; }                 // this is the property version of the same idea
+```
+
+
+## One shared value, decided at startup: static readonly
+
+Combining the two keywords answers both questions at once:
+
+- `static`: one value for the whole class.
+- `readonly`: it cannot be reassigned after it is set.
+
+```csharp
+public class AppInfo
+{
+    public static readonly DateTime StartedAt = DateTime.Now;
+    public static readonly string[] SupportedCultures = ["en-CA", "fr-CA"];
+}
+
+Console.WriteLine(AppInfo.StartedAt.Year);
+// AppInfo.StartedAt = DateTime.Now;   // error: cannot assign a readonly field
+```
+
+This is the option to reach for whenever a shared value cannot be a const: a timestamp, an array, a regular expression, a configured object. The value is calculated once, the first time the class is used, and then stays.
+
+
+## The five declarations, compared
+
+Back to the opening example:
+
+| Declaration | Who owns it | When the value is set | Can it change later |
+|---|---|---|---|
+| `public int A` | each object | anytime | yes |
+| `public static int B` | the class | anytime | yes |
+| `public const int C` | the class, automatically | at compile time | no, ever |
+| `public readonly int D` | each object | declaration or constructor | no |
+| `public static readonly int E` | the class | declaration or static constructor | no |
+
+The two questions that decide everything:
+
+```text
+1. Should every object have its own copy?
+      yes -> plain member          no -> static
+
+2. Should the value ever change?
+      yes -> plain member
+      no, and the value is a simple literal        -> const
+      no, and each object decides its own value    -> readonly
+      no, and one shared value is computed at run  -> static readonly
+```
+
+
+## const vs static readonly, side by side
+
+These two are the pair most often confused, because both are shared and neither can be reassigned.
+
+| Question | `const` | `static readonly` |
+|---|---|---|
+| Needs the `static` keyword? | no, it is implied | yes |
+| When is the value decided? | at compile time | while the program runs |
+| Allowed types | numbers, bool, char, string, enums | any type at all |
+| Can it be a `DateTime` or a list? | no | yes |
+| Can each object differ? | no | no, it is shared |
+| Value copied into other projects? | yes, at their compile time | no, read at runtime |
+
+A single example shows the whole difference:
+
+```csharp
+public const DateTime Started = DateTime.Now;           // error
+public static readonly DateTime Started = DateTime.Now; // fine
+```
+
+`DateTime.Now` is only known while the program is running, so the compiler cannot bake it in.
+
+
+## Full example
+
+One small program using every idea above.
+
+```csharp
+var alice = new Employee("Alice", 101);
+var bob   = new Employee("Bob", 102);
+
+alice.Name = "Alice Smith";   // a normal property: can change
+alice.Promote("Senior Developer");
+
+Console.WriteLine(alice.Summary);
+Console.WriteLine(bob.Summary);
+Console.WriteLine();
+Console.WriteLine($"Employees created : {Employee.Count}");
+Console.WriteLine($"Max vacation days : {Employee.MaxVacationDays}");
+Console.WriteLine($"Program started in: {Employee.StartedAt.Year}");
+
+// alice.Id = 999;             // error: Id has no set
+// alice.Title = "Manager";    // error: the set is private
+// Employee.MaxVacationDays = 40;   // error: a const cannot be assigned
+// Employee.StartedAt = DateTime.Now;  // error: a static readonly field cannot be assigned
+
+// ======================= the class =======================
+
+public class Employee
+{
+    // const: a fixed value, known at compile time, shared by the class
+    public const int MaxVacationDays = 30;
+
+    // static readonly: one shared value, calculated when the program starts
+    public static readonly DateTime StartedAt = DateTime.Now;
+
+    // static: one shared number, and it does change
+    public static int Count { get; private set; }
+
+    // a field holding the real data, with a property guarding it
+    private string _name = "";
+
+    public string Name
+    {
+        get { return _name; }
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                throw new ArgumentException("Name cannot be empty.");
+
+            _name = value;
+        }
+    }
+
+    // get only: set in the constructor, different for every employee, never changes
+    public int Id { get; }
+
+    // private set: readable everywhere, changeable only inside this class
+    public string Title { get; private set; } = "Developer";
+
+    // computed: no storage, worked out each time it is read
+    public string Summary => $"#{Id} {Name} ({Title})";
+
+    public Employee(string name, int id)
+    {
+        Name = name;     // goes through the property, so the validation runs
+        Id = id;
+        Count++;         // the shared counter
+    }
+
+    public void Promote(string title) => Title = title;
+}
+```
+
+Output:
+
+```text
+#101 Alice Smith (Senior Developer)
+#102 Bob (Developer)
+
+Employees created : 2
+Max vacation days : 30
+Program started in: 2026
+```
+
+Reading the class:
+
+- `MaxVacationDays` is a company rule that never changes and is a plain number, so it is `const`.
+- `StartedAt` is shared and fixed, but a `DateTime` is calculated while running, so it must be `static readonly`.
+- `Count` is shared and **does** change, so it is `static` with a private set, meaning only the class can increase it.
+- `Name` needs validation, so it is a full property with a private backing field.
+- `Id` differs per employee and is set once, so it is a get-only property.
+- `Title` can change, but only through `Promote`, so its set is private.
+- `Summary` stores nothing; it builds a string each time it is read.
+
+
+## Cheat sheet
+
+```text
+field       storage inside the object
+property    a door to the storage: get runs on read, set runs on write
+
+static          one value for the whole class, used as ClassName.Member
+const           fixed at compile time, automatically static, simple types only
+readonly        a field set once: at its declaration or in a constructor
+static readonly one shared value, computed at runtime, never reassigned
+
+get only          set in the constructor only
+get and init      set while creating the object only
+get, private set  changeable only from inside the class
+get and set       changeable by anyone
+=> expression     computed each time, stores nothing
+
+const is for simple fixed values    -> 30, "Timekeeper", 3.14
+static readonly is for everything else shared and fixed -> DateTime, arrays, objects
+```
+
+
+## Checkpoint
+
+1. What does a property let code do that a plain public field cannot?
+2. Why is writing `public static const int MaxUsers = 100;` an error?
+3. Why can `DateTime.Now` not be stored in a const, and what should be used instead?
+4. Two employees have different ids that never change after creation. Which option fits: `const`, `static`, or `readonly`?
+5. A field is `readonly` and holds a list. Can items still be added to that list? Why?
+6. What is the difference between a property with get only and one with get and private set?

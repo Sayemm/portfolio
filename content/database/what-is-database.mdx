@@ -1,0 +1,617 @@
+---
+title: "What a database actually is"
+date: 2026-09-30
+status: written
+minutes: 26
+order: 1
+lead: "Not tables and rows, but files, 8KB pages, and a log that makes writes survive a crash. This article puts three rows into a table and then reads them back as raw bytes."
+---
+
+## The main question
+
+A database is usually introduced like this: it is a place where data is stored in tables, made of rows and columns.
+
+That is true, and it explains nothing. It does not explain any of these:
+
+- Why deleting rows does not make a table smaller.
+- Why one query reads 4 units of data and another reads 50,000, from the same table.
+- Why pulling the power cord out mid-write does not corrupt the data.
+- Why adding an index makes reads faster and writes slower.
+
+A more useful definition is a physical one:
+
+```text
+A database is:
+    1. a set of files on disk
+    2. an engine that reads and writes those files in fixed-size chunks
+    3. a protocol that guarantees those writes survive a crash
+```
+
+Everything else — SQL, tables, indexes, transactions, Entity Framework — is built on top of those three things.
+
+This article stays at the bottom. It creates a database, inserts three rows, and then reads those rows back as hexadecimal bytes to see exactly where each value physically sits. Nothing here assumes prior database knowledge.
+
+
+## Why a database instead of a file
+
+A plain file can store records. Writing employees to a text file works. The problem is everything that has to be built around it.
+
+| Problem with a plain file | What a database engine already solves |
+|---|---|
+| A crash halfway through a write corrupts the data | A log of changes, replayed automatically on restart |
+| Two programs writing at once overwrite each other | Locks, so one waits while the other finishes |
+| Finding one record means reading the whole file | Indexes, which jump straight to the right place |
+| Every new question needs new code written | SQL: describe the question, the engine works out how |
+| Nothing stops nonsense being written | Types, constraints, foreign keys |
+
+Those five rows are the syllabus of this whole series. The first of them becomes visible about thirty seconds after creating a database.
+
+
+## Setting up: SQL Server on an Apple Silicon Mac
+
+The engine used throughout this series is Microsoft SQL Server, running in Docker.
+
+Two facts to know before starting, because both cause failures that look mysterious:
+
+**Microsoft publishes no ARM64 build of SQL Server.** Apple Silicon Macs are ARM64. The official container image is x86_64 only, so it runs through a translation layer. On macOS that layer should be Rosetta, enabled at **Docker Desktop → Settings → General → "Use Rosetta for x86/amd64 emulation on Apple Silicon."** Without it, Docker falls back to a slower emulator that SQL Server crashes under, reporting an invalid memory mapping.
+
+**Use SQL Server 2022, not 2025.** Docker Desktop's Rosetta emulation does not expose a set of CPU instructions that SQL Server 2025 requires at startup.
+
+With that settled:
+
+```bash
+docker volume create shiftledger-data
+
+docker run \
+  --platform linux/amd64 \
+  --name shiftledger-sql \
+  --hostname shiftledger-sql \
+  -e 'ACCEPT_EULA=Y' \
+  -e 'MSSQL_SA_PASSWORD=Sh1ftL3dger!Dev' \
+  -e 'MSSQL_PID=Developer' \
+  -p 1433:1433 \
+  -v shiftledger-data:/var/opt/mssql \
+  -d mcr.microsoft.com/mssql/server:2022-latest
+```
+
+Every option does something worth understanding:
+
+| Option | What it does |
+|---|---|
+| `--platform linux/amd64` | States the architecture explicitly, so Docker stops guessing |
+| `MSSQL_PID=Developer` | Developer edition: free, and identical in features to Enterprise |
+| `-p 1433:1433` | Port 1433 is where SQL Server listens |
+| `-v shiftledger-data:/var/opt/mssql` | Puts the database files in a Docker volume, so they survive the container being deleted |
+
+> **Why port 1433 matters later.** SQL Server speaks a protocol called TDS (Tabular Data Stream) on that port. When a .NET application opens a connection, what it really opens is a TCP socket to port 1433 carrying an authenticated TDS session. "Connection pooling", covered much later in this series, means reusing those sessions instead of paying to establish one each time.
+
+Check that it started:
+
+```bash
+docker logs shiftledger-sql | tail -20
+```
+
+The line to look for is `SQL Server is now ready for client connections`.
+
+
+## A detour that teaches something: the password
+
+The password rules are strict: at least 8 characters, using at least three of uppercase, lowercase, digits, and symbols. A password such as `abcdefghi` is rejected and the container refuses to start.
+
+There is a second, less obvious trap. Suppose the container is deleted and recreated with a **different** password, reusing the same volume:
+
+```bash
+docker rm -f shiftledger-sql
+docker run ... -e 'MSSQL_SA_PASSWORD=somethingelse' -v shiftledger-data:/var/opt/mssql ...
+```
+
+The new container starts fine, and then every login fails.
+
+The reason is that `MSSQL_SA_PASSWORD` is a **setup** variable, not a configuration variable. The container's startup script reads it only when `/var/opt/mssql` is empty and a brand-new instance has to be built. If the volume already holds a working installation, setup is skipped and the variable is ignored entirely. The password that still works is the original one, because it lives as a hash inside a file on that volume.
+
+The container log says this clearly. The client does not:
+
+```text
+Login failed for user 'sa'.
+Reason: Password did not match that for the login provided.
+Error: 18456, Severity: 14, State: 8.
+```
+
+The client only ever sees "Login failed for user 'sa'." The **State** number, visible only in the server log, is the real diagnosis:
+
+| State | Meaning |
+|---|---|
+| 2 or 5 | The login does not exist |
+| 7 | The login exists but is disabled |
+| 8 | The password did not match |
+| 38 | The requested database does not exist |
+
+The vagueness is deliberate. If the client were told "that user does not exist", an attacker could discover valid usernames by trying them one at a time. So the client gets one generic message and the log gets the truth.
+
+> Two habits worth forming from this. First, when a login fails, read the server log rather than the client error. Second, a data volume outranks an environment variable — true of any container that initialises state on first boot, not just SQL Server.
+
+Resetting the password without destroying the data is a separate command, run against the stopped container's volume:
+
+```bash
+docker stop shiftledger-sql
+
+docker run --rm --platform linux/amd64 \
+  -v shiftledger-data:/var/opt/mssql \
+  -e 'ACCEPT_EULA=Y' \
+  -e 'MSSQL_SA_PASSWORD=NewPassw0rd!' \
+  mcr.microsoft.com/mssql/server:2022-latest \
+  /opt/mssql/bin/mssql-conf set-sa-password
+
+docker start shiftledger-sql
+```
+
+
+## Connecting
+
+A command-line client is useful, mainly because it can capture output to a file:
+
+```bash
+brew install sqlcmd
+
+sqlcmd -S localhost,1433 -U sa -P 'Sh1ftL3dger!Dev' -C -Q "SELECT @@VERSION"
+```
+
+The `-C` flag means "trust the server's certificate without checking it". The container generates its own self-signed certificate, which no certificate authority has vouched for, so verification would fail. The traffic is still encrypted; only the identity check is skipped. In a .NET connection string the same setting is written `TrustServerCertificate=True` — worth understanding now rather than copying blindly into production later.
+
+For interactive work, Visual Studio Code with the **SQL Server (mssql)** extension is the practical choice, since SQL Server Management Studio is Windows-only and Azure Data Studio has been retired:
+
+```bash
+code --install-extension ms-mssql.mssql
+```
+
+
+## Two files, and only one of them holds the data
+
+Creating a database produces exactly two files:
+
+```sql
+CREATE DATABASE ShiftLedger;
+GO
+
+USE ShiftLedger;
+GO
+
+SELECT name, type_desc, physical_name,
+       size   / 128.0 AS size_mb,
+       growth / 128.0 AS growth_mb
+FROM sys.database_files;
+```
+
+Output:
+
+```text
+name             type_desc  physical_name                            size_mb  growth_mb
+---------------  ---------  ---------------------------------------  -------  ---------
+ShiftLedger      ROWS       /var/opt/mssql/data/ShiftLedger.mdf         8.00      64.00
+ShiftLedger_log  LOG        /var/opt/mssql/data/ShiftLedger_log.ldf     8.00      64.00
+```
+
+The `.mdf` is the **data file**. It holds the data as it currently stands.
+
+The `.ldf` is the **transaction log**. It holds a record of every change, written *before* that change is allowed to reach the data file.
+
+That ordering has a name: **write-ahead logging**. It is worth stating precisely, because it is the opposite of what most people assume.
+
+When a transaction commits, the engine does **not** write the changed row into the data file. It writes a description of the change into the log file and forces that to disk. The changed page stays in memory, marked as modified, and may not reach the `.mdf` for several minutes — until a periodic event called a checkpoint.
+
+So if the machine loses power one millisecond after a commit, the row is not in the data file at all. It exists only in the log. On restart, the engine reads the log and re-applies every committed change that never made it across. This is called **recovery**, and it happens automatically before the database becomes available.
+
+```text
+COMMIT
+   |
+   +--> write a description of the change to the .ldf   ... forced to disk NOW
+   |
+   +--> change the page in memory, mark it dirty        ... written to .mdf LATER
+
+crash here?  ->  on restart, replay the .ldf into the .mdf
+```
+
+There is a performance reason for this design, not only a safety one. Writing to the log is one **sequential** append to the end of one file. Writing changed pages to the data file means many **random** writes scattered across a potentially huge file. Sequential writes are dramatically cheaper. By making commit depend only on the cheap operation, a database can commit thousands of transactions per second.
+
+> **Reading the size column.** `size` is measured neither in bytes nor megabytes. It counts 8KB pages, which is why converting to megabytes means dividing by 128 (128 × 8KB = 1MB). The page is so fundamental that the system's own catalog measures everything in it.
+
+
+## Where the 8MB came from
+
+Listing the directory inside the container reveals more than the query does:
+
+```bash
+docker exec shiftledger-sql ls -lh /var/opt/mssql/data/
+```
+
+```text
+-rw-r----- 1 mssql mssql  256  Entropy.bin
+-rw-r----- 1 mssql mssql 8.0M  ShiftLedger.mdf
+-rw-r----- 1 mssql mssql 8.0M  ShiftLedger_log.ldf
+-rw-r----- 1 mssql mssql 4.7M  master.mdf
+-rw-r----- 1 mssql mssql 8.0M  model.mdf
+-rw-r----- 1 mssql mssql 8.0M  modellog.ldf
+-rw-r----- 1 mssql mssql  16M  msdbdata.mdf
+-rw-r----- 1 mssql mssql 8.0M  tempdb.mdf
+-rw-r----- 1 mssql mssql 8.0M  tempdb2.ndf
+...                            tempdb3 through tempdb8
+-rw-r----- 1 mssql mssql 8.0M  templog.ldf
+```
+
+The new database is 8MB, and so is `model.mdf`. That is not a coincidence.
+
+**`CREATE DATABASE` is a file copy.** A new database begins as a byte-level clone of a template database called `model`, which is then renamed and expanded. Anything placed into `model` — a table, a setting, a schema — appears automatically in every database created afterwards.
+
+This also means the brand-new `ShiftLedger.mdf` is not empty. It already contains the entire system catalog: the tables that describe tables, columns, indexes, and which parts of the file are in use. Roughly a thousand pages of bookkeeping exist before a single row of real data does.
+
+The other files are the server itself:
+
+| File | Purpose |
+|---|---|
+| `master` | The server's own catalog: logins and their password hashes, and where every database's files live. If this is lost, nothing starts. |
+| `model` | The template every new database is copied from. |
+| `msdb` | Scheduled jobs, backup history, maintenance plans. |
+| `tempdb` | Scratch space, wiped and recreated on every restart. |
+| `Entropy.bin` | Key material used to encrypt credentials the server stores. |
+
+Two details reward a second look.
+
+**`tempdb` has eight data files.** Every session that needs a temporary table, a sort too large for memory, or a saved earlier version of a row uses `tempdb`. It is one shared resource for the entire server, so the small bookkeeping pages tracking free space inside it become a traffic jam. Splitting it into one file per CPU core spreads that traffic across eight sets of bookkeeping pages. The container image configures this automatically.
+
+**Autogrowth is 64MB, not a percentage.** When a file fills up, the engine must pause and extend it. Older versions of SQL Server grew files by 10%, which meant a 100GB database pausing to allocate 10GB in one go. A fixed size keeps each pause bounded.
+
+
+## The page: the unit of absolutely everything
+
+The engine never reads a single row from disk. It reads an **8192-byte page (8KB)** and locates the row inside it.
+
+The page is the unit of reading, the unit of writing, the unit of caching in memory, and the unit in which every performance number is counted. A data page is laid out in three regions:
+
+```text
+byte 0                                                       byte 8191
++--------+-------------------------------+------+------+------+------+
+| header |  records, growing downward -> | free | slot | slot | slot |
+| 96 B   |                               |      |  2   |  1   |  0   |
++--------+-------------------------------+------+------+------+------+
+                                            <-- slot array grows upward
+```
+
+- The first 96 bytes are a **header** describing the page.
+- Records are added downward, starting right after the header.
+- A **slot array** grows backward from the very end of the page. It is a directory: two bytes per record, holding the offset where that record starts.
+- The page is full when the records and the slot array meet.
+
+Two consequences fall straight out of this picture:
+
+**A record cannot span two pages.** The largest possible row is about 8060 bytes, once the header and slot array are subtracted. Large text and binary columns escape this by storing their contents on separate pages and leaving a pointer behind.
+
+**Wider rows mean fewer rows per page.** Reading a thousand rows from a table with narrow rows might touch 10 pages; from a table with wide rows it might touch 200. Row width is a performance decision, not merely a modelling one.
+
+
+## Three rows, and where they landed
+
+A table created without a primary key is called a **heap** — an unordered pile of rows, with no rule governing where any row is placed.
+
+```sql
+CREATE TABLE dbo.Employees
+(
+    EmployeeId  INT         NOT NULL,
+    FirstName   VARCHAR(50) NOT NULL,
+    LastName    VARCHAR(50) NOT NULL,
+    HireDate    DATE        NOT NULL
+);
+
+INSERT dbo.Employees (EmployeeId, FirstName, LastName, HireDate)
+VALUES (1, 'Mofakh', 'Rahman', '2026-05-25'),
+       (2, 'Dana',   'Okoye',  '2024-11-03'),
+       (3, 'Priya',  'Sandhu', '2023-02-17');
+```
+
+SQL Server exposes an undocumented pseudo-column reporting each row's physical address:
+
+```sql
+SELECT sys.fn_PhysLocFormatter(%%physloc%%) AS FilePageSlot, *
+FROM dbo.Employees;
+```
+
+```text
+FilePageSlot  EmployeeId  FirstName  LastName  HireDate
+------------  ----------  ---------  --------  ----------
+(1:392:0)              1  Mofakh     Rahman    2026-05-25
+(1:392:1)              2  Dana       Okoye     2024-11-03
+(1:392:2)              3  Priya      Sandhu    2023-02-17
+```
+
+`(1:392:0)` reads as **file 1, page 392, slot 0**.
+
+That triple is called a **RID** (row identifier), and it is an 8-byte physical address: 2 bytes naming the file, 4 naming the page, 2 naming the slot. It matters far beyond this article — **it is the address an index on a heap stores**, which is why execution plans on heaps contain an operation literally named "RID Lookup".
+
+Two smaller observations:
+
+**The page number is 392, not 1.** Pages 0 through 9 of every data file are reserved with fixed meanings: file header, free-space map, allocation maps, boot page. Everything up to 392 is the system catalog inherited from `model`.
+
+**All three rows share one page**, and the slot numbers happen to run in insertion order. Neither is guaranteed. A heap places rows wherever its free-space bookkeeping reports room.
+
+
+## Reading the page itself
+
+`DBCC PAGE` dumps a page's contents. A trace flag is required first, or the output goes to the error log instead of the screen:
+
+```sql
+DBCC TRACEON(3604);
+DBCC PAGE('ShiftLedger', 1, 392, 3);
+```
+
+The last argument is the detail level: `3` means "decode each record into columns". For long output, capturing to a file beats scrolling:
+
+```bash
+sqlcmd -S localhost,1433 -U sa -P 'Sh1ftL3dger!Dev' -C -d ShiftLedger -y0 \
+  -Q "DBCC TRACEON(3604); DBCC PAGE('ShiftLedger', 1, 392, 3);" > page392.txt
+```
+
+### The header
+
+```text
+m_type        = 1              data page
+m_level       = 0              leaf level
+pminlen       = 11             length of the fixed-size part of each record
+m_slotCnt     = 3              records on this page
+m_freeCnt     = 7998           free bytes
+m_freeData    = 188            offset where used space ends
+m_prevPage    = (0:0)          no previous page
+m_nextPage    = (0:0)          no next page
+m_lsn         = (42:592:30)    log position of the last change to this page
+m_ghostRecCnt = 0              deleted-but-not-yet-removed records
+```
+
+Several of these deserve attention.
+
+**`m_type = 1`** identifies a data page. Other values appear later: 2 for an index page, 10 and 11 for the bookkeeping pages tracking allocation and free space.
+
+**`m_prevPage` and `m_nextPage` are both empty.** This contradicts a very common belief: that scanning a table means following a linked list of pages. That is true only for tables *with* a clustered index. A heap has no such chain. Scanning a heap means consulting the allocation maps to find which chunks of the file belong to this table, then visiting those pages in whatever physical order they occupy. This is why reading a heap twice can return rows in a different order each time.
+
+**`m_lsn`** is a pointer into the transaction log — virtual log file 42, block 592, record 30. Every page records the log position of its last change. During recovery the engine compares a log record's position against the page's recorded position to decide whether that change was already applied. Write-ahead logging is not an abstraction; it is this one field.
+
+**`m_freeCnt = 7998`** checks out arithmetically: 8192 total, minus 188 bytes of header-plus-records, minus 6 bytes of slot array (2 bytes × 3 slots).
+
+The allocation section adds one more:
+
+```text
+PFS (1:1) = 0x41 ALLOCATED  50_PCT_FULL
+```
+
+The free-space map tracks each page's fullness in a single byte, using coarse buckets: empty, 1–50%, 51–80%, 81–95%, 96–100%. This page is barely 1% used and still lands in the "1 to 50 percent" bucket. That coarseness carries a real cost with wide rows, because the allocator trusts these buckets when deciding where to put the next insert and can badly overestimate the space available.
+
+
+## One row, decoded byte by byte
+
+This is the centre of the article. Slot 0 reports `Record Size = 32` and dumps as:
+
+```text
+00:  30 00 0b 00
+04:  01 00 00 00
+08:  b0 49 0b
+0b:  04 00
+0d:  00
+0e:  02 00
+10:  1a 00
+12:  20 00
+14:  4d 6f 66 61 6b 68          "Mofakh"
+1a:  52 61 68 6d 61 6e          "Rahman"
+```
+
+Taking it in order:
+
+**`30` — status bits.** In binary, `0011 0000`. Bit 4 set means "a null bitmap is present". Bit 5 set means "there are variable-length columns". The lowest three bits give the record type, and `000` means a normal record. This single byte is what the decoded output prints as `Record Attributes = NULL_BITMAP VARIABLE_COLUMNS`. Deleted records and index records differ here.
+
+**`00` — a second status byte**, unused for this kind of record.
+
+**`0b 00` — the number 11**, stored little-endian (least significant byte first). This is the length of the fixed-size portion of the record. The header's `pminlen` field holds the same 11, so the engine knows the layout before reading any individual record.
+
+**`01 00 00 00` — `EmployeeId = 1`.** A 4-byte integer, little-endian, at offset 4.
+
+**`b0 49 0b` — `HireDate`.** Three bytes, little-endian, giving `0x0B49B0` = **739,760**. That is the number of days since 1 January of year 1. Counting forward 739,760 days lands on 2026-05-25. A `DATE` is therefore neither a string nor a structure — it is an integer day counter. This is why date arithmetic is fast and why the type costs only 3 bytes.
+
+**`04 00` then `00` — the null bitmap.** Two bytes saying "this record has 4 columns", then one byte holding one bit per column. All bits are zero, meaning nothing is null.
+
+Note that the bitmap is written even though every column is declared `NOT NULL`. Declaring a column `NOT NULL` saves no storage whatsoever here. It buys correctness and better query planning, never bytes.
+
+**`02 00` — "two variable-length columns follow".**
+
+**`1a 00` and `20 00` — the offset array**, holding 26 and 32. These are **end** positions, not start positions. Since the array itself ends at byte 20, `FirstName` occupies bytes 20 to 26 and `LastName` occupies bytes 26 to 32. Each length is obtained by subtracting the previous entry.
+
+**The remaining 12 bytes** are character data, one byte per character because the columns are `VARCHAR`. Had they been `NVARCHAR`, this would be 24 bytes, since that type stores two bytes per character.
+
+Counting it all: 4 + 4 + 3 + 3 + 2 + 4 + 6 + 6 = 32, matching the reported record size exactly.
+
+
+## Logical column order is not physical column order
+
+The decoded output lists each column's offset:
+
+```text
+EmployeeId  (column 1)   offset 0x04   =  4
+FirstName   (column 2)   offset 0x14   = 20
+LastName    (column 3)   offset 0x1A   = 26
+HireDate    (column 4)   offset 0x08   =  8
+```
+
+Column 4 is stored **before** columns 2 and 3. The order columns are declared in has nothing to do with the order they are stored in.
+
+The record is split into two regions:
+
+```text
++--------+-----------------------+-------------+----------+--------------------+
+| header | fixed-size columns    | null bitmap | offsets  | variable-size data |
+|        | EmployeeId, HireDate  |             |          | FirstName, LastName|
++--------+-----------------------+-------------+----------+--------------------+
+```
+
+Everything with a fixed width — `INT`, `DATE`, `BIT`, `DATETIME2`, `UNIQUEIDENTIFIER` — is packed immediately after the header. Everything with a variable width — `VARCHAR`, `NVARCHAR`, `VARBINARY` — goes at the tail, behind an array of offsets.
+
+The reason is the cost of finding a value:
+
+| Kind of column | How the engine finds it |
+|---|---|
+| Fixed width | Add a constant to the record's address. One addition. |
+| Variable width | Read the column count, index into the offset array, subtract the previous entry, then jump. Two hops. |
+
+This also explains why the three rows are not the same size. `Mofakh`/`Rahman` gives 32 bytes, `Dana`/`Okoye` gives 29, `Priya`/`Sandhu` gives 31. Variable-length storage is charged per value, not per column. Had those columns been `CHAR(50)`, every row would exceed 100 bytes regardless of content.
+
+
+## A delete does not delete
+
+Removing the middle row and re-reading the page produces a result almost everyone predicts wrongly:
+
+```sql
+DELETE FROM dbo.Employees WHERE EmployeeId = 2;
+```
+
+```text
+                before      after
+m_slotCnt        3           3
+m_freeCnt        7998        8027
+m_freeData       188         188
+m_ghostRecCnt    0           0
+m_xactReserved   0           29
+```
+
+Three separate lessons sit in that table.
+
+**The freed space is a hole, not room at the end.** `m_freeCnt` rises by exactly 29 — the deleted record's size. But `m_freeData`, which marks where used space ends, does not move at all, because the *last* record still sits at the tail. So the page now reports 8027 free bytes while being unable to accept a single 8027-byte record. The difference between "free" and "free and contiguous" is called **internal fragmentation**, and it is the reason index rebuilds exist as a maintenance operation.
+
+**The slot count stays at 3.** The directory keeps a dead entry rather than compacting. If slot 1 were removed and slot 2 renumbered to slot 1, every index entry storing the address `(1:392:2)` would silently point at the wrong row. Slot numbers are part of a row's physical address, so they cannot be shuffled.
+
+**The space is reserved, not released.** `m_xactReserved = 29`, tagged with the id of the transaction that performed the delete. Those bytes are held in case that transaction rolls back and the row has to reappear. Space freed by a delete is unavailable to other transactions until the deleting transaction can no longer be undone.
+
+That last one can be watched directly:
+
+```sql
+BEGIN TRANSACTION;
+    DELETE FROM dbo.Employees WHERE EmployeeId = 3;
+    -- dump the page from another session here: the row is gone, space is reserved
+ROLLBACK;
+    -- dump again: the row is back, in its original slot
+```
+
+> **Heaps behave differently from indexed tables here.** Deleting from a heap removes the record. Deleting the same row from a table that has a clustered index does not — it flips the record type to `GHOST_DATA_RECORD`, increments `m_ghostRecCnt`, and leaves the bytes in place for a background task to clean up later. Ghost records let the delete stay lockable and undoable, and let other readers still find the version of the row they are entitled to see. The same `DELETE` statement, against the same data, behaves differently depending on physical structure. This is precisely why storage is worth learning before ORMs.
+
+One more consequence, and it is worth verifying rather than taking on trust. Detail level `2` dumps the page as raw hexadecimal instead of decoding only the valid records:
+
+```bash
+sqlcmd -S localhost,1433 -U sa -P 'Sh1ftL3dger!Dev' -C -d ShiftLedger -y0 \
+  -Q "DBCC TRACEON(3604); DBCC PAGE('ShiftLedger', 1, 392, 2);" | grep -i "dana\|okoye"
+```
+
+```text
+0000000A64B9608C:  00000200 18001d00 44616e61 4f6b6f79 6530000b  ........DanaOkoye0..
+```
+
+The deleted row is not merely present as stray text. It is present as a complete, decodable record:
+
+```text
+00 00           the end of the null bitmap
+02 00           two variable-length columns
+18 00           24  -> FirstName ends at byte 24
+1d 00           29  -> LastName  ends at byte 29
+44 61 6e 61     "Dana"
+4f 6b 6f 79 65  "Okoye"
+30 00 0b        the status bytes of the NEXT record
+```
+
+That final fragment is the following row beginning immediately after the deleted one, at exactly the offset it occupied before the delete. Nothing was compacted, nothing was shifted, nothing was overwritten. The engine adjusted a counter in the page header and stopped.
+
+`DELETE` marks space as reusable. It does not erase it. The bytes persist until some future insert happens to reuse that exact space, which may be never — and a backup taken afterwards contains them too. Deleted rows therefore remain recoverable by anyone able to read the file, which is why deletion is not a data-destruction mechanism for privacy or compliance purposes. Encryption at rest is.
+
+
+## The page being read is not on disk
+
+The very top of the `DBCC PAGE` output describes a memory buffer:
+
+```text
+bpage         = 0x0000000F1DBA4000
+bdbid         = 5
+bReadMicroSec = 220
+bDirtyContext = 0x0000000F1E99E2A0
+```
+
+`DBCC PAGE` does not read the file. It reads the **buffer pool** — the engine's in-memory cache of pages — and prints the contents of one 8192-byte frame of memory.
+
+| Field | Meaning |
+|---|---|
+| `bpage` | The memory address of the 8192-byte frame holding this page |
+| `bdbid` | Database id 5; ids 1–4 are always master, tempdb, model and msdb |
+| `bReadMicroSec` | How long the original read from disk took: 220 microseconds |
+| `bDirtyContext` | Non-null means this page has been changed in memory and not yet written to the `.mdf` |
+
+That last field is the write-ahead protocol visible as a pointer. The three inserted rows exist in memory and in the log file, and quite possibly not yet in the data file at all.
+
+This is the layer every performance discussion eventually reaches. Two numbers appear constantly in later articles:
+
+- **Logical reads** — pages fetched from the buffer pool in memory.
+- **Physical reads** — pages not cached, which had to come from storage.
+
+A query performing 50,000 logical reads is consuming memory bandwidth. The same query performing 50,000 physical reads is consuming disk. Both count the same 8KB page examined throughout this article.
+
+
+## Cheat sheet
+
+```text
+FILES
+  .mdf     data file: the data as it currently stands
+  .ldf     transaction log: every change, written BEFORE it reaches the .mdf
+  model    the template every new database is copied from
+  master   the server's own catalog: logins, database locations
+  tempdb   scratch space, recreated on every restart
+
+WRITE-AHEAD LOGGING
+  commit = force a log record to disk
+  the changed page reaches the data file later, at a checkpoint
+  crash -> replay the log on restart
+
+PAGE (8192 bytes)
+  96-byte header | records growing down | free space | slot array growing up
+  a record cannot span pages -> max row ~8060 bytes
+  wider rows -> fewer per page -> more pages read per query
+
+RECORD
+  [status][fixed-size columns][null bitmap][offset array][variable-size columns]
+  fixed columns    : found by adding a constant    (fast)
+  variable columns : found via the offset array    (two hops)
+  declared column order != stored byte order
+
+HEAP (a table with no clustered index)
+  no order, no links between pages
+  row address = RID = (file : page : slot)
+  scanning means following allocation maps, not a page chain
+
+DELETE
+  frees bytes but leaves a hole in the middle of the page
+  slot count does not shrink (slot numbers are part of row addresses)
+  space stays reserved until the transaction can no longer roll back
+  the bytes are not erased
+
+BUFFER POOL
+  pages live in memory; disk is read only on a miss
+  logical read  = from memory
+  physical read = from disk
+```
+
+
+## Checkpoint
+
+1. A transaction commits and the power fails one millisecond later. The changed row was never written to the `.mdf`. Why is the data not lost?
+2. Why does a brand-new, empty database start at 8MB rather than a few kilobytes?
+3. A page reports 8027 free bytes. Why might it still be unable to store an 8000-byte record?
+4. Why does `m_slotCnt` stay at 3 after one of three rows is deleted?
+5. `HireDate` is declared as the fourth column but stored at byte offset 8, before the second and third columns. Why?
+6. The null bitmap is written even when every column is `NOT NULL`. What, then, does `NOT NULL` actually buy?
+7. A login fails and the client reports only "Login failed for user 'sa'". Where is the real reason, and why is it withheld from the client?
+8. What is the difference between a logical read and a physical read, and why are both counted in pages rather than rows?
+
+
+## What comes next
+
+The picture so far is entirely physical: files, pages, records, byte offsets. There is no notion yet of what the data *means* — nothing prevents two employees sharing an id, or a row referring to a department that does not exist.
+
+The next article moves up one level, to the logical model: what a relation actually is, why a primary key is a statement about identity rather than a performance trick, and how declaring one changes every single byte examined here.

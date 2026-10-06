@@ -1,0 +1,546 @@
+---
+title: "typeof, nameof and Enums in C#"
+date: 2026-09-23
+status: written
+minutes: 16
+order: 12
+lead: "Three things that show up together in everyday code: typeof for talking about a type, nameof for talking about a name, and enums with everything around them — casting, parsing, validating, listing, labelling and serializing."
+---
+
+## The main question
+
+A line like this appears in a lot of codebases:
+
+```csharp
+var column = (ENames)Enum.Parse(typeof(ENames), text);
+```
+
+Three separate ideas are packed into it: `typeof`, enum parsing, and a cast back from `object`. This article unpacks all three, adds `nameof` because it answers a related question, and then covers the enum operations that come up constantly: converting to and from numbers, validating input, listing members, giving them display names, and sending them over the wire.
+
+
+## Type vs value: typeof and GetType
+
+`typeof` takes a **type name** and returns a `Type` object describing it. It is resolved at compile time:
+
+```csharp
+Type t = typeof(string);
+Console.WriteLine(t.Name);   // String
+```
+
+`GetType()` is called on an **object** and reports what that object actually is, at runtime:
+
+```csharp
+object something = "hello";
+Console.WriteLine(something.GetType().Name);   // String
+```
+
+| | `typeof(X)` | `value.GetType()` |
+|---|---|---|
+| Argument | a type name | an instance |
+| Resolved | at compile time | at runtime |
+| Works without an object | yes | no, needs an instance |
+| Works on null | yes | no, throws |
+
+A common mistake is passing a variable to `typeof`:
+
+```csharp
+var status = Status.Active;
+var t1 = typeof(status);   // error CS0118: 'status' is a variable but is used like a type
+var t2 = status.GetType(); // correct
+```
+
+Two more facts worth carrying:
+
+```csharp
+// typeof works with generics, including an "open" generic
+Console.WriteLine(typeof(List<int>).Name);   // List`1
+Console.WriteLine(typeof(List<>).Name);      // List`1   (no type argument supplied)
+
+// inside a generic method, typeof(T) gives the real type argument
+static string Describe<T>() => typeof(T).Name;
+Console.WriteLine(Describe<Status>());       // Status
+```
+
+And when checking a type at runtime, `is` and `GetType()` differ:
+
+```csharp
+object o = "text";
+
+Console.WriteLine(o is string);                  // True  — also true for derived types
+Console.WriteLine(o.GetType() == typeof(string)); // True — exact type only
+```
+
+`typeof` is mostly needed for **reflection**: reading attributes, listing members, or calling older APIs that take a `Type`. Most modern APIs offer a generic version instead, which is shorter and type-safe.
+
+
+## Name as text: nameof
+
+`nameof` turns a program element's name into a **string, at compile time**:
+
+```csharp
+Console.WriteLine(nameof(Status));          // Status
+Console.WriteLine(nameof(Status.Active));   // Active   -- only the last part
+Console.WriteLine(nameof(Console.Write));   // Write
+
+void Save(string customerId)
+{
+    Console.WriteLine(nameof(customerId));  // customerId
+}
+```
+
+The value is baked in by the compiler, so there is no reflection, no allocation, and no runtime cost at all. The point is **refactor safety**: renaming the element updates the string, or breaks the build if something is wrong. A hand-typed `"customerId"` silently goes stale.
+
+Where it earns its place:
+
+```csharp
+// argument validation
+if (rate < 0)
+    throw new ArgumentOutOfRangeException(nameof(rate), rate, "Rate cannot be negative.");
+
+// logging and messages
+logger.LogWarning("{Method} skipped the update", nameof(Save));
+
+// anywhere a literal name is required, such as attributes
+[Display(Name = nameof(Status))]
+public Status Status { get; set; }
+```
+
+For null checks specifically, modern .NET removes the need to type the name at all:
+
+```csharp
+ArgumentNullException.ThrowIfNull(customer);   // the parameter name is captured automatically
+```
+
+That works through `CallerArgumentExpression`, a compiler feature that passes the caller's source text as a hidden argument.
+
+### nameof vs typeof vs ToString
+
+```csharp
+Console.WriteLine(nameof(Status.Active));       // "Active"  compile-time constant, free
+Console.WriteLine(Status.Active.ToString());    // "Active"  computed at runtime, allocates
+Console.WriteLine(typeof(Status).Name);         // "Status"  reflection at runtime
+Console.WriteLine(nameof(Status));              // "Status"  compile-time constant, free
+```
+
+Rule of thumb: if the name is known while writing the code, use `nameof`. Use `ToString()` only when the value is decided at runtime, and `typeof` only when a `Type` object is genuinely needed.
+
+
+## Enums: named numbers
+
+An enum defines a set of named constants:
+
+```csharp
+public enum Status
+{
+    Unknown,     // 0
+    Active,      // 1
+    Suspended,   // 2
+    Closed       // 3
+}
+```
+
+Without explicit values the compiler numbers them from zero. Values can also be written out, which is the safer habit when the numbers are stored anywhere:
+
+```csharp
+public enum Status : byte      // the underlying type, int by default
+{
+    Unknown   = 0,
+    Active    = 1,
+    Suspended = 2,
+    Closed    = 3
+}
+```
+
+Two rules that prevent real bugs:
+
+- **Always define a member for 0.** The default value of an enum field or variable is 0, whether or not a member has that value. A `Status` with no zero member still starts at 0 and prints `0`.
+- **Never renumber an enum whose values are stored** in a database, a file, or a message. The stored numbers do not move with the code.
+
+The underlying type can be checked at runtime:
+
+```csharp
+Console.WriteLine(Enum.GetUnderlyingType(typeof(Status)).Name);   // Byte
+```
+
+Smaller underlying types exist for storage reasons, but `int` is the normal choice.
+
+
+## Enum to number, number to enum
+
+Conversion in both directions is a cast:
+
+```csharp
+int number = (int)Status.Suspended;      // 2
+Status back = (Status)3;                 // Closed
+```
+
+The dangerous direction is number to enum, because **the cast is not checked**:
+
+```csharp
+Status weird = (Status)99;
+Console.WriteLine(weird);        // 99    -- no member has this value
+Console.WriteLine((int)weird);   // 99
+```
+
+The value 99 is stored and carried around as a `Status`, and every `switch` over it falls through to the default case. This is how invalid data from a database, an API or a query string spreads. Validate at the boundary:
+
+```csharp
+Console.WriteLine(Enum.IsDefined(weird));              // False
+Console.WriteLine(Enum.IsDefined(Status.Suspended));   // True
+```
+
+> `Enum.IsDefined` uses reflection and allocates, so it is not free in a hot loop. It also answers `False` for legitimate combinations of a `[Flags]` enum, such as two flags combined. For flags enums, check the individual flags instead.
+
+
+## Text to enum: Parse and TryParse
+
+`Enum.Parse` converts a string to an enum value. The classic form takes a `Type` and returns `object`, so it needs a cast:
+
+```csharp
+var status = (Status)Enum.Parse(typeof(Status), "Active");
+```
+
+The generic form is shorter and needs no cast:
+
+```csharp
+Status status = Enum.Parse<Status>("Active");
+Status loose  = Enum.Parse<Status>("active", ignoreCase: true);
+```
+
+Prefer the generic version. The `typeof` form exists for older code and for cases where the type is only known at runtime.
+
+Two behaviours that surprise people:
+
+```csharp
+Console.WriteLine(Enum.Parse<Status>("2"));    // Suspended  -- numeric strings are accepted
+Console.WriteLine(Enum.Parse<Status>("99"));   // 99         -- and are NOT validated
+```
+
+Parsing a numeric string just converts the number, exactly like a cast, so an undefined value passes straight through. A name, by contrast, must match a real member or the call throws.
+
+`Parse` throws on bad input; `TryParse` reports failure instead:
+
+```csharp
+if (Enum.TryParse<Status>(userInput, ignoreCase: true, out var parsed) && Enum.IsDefined(parsed))
+    Console.WriteLine($"Valid: {parsed}");
+else
+    Console.WriteLine("Not a valid status.");
+```
+
+Both calls together are the safe pattern for untrusted input: `TryParse` rejects nonsense text, and `IsDefined` rejects numbers that happen to parse.
+
+| Call | Bad name | Numeric string with no member |
+|---|---|---|
+| `Enum.Parse<T>` | throws `ArgumentException` | succeeds, returns an undefined value |
+| `Enum.TryParse<T>` | returns `false` | returns `true` |
+| plus `Enum.IsDefined` | — | caught |
+
+> The same `Parse` and `TryParse` pair exists on `int`, `double`, `DateTime`, `Guid` and most other types. `Parse` means "this must work"; `TryParse` means "tell me whether it worked".
+
+
+## Listing the members
+
+```csharp
+foreach (var name in Enum.GetNames<Status>())
+    Console.WriteLine(name);
+
+foreach (var value in Enum.GetValues<Status>())
+    Console.WriteLine($"{value} = {(int)value}");
+
+Console.WriteLine(Enum.GetName(Status.Closed));   // Closed
+```
+
+The generic versions (`GetNames<T>`, `GetValues<T>`, `GetName`) are the modern ones; older code uses the `typeof` overloads. This is how dropdown lists and filter menus are built from an enum.
+
+
+## Two names, one number
+
+C# allows several members to share a value. They become **aliases**:
+
+```csharp
+public enum Result
+{
+    Success   = 1,
+    Completed = 1,   // alias for the same number
+    Failed    = 2
+}
+
+Console.WriteLine((int)Result.Completed);   // 1
+Console.WriteLine(Result.Success == Result.Completed);   // True
+```
+
+Both names compile to the same value, so they are interchangeable. The catch is converting back:
+
+```csharp
+Console.WriteLine((Result)1);   // Success or Completed -- which one is not guaranteed
+```
+
+The runtime returns one of the matching names, and the documentation does not promise which. Never rely on the text for an aliased value.
+
+Aliases are useful when a value genuinely has two accepted names. If two names are meant to be different things, they need different numbers, or every comparison between them silently becomes true.
+
+
+## Display names for enums
+
+Enum member names are identifiers, so they cannot contain spaces. For a user interface, the usual approach is an attribute plus a small extension method:
+
+```csharp
+using System.ComponentModel;
+using System.Reflection;
+
+public enum Status
+{
+    Unknown = 0,
+
+    [Description("Active customer")]
+    Active = 1,
+
+    [Description("Temporarily suspended")]
+    Suspended = 2,
+
+    Closed = 3
+}
+
+public static class EnumExtensions
+{
+    public static string GetLabel<TEnum>(this TEnum value) where TEnum : struct, Enum
+    {
+        FieldInfo? member = typeof(TEnum).GetField(value.ToString());
+        var attribute = member?.GetCustomAttribute<DescriptionAttribute>();
+
+        return attribute?.Description ?? value.ToString();
+    }
+}
+```
+
+```csharp
+Console.WriteLine(Status.Suspended.GetLabel());   // Temporarily suspended
+Console.WriteLine(Status.Closed.GetLabel());      // Closed          -- falls back to the name
+Console.WriteLine(((Status)99).GetLabel());       // 99              -- no member, no attribute
+```
+
+Two notes on this pattern. Enums cannot have methods, which is why this is an extension method. And it uses reflection on every call, so for a hot path either cache the results in a dictionary or skip attributes entirely and use a `switch` expression that maps values to text.
+
+The `where TEnum : struct, Enum` constraint is what keeps the method available only on enum types.
+
+
+## Enums in a switch
+
+A `switch` expression over an enum is the clearest way to map values to behaviour:
+
+```csharp
+static string NextAction(Status status) => status switch
+{
+    Status.Unknown   => "investigate",
+    Status.Active    => "nothing to do",
+    Status.Suspended => "contact the customer",
+    Status.Closed    => "archive",
+    _                => throw new ArgumentOutOfRangeException(nameof(status), status, "Unhandled status.")
+};
+```
+
+The final arm matters. The compiler does **not** guarantee that an enum variable holds a defined value, so a switch without a default can fail at runtime with an unmatched value. Throwing there also makes a newly added enum member show up immediately instead of being silently ignored.
+
+
+## Enums on the wire: JSON
+
+By default, `System.Text.Json` writes enums as **numbers**:
+
+```text
+{"id":"A-1","status":2}
+```
+
+Numbers are compact and stable, but unreadable in logs and fragile if anyone renumbers the enum. Writing them as names is one converter away:
+
+```csharp
+var options = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    Converters = { new JsonStringEnumConverter() }
+};
+```
+
+```text
+{"id":"A-1","status":"Suspended"}
+```
+
+Reading is forgiving in both directions: with the converter in place, both `"Suspended"` and `2` deserialize successfully. Choose one shape for a public API and keep it, since switching later breaks older clients.
+
+
+## Full example
+
+```csharp
+using System.ComponentModel;
+using System.Reflection;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+// ---- typeof and nameof ----
+object boxed = Status.Active;
+
+Console.WriteLine($"type name       : {typeof(Status).Name}");
+Console.WriteLine($"underlying type : {Enum.GetUnderlyingType(typeof(Status)).Name}");
+Console.WriteLine($"runtime type    : {boxed.GetType().Name}");
+Console.WriteLine($"exact match     : {boxed.GetType() == typeof(Status)}");
+Console.WriteLine($"nameof member   : {nameof(Status.Active)}");
+Console.WriteLine();
+
+// ---- listing members ----
+Console.WriteLine("Members:");
+foreach (var value in Enum.GetValues<Status>())
+    Console.WriteLine($"  {value,-10} = {(byte)value,-3} label: {value.GetLabel()}");
+Console.WriteLine();
+
+// ---- converting ----
+Console.WriteLine($"enum to number  : {(byte)Status.Closed}");
+Console.WriteLine($"number to enum  : {(Status)2}");
+Console.WriteLine($"undefined cast  : {(Status)99}  defined: {Enum.IsDefined((Status)99)}");
+Console.WriteLine();
+
+// ---- parsing ----
+Console.WriteLine($"parse name      : {Enum.Parse<Status>("Suspended")}");
+Console.WriteLine($"parse ignorecase: {Enum.Parse<Status>("suspended", ignoreCase: true)}");
+Console.WriteLine($"parse number    : {Enum.Parse<Status>("2")}");
+Console.WriteLine($"parse unknown   : {Enum.Parse<Status>("99")}");
+Console.WriteLine($"safe parse ok   : {TryRead("Closed")}");
+Console.WriteLine($"safe parse text : {TryRead("banana")}");
+Console.WriteLine($"safe parse 99   : {TryRead("99")}");
+Console.WriteLine();
+
+// ---- switch ----
+Console.WriteLine($"action (Active) : {NextAction(Status.Active)}");
+try
+{
+    NextAction((Status)99);
+}
+catch (ArgumentOutOfRangeException ex)
+{
+    Console.WriteLine($"action (99)     : rejected - {ex.ParamName}");
+}
+Console.WriteLine();
+
+// ---- json ----
+var account = new Account("A-1", Status.Suspended);
+
+var numbers = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+var names   = new JsonSerializerOptions(numbers) { Converters = { new JsonStringEnumConverter() } };
+
+Console.WriteLine($"json (numbers)  : {JsonSerializer.Serialize(account, numbers)}");
+Console.WriteLine($"json (names)    : {JsonSerializer.Serialize(account, names)}");
+
+static string TryRead(string input) =>
+    Enum.TryParse<Status>(input, ignoreCase: true, out var parsed) && Enum.IsDefined(parsed)
+        ? parsed.ToString()
+        : "rejected";
+
+static string NextAction(Status status) => status switch
+{
+    Status.Unknown   => "investigate",
+    Status.Active    => "nothing to do",
+    Status.Suspended => "contact the customer",
+    Status.Closed    => "archive",
+    _                => throw new ArgumentOutOfRangeException(nameof(status), status, "Unhandled status.")
+};
+
+// ======================= types =======================
+
+public enum Status : byte
+{
+    Unknown = 0,
+
+    [Description("Active customer")]
+    Active = 1,
+
+    [Description("Temporarily suspended")]
+    Suspended = 2,
+
+    Closed = 3
+}
+
+public sealed record Account(string Id, Status Status);
+
+public static class EnumExtensions
+{
+    public static string GetLabel<TEnum>(this TEnum value) where TEnum : struct, Enum
+    {
+        FieldInfo? member = typeof(TEnum).GetField(value.ToString());
+        var attribute = member?.GetCustomAttribute<DescriptionAttribute>();
+
+        return attribute?.Description ?? value.ToString();
+    }
+}
+```
+
+Output:
+
+```text
+type name       : Status
+underlying type : Byte
+runtime type    : Status
+exact match     : True
+nameof member   : Active
+
+Members:
+  Unknown    = 0   label: Unknown
+  Active     = 1   label: Active customer
+  Suspended  = 2   label: Temporarily suspended
+  Closed     = 3   label: Closed
+
+enum to number  : 3
+number to enum  : Suspended
+undefined cast  : 99  defined: False
+
+parse name      : Suspended
+parse ignorecase: Suspended
+parse number    : Suspended
+parse unknown   : 99
+safe parse ok   : Closed
+safe parse text : rejected
+safe parse 99   : rejected
+
+action (Active) : nothing to do
+action (99)     : rejected - status
+
+json (numbers)  : {"id":"A-1","status":2}
+json (names)    : {"id":"A-1","status":"Suspended"}
+```
+
+Two lines deserve attention. `parse number` shows that `"2"` was accepted and resolved to the member with that value, `Suspended`. And `parse unknown` printed `99`, because `Parse` accepted a number with no matching member at all — exactly the hole that `IsDefined` closes inside `TryRead`, where the same input is rejected.
+
+
+## Cheat sheet
+
+```text
+typeof(X)          a Type object for a type name, resolved at compile time
+value.GetType()    the runtime type of an instance
+nameof(X)          the element's name as a compile-time string, free at runtime
+
+enum to number     (int)Status.Closed
+number to enum     (Status)3          -- NOT validated
+validate           Enum.IsDefined(value)
+
+text to enum       Enum.Parse<Status>(text)                 throws on a bad name
+                   Enum.Parse<Status>(text, ignoreCase: true)
+safe               Enum.TryParse<Status>(text, out var v)   returns false on a bad name
+untrusted input    TryParse + IsDefined      (numbers pass TryParse on their own)
+
+list members       Enum.GetNames<Status>() / Enum.GetValues<Status>()
+one name           Enum.GetName(value)
+underlying type    Enum.GetUnderlyingType(typeof(Status))
+
+always define a member for 0     the default value of any enum is 0
+never renumber a stored enum     the stored numbers do not move
+always add a default switch arm  an enum can hold an undefined value
+json                             numbers by default; JsonStringEnumConverter for names
+```
+
+
+## Checkpoint
+
+1. Why does `typeof(status)` fail when `status` is a variable, and what should be used instead?
+2. What does `nameof(Status.Active)` produce, and what does it cost at runtime?
+3. Is `(Status)99` legal? What does it print, and how can it be detected?
+4. `Enum.Parse<Status>("99")` does not throw. Why, and which check catches it?
+5. Which two calls together make untrusted text safe to turn into an enum?
+6. Two enum members share the value 1. What does converting the number 1 back to the enum return?
+7. Why is a display-name helper for an enum written as an extension method rather than a method on the enum?

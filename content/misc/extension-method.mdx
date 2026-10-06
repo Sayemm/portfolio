@@ -1,0 +1,413 @@
+---
+title: "Extension Methods in C#"
+date: 2026-09-23
+status: written
+minutes: 14
+order: 13
+lead: "How a method can appear on a type that does not define it: the this parameter, how the compiler rewrites the call, why instance methods always win, why extension methods survive a null reference, and where LINQ comes from."
+---
+
+## The main question
+
+```csharp
+var names = people.Where(p => p.Age > 18).Select(p => p.Name).ToList();
+```
+
+`List<T>` does not define `Where`, `Select` or `ToList`. Neither does `IEnumerable<T>`. So where do they come from?
+
+They are **extension methods**: static methods written somewhere else that the compiler lets code call as if they were part of the type. This article covers how they work, the rules around them, and the traps that come up in real code.
+
+
+## Helper call vs extension call
+
+Start with an ordinary static helper:
+
+```csharp
+public static class TextHelper
+{
+    public static string Shout(string text) => text.ToUpperInvariant() + "!";
+}
+
+Console.WriteLine(TextHelper.Shout("hello"));   // HELLO!
+```
+
+Adding one keyword turns it into an extension method:
+
+```csharp
+public static class TextExtensions
+{
+    public static string Shout(this string text) => text.ToUpperInvariant() + "!";
+    //                        ^^^^
+}
+
+Console.WriteLine("hello".Shout());   // HELLO!
+```
+
+The word `this` on the **first parameter** says: *this method can be called as if it belonged to that type.*
+
+Nothing is added to `string`. The compiler simply rewrites the call:
+
+```text
+"hello".Shout()      becomes      TextExtensions.Shout("hello")
+```
+
+Both lines compile to exactly the same thing. An extension method is a plain static method with nicer call syntax.
+
+
+## The rules for writing one
+
+```csharp
+public static class TextExtensions      // 1. a static class
+{
+    public static string Shout(         // 2. a static method
+        this string text,               // 3. this on the first parameter
+        int times = 1)                  // 4. any other parameters follow normally
+        => string.Concat(Enumerable.Repeat(text.ToUpperInvariant() + "!", times));
+}
+
+Console.WriteLine("hi".Shout(2));   // HI!HI!
+```
+
+1. The containing class must be **static** and not nested inside another class.
+2. The method must be **static**.
+3. `this` goes on the **first** parameter only. That parameter's type is the type being extended.
+4. Everything after the first parameter behaves like a normal argument list.
+
+And one rule that lives outside the class: the namespace holding the extension class must be **in scope** where the method is called.
+
+
+## Visible vs invisible: extensions need a using
+
+An extension method is only offered if its namespace is imported:
+
+```csharp
+using MyApp.Text;      // without this line, "hello".Shout() does not compile
+```
+
+The error when it is missing is a familiar one:
+
+```text
+CS1061: 'string' does not contain a definition for 'Shout' and no accessible extension method 'Shout'
+accepting a first argument of type 'string' could be found (are you missing a using directive?)
+```
+
+That last clause is the giveaway: the method exists, but the compiler is not allowed to see it.
+
+This is exactly why LINQ requires `using System.Linq`. In modern projects that line is usually invisible because **implicit usings** add it for every file, and a `global using` in one file has the same effect project-wide.
+
+> Practical consequence: put extension methods in a namespace that callers choose to import, and keep it small. An extension class dropped into a widely used namespace adds its methods to **every** value of that type across the project, which is how `object` extensions end up polluting IntelliSense everywhere.
+
+
+## Instance method vs extension method: instance always wins
+
+The compiler looks for a real instance method first. Extension methods are only considered when nothing else matches:
+
+```csharp
+var basket = new Basket();
+Console.WriteLine(basket.Describe());   // instance
+
+public class Basket
+{
+    public string Describe() => "instance";
+}
+
+public static class BasketExtensions
+{
+    public static string Describe(this Basket basket) => "extension";
+}
+```
+
+Output:
+
+```text
+instance
+```
+
+No error, no warning, no ambiguity: the extension method is simply never chosen. The same thing happens silently when a library adds a real method with a name an extension was already using. The call keeps compiling and starts doing something else.
+
+The search order:
+
+```text
+1. instance methods on the type (and its base types)
+2. extension methods in namespaces that are imported
+     - the nearest enclosing namespace first, then outward
+3. nothing found -> CS1061
+```
+
+If two imported extension methods match equally well, the result is a compile error about an ambiguous call. The fix is to call one the long way, as a normal static method.
+
+
+## Null: the surprising part
+
+An extension method is a static call, so **the receiver is allowed to be null**. The method decides what to do about it:
+
+```csharp
+string? nothing = null;
+
+Console.WriteLine(nothing.IsBlank());      // True   -- no exception
+// Console.WriteLine(nothing.Length);      // NullReferenceException
+
+public static class TextExtensions
+{
+    public static bool IsBlank(this string? text) => string.IsNullOrWhiteSpace(text);
+}
+```
+
+This works because the call becomes `TextExtensions.IsBlank(nothing)`, and passing null to a static method is normal.
+
+Two consequences worth knowing:
+
+- An extension method can be **null-tolerant by design**, which is useful for helpers such as `IsBlank` or `OrEmpty`. Mark the parameter type nullable (`this string? text`) so callers see the intent.
+- If the parameter is **not** nullable and the body uses it, a null receiver still produces a `NullReferenceException`, but thrown from inside the helper rather than at the call site. For public APIs, guard it:
+
+```csharp
+public static string Shout(this string text)
+{
+    ArgumentNullException.ThrowIfNull(text);
+    return text.ToUpperInvariant() + "!";
+}
+```
+
+> The null-conditional operator does not help here. `text?.Shout()` skips the call when `text` is null, which defeats a null-tolerant extension. And extension methods cannot be invoked through `?.` reliably for that reason.
+
+
+## What extension methods cannot do
+
+| Cannot | Why |
+|---|---|
+| Add fields or state | They are static methods; there is nowhere to store anything |
+| Access private or protected members | They are outside the type, bound by normal accessibility |
+| Override an existing method | The instance method always wins |
+| Extend a static class such as `Math` | There is no instance to be the first parameter |
+| Satisfy an interface | Implementing a member requires a real member on the type |
+| Be found without the namespace | No import, no method |
+
+The last two matter in design. An extension method on `IReportable` is **not** part of the interface contract: a type implementing that interface has not promised the behaviour, and a mock or a different implementation cannot replace it.
+
+
+## What they are good for
+
+**Extending types that cannot be modified.** `string`, `int`, `DateTime`, and types from libraries are sealed or simply not editable. An extension method adds the convenience without a wrapper class.
+
+**Extending interfaces once for every implementor.** This is the biggest win, and the reason LINQ exists. Write one method on `IEnumerable<T>` and every array, list, set and custom sequence gets it:
+
+```csharp
+int[] numbers = [1, 2, 3, 4, 5, 6];
+
+foreach (var n in numbers.WhereMine(n => n % 2 == 0))
+    Console.WriteLine(n);
+
+public static class MyEnumerable
+{
+    public static IEnumerable<T> WhereMine<T>(this IEnumerable<T> source, Func<T, bool> predicate)
+    {
+        foreach (var item in source)
+            if (predicate(item))
+                yield return item;
+    }
+}
+```
+
+Output:
+
+```text
+2
+4
+6
+```
+
+That is the real `Where`, minus argument checking. Every LINQ operator is an extension method on `IEnumerable<T>`, which is why they chain: each one takes a sequence and returns a sequence.
+
+**Extending enums.** An enum cannot have methods, so extension methods are the standard way to attach behaviour to one:
+
+```csharp
+Console.WriteLine(Status.Active.IsFinal());     // False
+Console.WriteLine(Status.Closed.IsFinal());     // True
+
+public enum Status { Active, Suspended, Closed }
+
+public static class StatusExtensions
+{
+    public static bool IsFinal(this Status status) => status == Status.Closed;
+}
+```
+
+**Extending a generic type with a constraint**, so the method appears only where it makes sense:
+
+```csharp
+public static class NumberExtensions
+{
+    public static T ClampMin<T>(this T value, T minimum) where T : IComparable<T>
+        => value.CompareTo(minimum) < 0 ? minimum : value;
+}
+
+Console.WriteLine(3.ClampMin(10));        // 10
+Console.WriteLine("m".ClampMin("d"));     // m
+```
+
+
+## Helper class vs extension method
+
+The same three operations, written both ways. First as static helpers:
+
+```csharp
+string clean = TextHelper.Ellipsis(TextHelper.CollapseSpaces(TextHelper.StripTags(raw)), 20);
+```
+
+Reading that requires starting in the middle and working outward, and the order of operations is the reverse of the order they are written.
+
+As extension methods:
+
+```csharp
+string clean = raw.StripTags().CollapseSpaces().Ellipsis(20);
+```
+
+Left to right, in the order things happen. This is the main practical reason extension methods exist: **a pipeline reads better than nested calls.**
+
+
+## Full example
+
+```csharp
+using System.Text.RegularExpressions;
+
+string raw = "<p>Hello   <b>world</b>, extension methods are handy.</p>";
+
+Console.WriteLine(raw.StripTags());
+Console.WriteLine(raw.StripTags().CollapseSpaces());
+Console.WriteLine(raw.StripTags().CollapseSpaces().Ellipsis(20));
+Console.WriteLine(raw.StripTags().CollapseSpaces().Ellipsis(100));
+
+string? missing = null;
+Console.WriteLine($"missing is blank: {missing.IsBlank()}");
+
+int[] numbers = [5, 12, 3, 20, 8];
+Console.WriteLine($"big numbers: {string.Join(", ", numbers.WhereMine(n => n > 5))}");
+
+// ======================= the extensions =======================
+
+public static class TextExtensions
+{
+    public static bool IsBlank(this string? text) => string.IsNullOrWhiteSpace(text);
+
+    public static string StripTags(this string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        return Regex.Replace(text, "<.*?>", "");
+    }
+
+    public static string CollapseSpaces(this string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        return Regex.Replace(text, @"\s+", " ").Trim();
+    }
+
+    public static string Ellipsis(this string text, int maxLength)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        if (maxLength < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxLength));
+
+        return text.Length <= maxLength
+            ? text
+            : text[..(maxLength - 1)] + "…";
+    }
+}
+
+public static class MyEnumerable
+{
+    public static IEnumerable<T> WhereMine<T>(this IEnumerable<T> source, Func<T, bool> predicate)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(predicate);
+
+        foreach (var item in source)
+            if (predicate(item))
+                yield return item;
+    }
+}
+```
+
+Output:
+
+```text
+Hello   world, extension methods are handy.
+Hello world, extension methods are handy.
+Hello world, extens…
+Hello world, extension methods are handy.
+missing is blank: True
+big numbers: 12, 20
+```
+
+Points to notice:
+
+- `StripTags` returns a `string`, so `CollapseSpaces` can be called on the result. Chaining works because each method returns the type the next one extends.
+- `Ellipsis(100)` returns the text unchanged, since it is already shorter than the limit.
+- `IsBlank` was called on a null variable and returned `True` instead of throwing.
+- `WhereMine` works on an `int[]` even though arrays define no such method, because it extends `IEnumerable<T>`.
+
+
+## Newer: extension members
+
+Until recently, only **methods** could be extensions. Newer C# adds an `extension` block, which allows extension **properties** and static members as well:
+
+```csharp
+public static class TextExtensions
+{
+    extension(string text)
+    {
+        public bool IsBlank => string.IsNullOrWhiteSpace(text);   // an extension property
+        public string Shout() => text.ToUpperInvariant() + "!";   // a method, same as before
+    }
+}
+
+Console.WriteLine("  ".IsBlank);   // True
+```
+
+> This arrived in C# 14 / .NET 10. Projects on an older language version still need the classic form, and the classic form remains valid everywhere. Check the project's language version before using it.
+
+
+## Guidelines
+
+- **Extend narrowly.** Extending `object` or `string` puts a method on everything. Extending a domain type or an interface keeps the surface small.
+- **Put extensions in their own namespace**, so importing them is a choice.
+- **Name for the caller, not the implementation.** `order.IsOverdue()` reads well; `OrderUtils.CheckOverdueStatus(order)` does not.
+- **Prefer a real method when the type is editable.** Extension methods are a workaround for types that cannot be changed, not a default place to put logic.
+- **Keep them pure where possible.** A method that looks like it belongs to the type but quietly mutates it, logs, or calls a database is surprising.
+- **Guard public arguments**, with `ArgumentNullException.ThrowIfNull`, unless the method is deliberately null-tolerant.
+
+
+## Cheat sheet
+
+```text
+Writing one
+    static class + static method + "this" on the FIRST parameter
+
+Calling one
+    value.Method(args)   is rewritten to   Helper.Method(value, args)
+
+Finding one
+    the namespace must be imported (using / global using / implicit usings)
+    missing import -> CS1061 "are you missing a using directive?"
+
+Resolution
+    instance method  >  extension method  >  compile error
+    two equal matches -> ambiguous call error
+
+Null
+    the receiver MAY be null; the method decides what happens
+
+Cannot
+    add state, touch private members, override a method,
+    extend a static class, or implement an interface member
+```
+
+
+## Checkpoint
+
+1. What are the three requirements for declaring an extension method?
+2. What does the compiler turn `"abc".Shout()` into?
+3. A class defines `Describe()` and an imported extension also defines `Describe()`. Which one runs?
+4. Why does calling an extension method on a null reference not always throw?
+5. Why can an extension method not be used to implement an interface member?
+6. Why do all LINQ operators chain so easily?

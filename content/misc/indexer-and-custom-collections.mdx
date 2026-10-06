@@ -1,0 +1,689 @@
+---
+title: "Indexers and Custom Collections in C#"
+date: 2026-09-21
+status: written
+minutes: 16
+order: 6
+lead: "What obj[key, query] really is, how a class extends Dictionary with a second indexer, what base[key] and StringBuilder do, and why holding a dictionary usually beats being one."
+---
+
+## The main question
+
+API client code often contains a line like this:
+
+```csharp
+string url = urls[Endpoints.Users, query];
+```
+
+Two things inside square brackets, on something that looks like a dictionary. It reads like special syntax. It is not. It is a **custom indexer** on a class that **inherits from `Dictionary`**, and every piece of it is ordinary C#.
+
+This article builds that pattern from zero, runs it end to end, then shows why the pattern is weak and replaces it with a better design, also end to end.
+
+Concepts covered, in order:
+
+| Concept | One-line meaning |
+|---|---|
+| Indexer | A property that takes parameters, invoked with square brackets |
+| Multi-parameter indexer | An indexer with more than one parameter |
+| Indexer overloading | Several indexers on one class, picked by argument types |
+| Inheriting `Dictionary<TKey, TValue>` | A class that is a dictionary, plus extra members |
+| Collection initializers | The two ways to fill a dictionary at construction |
+| `base` | The parent class's version of a member |
+| `StringBuilder` | A mutable text buffer for building strings |
+| `sealed` | A class that nobody may inherit from |
+| Composition | Holding a dictionary privately instead of being one |
+
+
+## Property vs indexer
+
+A property has a name and no parameters:
+
+```csharp
+public class Player
+{
+    public string Name { get; set; } = "";
+}
+
+var p = new Player();
+p.Name = "Ada";
+Console.WriteLine(p.Name);   // Ada
+```
+
+An indexer has parameters and **no name**. Because it is invoked through the object itself, the name slot holds the keyword `this`:
+
+```csharp
+public class Inventory
+{
+    private readonly string[] _items = ["sword", "shield", "potion"];
+
+    public string this[int index]
+    {
+        get => _items[index];
+        set => _items[index] = value;
+    }
+}
+
+var inv = new Inventory();
+Console.WriteLine(inv[0]);   // sword
+inv[0] = "axe";
+Console.WriteLine(inv[0]);   // axe
+```
+
+Side by side, the structure is identical:
+
+```csharp
+public string Name { get; set; }            // called as: obj.Name
+public string this[int i] { get; set; }     // called as: obj[i]
+```
+
+The only difference: the second one takes parameters.
+
+> Under the hood, the compiler emits an indexer as two ordinary methods, `get_Item` and `set_Item`. That is why a class with an indexer cannot also declare a property literally named `Item`: the names collide.
+
+
+## One parameter vs many
+
+Nothing limits an indexer to a single parameter:
+
+```csharp
+public class Grid
+{
+    private readonly int[,] _cells = new int[3, 3];
+
+    public int this[int row, int col]
+    {
+        get => _cells[row, col];
+        set => _cells[row, col] = value;
+    }
+}
+
+var g = new Grid();
+g[1, 2] = 5;
+Console.WriteLine(g[1, 2]);   // 5
+```
+
+`g[1, 2]` is a normal call to a two-parameter indexer. The same is true of `urls[Endpoints.Users, query]`.
+
+
+## Override vs overload: many indexers on one class
+
+Indexers overload exactly like methods. The compiler picks one by the number and types of the arguments:
+
+```csharp
+public class Lookup
+{
+    public string this[int id]               => $"by-id:{id}";
+    public string this[string name]          => $"by-name:{name}";
+    public string this[int id, bool verbose] => verbose ? $"verbose:{id}" : $"plain:{id}";
+}
+
+var l = new Lookup();
+Console.WriteLine(l[7]);          // by-id:7
+Console.WriteLine(l["ada"]);      // by-name:ada
+Console.WriteLine(l[7, true]);    // verbose:7
+```
+
+Three indexers, one class, no conflict. This is the key fact for the rest of the article: **adding a two-parameter indexer to a class that already has a one-parameter indexer is an overload, not an override.** Both keep working.
+
+
+## Is-a: inheriting `Dictionary`
+
+```csharp
+public enum Endpoints { Users, Orders }
+
+public class BaseUrlDictionary : Dictionary<Endpoints, string>
+{
+}
+```
+
+The body is empty, yet the class already has everything `Dictionary<Endpoints, string>` has: the one-parameter indexer (get and set), `Add`, `Remove`, `Clear`, `ContainsKey`, `TryGetValue`, `Count`, `Keys`, `Values`, and enumeration.
+
+```csharp
+var urls = new BaseUrlDictionary();
+urls.Add(Endpoints.Users, "/api/users");
+Console.WriteLine(urls[Endpoints.Users]);   // /api/users
+Console.WriteLine(urls.Count);              // 1
+```
+
+This is an **is-a** relationship. A `BaseUrlDictionary` is a `Dictionary<Endpoints, string>`, and can be passed anywhere one is expected.
+
+
+## Add vs set: two initializer forms
+
+A dictionary can be filled at construction in two ways. They look similar and behave differently.
+
+**Indexer initializer** — calls the indexer's setter:
+
+```csharp
+var a = new BaseUrlDictionary
+{
+    [Endpoints.Users]  = "/api/users",
+    [Endpoints.Orders] = "/api/orders"
+};
+```
+
+**Collection initializer** — calls `Add(key, value)` for each pair:
+
+```csharp
+var b = new BaseUrlDictionary
+{
+    { Endpoints.Users,  "/api/users"  },
+    { Endpoints.Orders, "/api/orders" }
+};
+```
+
+In the second form, each inner pair is **a list of arguments to `Add`**, not a nested object. The form works on any type that implements `IEnumerable` and has a matching `Add` method, which a class inherits for free from `Dictionary`.
+
+The behavioral difference shows up with a duplicate key:
+
+```csharp
+var overwrite = new BaseUrlDictionary
+{
+    [Endpoints.Users] = "/api/users",
+    [Endpoints.Users] = "/api/people"      // silently wins
+};
+Console.WriteLine(overwrite[Endpoints.Users]);   // /api/people
+
+var strict = new BaseUrlDictionary
+{
+    { Endpoints.Users, "/api/users"  },
+    { Endpoints.Users, "/api/people" }     // throws ArgumentException
+};
+```
+
+| Form | Calls | Duplicate key |
+|---|---|---|
+| Indexer initializer | the indexer setter | last value silently wins |
+| Collection initializer | `Add` | throws `ArgumentException` |
+
+For a hand-written table of URLs, the collection-initializer form is the safer choice: a copy-paste duplicate fails loudly at startup instead of silently replacing an entry.
+
+
+## Parameter, not magic: what `key` is
+
+Inside an indexer, parameters are plain variables, exactly like method parameters:
+
+```csharp
+public string Greet(string name) => "Hello " + name;
+
+Greet("Ada");   // inside the method: name = "Ada"
+```
+
+```csharp
+public string this[Endpoints key, PageQuery? query]
+{
+    get
+    {
+        // inside here: key and query are ordinary variables
+    }
+}
+```
+
+A call such as `urls[Endpoints.Users, someQuery]` runs the `get` block with:
+
+```text
+key   = Endpoints.Users
+query = someQuery
+```
+
+The name `key` is simply a choice. `endpoint` would work identically.
+
+
+## this vs base
+
+### base outside of dictionaries
+
+```csharp
+public class Animal
+{
+    public string Speak() => "Some sound";
+}
+
+public class Dog : Animal
+{
+    public string SpeakLoudly()
+    {
+        string parentSound = base.Speak();   // Animal's version
+        return parentSound + "!!!";
+    }
+}
+
+Console.WriteLine(new Dog().SpeakLoudly());   // Some sound!!!
+```
+
+`base` is a keyword, like `this`. It exists only inside a class that inherits from something, and it means **"the parent part of this object."**
+
+### base[key] inside the dictionary
+
+For `BaseUrlDictionary : Dictionary<Endpoints, string>`, the parent is the dictionary. The parent already knows how to look a value up by key. So inside the class:
+
+```csharp
+base[key]
+```
+
+means **"parent dictionary, use the normal lookup and return the value stored for this key."**
+
+It is the same lookup available from outside the class. Only the way of reaching it differs:
+
+```text
+Outside the class:  urls[key]    a variable points at the dictionary
+Inside the class:   base[key]    the dictionary part of this same object
+```
+
+Where the data actually lives:
+
+```text
++------------------- BaseUrlDictionary object -------------------+
+|                                                                |
+|   +------------- Dictionary part (the base) -------------+     |
+|   |   Users  -> "/api/users"                             |     |
+|   |   Orders -> "/api/orders"                            | <-- base[key] reads here
+|   +------------------------------------------------------+     |
+|                                                                |
+|   + the extra two-parameter indexer                            |
++----------------------------------------------------------------+
+```
+
+The entries were stored by the parent's `Add` method during initialization. The derived class never wrote storage code, so it asks the parent.
+
+### Why base[key] and not this[key]
+
+In this class, `this[key]` would resolve to the same inherited one-parameter indexer and would work. `base[key]` is still the better choice:
+
+- **Intent.** It says "read the raw stored value, do not re-enter this class's own logic."
+- **Safety.** If someone later hides the parent indexer with a `new` one-parameter indexer, `this[key]` silently changes meaning. `base[key]` does not.
+- **Clarity.** It removes any doubt about accidental recursion.
+
+> `base[key]` throws `KeyNotFoundException` for a missing key. For a URL table this is desirable: a forgotten registration fails immediately instead of producing a URL built from `null`.
+
+
+## string vs StringBuilder
+
+A `string` in C# can never change after creation. It is **immutable**. This code only looks like it modifies a string:
+
+```csharp
+string url = "/api/users";
+url = url + "?page=2";     // a brand-new string is created; the old one is discarded
+```
+
+Doing that once is harmless. Doing it in a loop creates many throwaway strings.
+
+`StringBuilder` is a **mutable text buffer**. Text is appended as many times as needed, and a real string is produced once at the end:
+
+```csharp
+using System.Text;
+
+var builder = new StringBuilder("/api/users");   // 1. start with this text
+builder.Append("?page=2");                       // 2. add to the end
+builder.Append("&size=10");                      //    and again
+string result = builder.ToString();              // 3. produce the finished string
+
+Console.WriteLine(result);   // /api/users?page=2&size=10
+```
+
+Passing a value to the constructor sets the **starting text**:
+
+```text
+new StringBuilder()               empty buffer
+new StringBuilder("/api/users")   buffer already containing "/api/users"
+```
+
+`Append` returns the same builder, so calls chain:
+
+```csharp
+var url = new StringBuilder("/api/users")
+    .Append("?page=").Append(2)
+    .Append("&size=").Append(10)
+    .ToString();
+```
+
+Now the line from real client code reads plainly:
+
+```csharp
+var builder = new StringBuilder(base[key]);
+```
+
+> Look up the base URL for this endpoint in the dictionary, and start building the final URL from it.
+
+> For a single small append, plain `+` is fine. `StringBuilder` earns its place when a URL is assembled from many pieces, such as a query string built property by property.
+
+
+## Open vs sealed
+
+```csharp
+public sealed class Foo { }
+public class Bar : Foo { }   // error CS0509: cannot derive from sealed type 'Foo'
+```
+
+`sealed` marks a class as a leaf: no class may inherit from it. Two reasons to use it:
+
+- **Design signal.** The class is an implementation detail, not an extension point.
+- **Performance.** The JIT can skip virtual dispatch on a sealed type, because no derived type can exist. A small, free win.
+
+Helper classes in API clients are often declared `private sealed` and nested inside the client class. Together, those two words mean: *visible only to the containing class, and not built to be extended.*
+
+
+## Vestigial generics: type parameters that do nothing
+
+Real code sometimes contains this:
+
+```csharp
+private sealed class BaseUrlDictionary<TKey, TItem> : Dictionary<Endpoints, string>
+```
+
+`TKey` and `TItem` appear nowhere in the body or the base type. They have no effect. The author most likely intended the base to be `Dictionary<TKey, TItem>` and then hard-coded it instead.
+
+The only visible consequence is noise at construction:
+
+```csharp
+new BaseUrlDictionary<Endpoints, string>();   // type arguments required, yet unused
+```
+
+It compiles and works. Removing both type parameters is a safe cleanup.
+
+
+## End to end: the original pattern
+
+Everything above, assembled. A `PageQuery` record carries paging values. `Orders` must always be requested with paging; `Users` may or may not be. Paste into `Program.cs` of a console app (top-level statements first, types below).
+
+```csharp
+using System.Text;
+
+var urls = new BaseUrlDictionary
+{
+    { Endpoints.Users,  "/api/users"  },
+    { Endpoints.Orders, "/api/orders" }
+};
+
+// ---- normal use ----
+Console.WriteLine(urls[Endpoints.Users]);                          // inherited 1-parameter indexer
+Console.WriteLine(urls[Endpoints.Users, null]);                    // custom indexer, no query
+Console.WriteLine(urls[Endpoints.Users, new PageQuery(2, 10)]);    // custom indexer, with query
+Console.WriteLine(urls[Endpoints.Orders, new PageQuery(1, 50)]);   // custom indexer, required query
+
+try
+{
+    Console.WriteLine(urls[Endpoints.Orders, null]);               // breaks the paging rule
+}
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ---- the weaknesses ----
+Console.WriteLine(urls[Endpoints.Orders]);                         // 1-parameter door skips the rule
+
+urls[Endpoints.Users] = "https://wrong.example.com";               // anyone can overwrite a URL
+Console.WriteLine(urls[Endpoints.Users, null]);
+
+urls.Clear();                                                      // anyone can wipe the table
+Console.WriteLine($"Entries left: {urls.Count}");
+
+// ======================= types =======================
+
+public enum Endpoints { Users, Orders }
+
+public sealed record PageQuery(int Page, int Size);
+
+public sealed class BaseUrlDictionary : Dictionary<Endpoints, string>
+{
+    public string this[Endpoints key, PageQuery? query]
+    {
+        get
+        {
+            if (key == Endpoints.Orders && query is null)
+                throw new ArgumentException("Orders must be requested with paging.", nameof(query));
+
+            var builder = new StringBuilder(base[key]);
+
+            if (query is not null)
+            {
+                builder.Append("?page=").Append(query.Page)
+                       .Append("&size=").Append(query.Size);
+            }
+
+            return builder.ToString();
+        }
+    }
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users
+/api/users?page=2&size=10
+/api/orders?page=1&size=50
+Error: Orders must be requested with paging. (Parameter 'query')
+/api/orders
+https://wrong.example.com
+Entries left: 0
+```
+
+Reading the output in pairs:
+
+- Line 1 goes through the **inherited** indexer. None of the custom code runs.
+- Lines 2 to 4 go through the **custom** two-parameter indexer: `base[key]` fetches the base URL, `StringBuilder` extends it.
+- Line 5 is the rule doing its job.
+- Line 6 is the same forbidden request as line 5, sent through the other door. The rule never runs.
+- Lines 7 and 8 show the "read-only" URL table being rewritten and emptied by ordinary calls.
+
+The first half of the output is the pattern working. The second half is the reason to replace it.
+
+
+## Why being a Dictionary is weak
+
+### Problem 1: the whole parent API leaks out
+
+Inheritance brings every public member of the parent. A lookup table meant to be filled once and then read becomes fully editable: indexer setter, `Add`, `Remove`, `Clear`. The end-to-end run above proved it.
+
+### Problem 2: writes cannot be guarded
+
+The natural fix is to add validation to `Add`. It does not hold:
+
+```csharp
+public class GuardedDictionary : Dictionary<string, string>
+{
+    public new void Add(string key, string value)
+    {
+        if (!value.StartsWith('/'))
+            throw new ArgumentException("URL must start with '/'.");
+        base.Add(key, value);
+    }
+}
+
+var g = new GuardedDictionary();
+g.Add("a", "bad");                        // throws: guard works
+
+Dictionary<string, string> d = g;
+d.Add("a", "bad");                        // succeeds: guard bypassed
+
+g["b"] = "bad";                           // succeeds: the setter was never guarded
+```
+
+`Dictionary`'s `Add` and indexer are not `virtual`, so they cannot be overridden. The `new` keyword only **hides** a member, and hiding depends on the variable's declared type. Any code holding the object as a plain `Dictionary` or `IDictionary` skips the guard.
+
+### Problem 3: two doors, one without rules
+
+The one-parameter indexer returns the raw stored value. The two-parameter indexer applies the rules. Callers choose, and the wrong choice compiles without a warning.
+
+### Problem 4: brackets hide work
+
+By convention, `thing[key]` means a cheap lookup. Nobody expects square brackets to build strings, validate input, or throw `ArgumentException`. A named method states what it does; an indexer disguises it.
+
+### Problem 5: the storage choice becomes the contract
+
+Once other code depends on the object being a `Dictionary`, the storage cannot change without breaking callers. An internal detail has become public API.
+
+> Context matters. A `private sealed` nested helper limits the damage to one class. The pattern is readable and it works. It becomes a real liability when the type is public or shared.
+
+
+## Has-a: composition
+
+The alternative: instead of **being** a dictionary, the class **holds** one in a private field and exposes only the operations that make sense.
+
+Three design decisions:
+
+1. **A private field** for storage, so nothing outside can reach it.
+2. **`FrozenDictionary`** (in `System.Collections.Frozen`, .NET 8+), which is read-only after creation and optimized for fast reads. A table filled once at startup and read constantly is exactly its use case.
+3. **A named method**, `Build`, as the single way in, so the rules always run.
+
+The constructor also copies its input into the frozen dictionary. Later changes to the caller's original dictionary cannot leak in.
+
+
+## End to end: the better version
+
+Same endpoints, same paging rule, same outputs where it matters.
+
+```csharp
+using System.Collections.Frozen;
+using System.Text;
+
+var source = new Dictionary<Endpoints, string>
+{
+    { Endpoints.Users,  "/api/users"  },
+    { Endpoints.Orders, "/api/orders" }
+};
+
+var urls = new EndpointUrls(source);
+
+// ---- normal use ----
+Console.WriteLine(urls.Build(Endpoints.Users));                          // no query
+Console.WriteLine(urls.Build(Endpoints.Users, new PageQuery(2, 10)));    // with query
+Console.WriteLine(urls.Build(Endpoints.Orders, new PageQuery(1, 50)));   // required query
+
+try
+{
+    Console.WriteLine(urls.Build(Endpoints.Orders));                     // breaks the paging rule
+}
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ---- the weaknesses are gone ----
+source[Endpoints.Users] = "https://wrong.example.com";                   // mutate the original input
+Console.WriteLine(urls.Build(Endpoints.Users));                          // unaffected: it was copied
+
+Console.WriteLine($"Registered endpoints: {urls.Count}");
+
+// None of these compile any more:
+// urls[Endpoints.Users] = "https://wrong.example.com";
+// urls.Add(Endpoints.Users, "/x");
+// urls.Clear();
+// Console.WriteLine(urls[Endpoints.Orders]);
+
+// ======================= types =======================
+
+public enum Endpoints { Users, Orders }
+
+public sealed record PageQuery(int Page, int Size);
+
+public sealed class EndpointUrls
+{
+    private readonly FrozenDictionary<Endpoints, string> _baseUrls;
+
+    public EndpointUrls(IReadOnlyDictionary<Endpoints, string> baseUrls)
+    {
+        _baseUrls = baseUrls.ToFrozenDictionary();
+    }
+
+    public int Count => _baseUrls.Count;
+
+    public string Build(Endpoints endpoint, PageQuery? query = null)
+    {
+        if (!_baseUrls.TryGetValue(endpoint, out var baseUrl))
+            throw new InvalidOperationException($"No base URL registered for '{endpoint}'.");
+
+        if (query is null)
+        {
+            if (endpoint == Endpoints.Orders)
+                throw new ArgumentException("Orders must be requested with paging.", nameof(query));
+
+            return baseUrl;
+        }
+
+        return new StringBuilder(baseUrl)
+            .Append("?page=").Append(query.Page)
+            .Append("&size=").Append(query.Size)
+            .ToString();
+    }
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users?page=2&size=10
+/api/orders?page=1&size=50
+Error: Orders must be requested with paging. (Parameter 'query')
+/api/users
+Registered endpoints: 2
+```
+
+What changed in the code:
+
+- `base[key]` is gone. There is no parent class any more, so there is no `base`. The class reads its own private field, `_baseUrls`.
+- `TryGetValue` replaces the throwing lookup, so a missing endpoint produces a clear, specific message instead of a generic `KeyNotFoundException`.
+- The rule lives in the only entry point, so no caller can skip it.
+- Every line that damaged the table in the original version is now a compile error, not a runtime surprise.
+
+
+## Original vs better
+
+| Question | Inheriting `Dictionary` | Composition |
+|---|---|---|
+| Can callers overwrite or delete URLs? | Yes | No |
+| Can validation be enforced? | No, it can be bypassed | Yes, one entry point |
+| Ways to get a URL | Two, one skips the rules | One |
+| Does the call say what it does? | `urls[key, query]` | `urls.Build(key, query)` |
+| Can storage change later? | Breaks callers | Invisible to callers |
+| Missing endpoint | `KeyNotFoundException` | Specific, readable error |
+
+The rule to carry forward:
+
+> Inherit when a class truly **is** the parent and should support **everything** the parent supports. Otherwise, **hold** the thing privately and expose only what is meant. If a URL table should not support `Clear()`, it should not inherit from a type that has `Clear()`.
+
+
+## Where KeyedCollection fits
+
+`KeyedCollection<TKey, TItem>` in `System.Collections.ObjectModel` is the collection designed for subclassing, with virtual hooks. It fits when **the key lives inside the item**:
+
+```csharp
+using System.Collections.ObjectModel;
+
+var catalog = new EndpointCatalog
+{
+    new ApiEndpoint(Endpoints.Users,  "/api/users"),
+    new ApiEndpoint(Endpoints.Orders, "/api/orders")
+};
+
+Console.WriteLine(catalog[Endpoints.Orders].Path);   // /api/orders
+
+public enum Endpoints { Users, Orders }
+
+public record ApiEndpoint(Endpoints Id, string Path);
+
+public sealed class EndpointCatalog : KeyedCollection<Endpoints, ApiEndpoint>
+{
+    protected override Endpoints GetKeyForItem(ApiEndpoint item) => item.Id;
+}
+```
+
+For a table of plain strings that must stay read-only, composition remains the better fit. `KeyedCollection` is the tool for items that carry their own identity.
+
+
+## Checkpoint
+
+1. `urls[Endpoints.Users]` and `urls[Endpoints.Users, null]` are called on the same `BaseUrlDictionary`. Which one runs custom code, and why does the compiler pick it?
+2. In the derived class, what does `base[key]` return, and where was that value stored?
+3. Why does `new StringBuilder(base[key])` start with the base URL instead of an empty buffer?
+4. A `GuardedDictionary` hides `Add` with `new`. Name two ways a caller can still insert an invalid value.
+5. In the composition version, why is `base` no longer used?
+
+
+## Next
+
+The paging rule here was a hard-coded `if` for one endpoint. Real clients usually need a **group** of endpoints that require a query, and a common way to store that group is inside the enum itself using `[Flags]`, bitwise operators, and `HasFlag`. That is the subject of the next article: how flags enums work at the bit level, where they are the right tool, and where a plain set is clearer.

@@ -1,0 +1,532 @@
+---
+title: "Who does what: SQL, SQL Server, ADO.NET and EF Core"
+date: 2026-09-30
+status: written
+minutes: 28
+order: 1.5
+lead: "Five words that sound like the same thing and are not, and the one boundary — a process boundary — that explains why every layer above it exists."
+---
+
+## The main question
+
+These five words get used as if they were interchangeable:
+
+```text
+SQL          SQL Server          database          MySQL          database engine
+```
+
+And these four get stacked in a way nobody explains:
+
+```text
+EF Core      Dapper      ADO.NET      Microsoft.Data.SqlClient
+```
+
+Two questions follow naturally from that confusion, and both are excellent questions:
+
+1. If a database is stored in `.mdf` and `.ldf` files, and MySQL is also a database system, why can MySQL not open a SQL Server `.mdf`? Is the format not the same?
+2. If EF Core turns C# into SQL, and ADO.NET connects to databases, and SqlClient talks to SQL Server — why are all three needed at once? Is one not enough?
+
+Both questions have the same answer underneath:
+
+> A layer is not a replacement for the layer beneath it. Each layer solves a different problem, and removing one does not remove the problem it solved.
+
+This article answers both, with code that can be run rather than diagrams to be trusted.
+
+
+## Part 1 — A file is bytes plus an agreement
+
+Start with something already familiar.
+
+```text
+photo.jpg      resume.pdf      Program.cs
+```
+
+Every one of these is the same physical thing: a sequence of bytes on an SSD. The disk stores no meaning at all. It stores numbers.
+
+```text
+photo.jpg on disk:
+    ff d8 ff e0 00 10 4a 46 49 46 00 01 ...
+```
+
+What makes those bytes a photograph is an **agreement** — a specification saying "the first two bytes are `ff d8`, then comes a header describing dimensions, then compressed image data in this arrangement". A program that knows the agreement can turn the bytes into a picture. A program that does not knows only that a file exists.
+
+```text
+bytes  +  an agreement about what they mean  =  a usable file
+```
+
+The extension `.jpg` is not the agreement. It is a hint, and hints can lie — renaming `photo.jpg` to `photo.pdf` changes nothing about the bytes, and no PDF reader will open it.
+
+
+## A database is also a file format
+
+This is the realisation that makes everything else fall into place.
+
+`ShiftLedger.mdf` is bytes plus an agreement, exactly like the JPEG. The agreement is SQL Server's:
+
+```text
+ShiftLedger.mdf
+
+    byte 0        page 0       file header
+    byte 8192     page 1       free-space map
+    byte 16384    page 2       allocation map
+    ...
+    byte 3211264  page 392     data: the Employees table
+```
+
+Article 1 pulled one record out of page 392 and decoded it byte by byte — status bits, a little-endian integer, a date stored as a day count, an offset array. That decoding was only possible because the agreement is known.
+
+The bytes really are plain and visible. After forcing SQL Server to write its modified pages to disk, they can be found with an ordinary text search:
+
+```sql
+CHECKPOINT;   -- force dirty pages from memory into the .mdf
+```
+
+```bash
+docker exec shiftledger-sql \
+  grep -a -c "Rahman" /var/opt/mssql/data/ShiftLedger.mdf
+```
+
+```text
+1
+```
+
+The name is sitting there in the file, in plain ASCII. Nothing is encrypted or hidden. What is missing, for any program other than SQL Server, is the agreement that says which byte is a column, which is a row header, which page belongs to which table.
+
+> **Why the `CHECKPOINT` was needed.** Article 1 showed that a commit writes to the log and leaves the changed page in memory. Without a checkpoint the row may be nowhere in the `.mdf` at all. This is the first hint that a `.mdf` file on its own is not the whole database.
+
+
+## So why can MySQL not open it?
+
+The short answer is the one above: MySQL does not know SQL Server's agreement. MySQL has its own.
+
+But there are three more reasons, and they are more interesting than the first.
+
+**1. The format is proprietary and undocumented.** JPEG is a published standard, which is why hundreds of programs can decode it. Microsoft has never published the `.mdf` page format. Even if MySQL's authors wanted to support it, there is no specification to implement.
+
+**2. The file is owned by a running process.** While SQL Server has a database attached, it holds an exclusive operating-system lock on those files. Nothing else can open them — not MySQL, not a text editor, and not even a second SQL Server instance. The database is not merely a file; it is a file plus a process that currently owns it plus that process's memory.
+
+**3. The file is incomplete on its own.** The `CHECKPOINT` above proved it. At any moment, committed data may exist only in the `.ldf`, with the `.mdf` still holding an older version of the page. This is why detaching or restoring a database always involves both files, and why copying a `.mdf` out from under a running server produces something unusable.
+
+```text
+A database at any instant =
+        the .mdf  +  the .ldf  +  what is currently in the server's memory
+```
+
+
+## The engine decides the format — and MySQL proves it
+
+There was a good instinct in the original question: that the internal format differs because one file was produced by the SQL Server engine and the other by the MySQL engine.
+
+That is exactly right, and MySQL demonstrates it inside a single product. MySQL has **pluggable storage engines**:
+
+| MySQL storage engine | Files it produces |
+|---|---|
+| InnoDB | `.ibd` tablespace files, plus redo log files |
+| MyISAM | `.MYD` for data and `.MYI` for indexes, per table |
+
+Same MySQL server, same SQL, same tables — different files on disk, incompatible with one another. The **storage engine** determines the format, not the product name. SQL Server happens to have exactly one storage engine, so the distinction is invisible there.
+
+A small correction to a common phrasing while on the subject: MySQL does not produce `.mdf` and `.ldf` files at all. Those extensions are SQL Server's alone.
+
+
+## What they *can* share is data, not files
+
+The two systems cannot share a file. They can absolutely hold the same information:
+
+```text
+                  the same logical data
+                           │
+              ┌────────────┴────────────┐
+              ↓                         ↓
+         SQL Server                   MySQL
+              ↓                         ↓
+      .mdf + .ldf                 InnoDB tablespaces
+      (SQL Server's format)       (InnoDB's format)
+```
+
+Moving between them means **migration**: reading rows out of one through its own software and writing them into the other through its own software. The data is portable. The files never are.
+
+> **Even the SQL is not perfectly portable.** SQL is a published standard, but no product implements all of it and every product adds its own extensions. SQL Server's dialect is called T-SQL; PostgreSQL, MySQL and Oracle each have their own. `SELECT`, `WHERE` and `JOIN` are largely the same everywhere. Date functions, string functions, pagination syntax, and stored-procedure languages are not.
+
+
+## Part 2 — Five words, five different things
+
+With the file question settled, the vocabulary can be pinned down precisely.
+
+| Word | What it actually is | Concrete example |
+|---|---|---|
+| **SQL** | A language. Text. | `SELECT * FROM Employees` |
+| **SQL Server** | A software product — a database management system (DBMS) | The program running in the Docker container |
+| **Database engine** | The component inside that product that does the actual work: parsing, planning, reading pages, locking, logging | The part that turns the text above into page reads |
+| **Database** | A named collection of data managed by the DBMS | `ShiftLedger` |
+| **`.mdf` / `.ldf`** | The files that one database is physically stored in | `/var/opt/mssql/data/ShiftLedger.mdf` |
+
+The nesting matters, because one of these contains the others:
+
+```text
+Docker container
+└── SQL Server              <- one running instance of the software
+    ├── master              <- a database (the server's own catalog)
+    ├── model               <- a database (the template)
+    ├── msdb                <- a database
+    ├── tempdb              <- a database
+    └── ShiftLedger         <- a database (yours)
+        ├── ShiftLedger.mdf
+        └── ShiftLedger_log.ldf
+```
+
+One installation of SQL Server manages many databases. This can be seen directly:
+
+```sql
+SELECT database_id, name FROM sys.databases;
+```
+
+```text
+database_id  name
+-----------  -----------
+          1  master
+          2  tempdb
+          3  model
+          4  msdb
+          5  ShiftLedger
+```
+
+The single most common phrasing mistake is calling the *product* a database. "Our database is SQL Server" is like saying "our document is Microsoft Word". SQL Server is the program. `ShiftLedger` is the database.
+
+
+## Part 3 — The boundary that explains everything else
+
+Here is the fact that makes the entire .NET stack make sense, and it is almost never stated plainly:
+
+> **SQL Server runs in a different process from the application.**
+
+Not a different class, not a different library — a different operating-system process, frequently on a different machine. In this setup it is a different operating system entirely, running inside a Linux container.
+
+```text
+  ┌─────────────────────────────┐          ┌──────────────────────────┐
+  │  the .NET process           │          │  the SQL Server process  │
+  │                             │          │  (Linux container)       │
+  │  C# code                    │          │                          │
+  │  EF Core                    │  ── ? ──▶│  database engine         │
+  │  Dapper                     │          │  buffer pool             │
+  │  Microsoft.Data.SqlClient   │          │  .mdf / .ldf             │
+  │                             │          │                          │
+  └─────────────────────────────┘          └──────────────────────────┘
+```
+
+Everything on the left is ordinary C# running inside the application. Everything on the right is a separate program. They share no memory and no variables. A C# object cannot be handed across that gap.
+
+The only thing that can cross it is **bytes on a network socket**, in a format both sides agree on. For SQL Server that format is called **TDS** (Tabular Data Stream), and it is why port 1433 exists.
+
+This can be confirmed from inside the server: 
+
+```sql
+SELECT session_id, net_transport, protocol_type, client_net_address
+FROM sys.dm_exec_connections
+WHERE session_id = @@SPID;
+```
+
+```text
+session_id  net_transport  protocol_type  client_net_address
+----------  -------------  -------------  ------------------
+        61  TCP            TSQL           192.168.65.1
+```
+
+`TCP` is the transport, `TSQL` is the protocol carried over it. The connection is genuinely a network connection, even when both sides sit on the same laptop.
+
+Now the whole question "why so many layers?" reframes itself into something answerable:
+
+> Something has to turn a C# expression into TDS bytes on a socket, and turn the TDS bytes that come back into C# objects. The layers are just a division of that labour.
+
+
+## Part 4 — The .NET side, from bottom to top
+
+### ADO.NET is the model, not a program
+
+ADO.NET is the name for .NET's database-access design. It is a set of **abstract base classes** in `System.Data.Common` that define what working with any database looks like:
+
+| Abstract class | What it represents |
+|---|---|
+| `DbConnection` | A session with a database |
+| `DbCommand` | A statement to execute |
+| `DbParameter` | A value passed safely into that statement |
+| `DbDataReader` | A forward-only stream of result rows |
+| `DbTransaction` | A unit of work |
+
+These classes cannot do anything on their own. `DbConnection` has no idea what TDS is. It is a contract: *any* database library that wants to fit into .NET implements these.
+
+### A provider is the implementation
+
+`Microsoft.Data.SqlClient` is the SQL Server implementation of that contract:
+
+```text
+DbConnection   (abstract)  ──implemented by──▶  SqlConnection
+DbCommand      (abstract)  ──implemented by──▶  SqlCommand
+DbDataReader   (abstract)  ──implemented by──▶  SqlDataReader
+```
+
+`SqlConnection` knows how to open a TCP socket to port 1433, perform a TDS handshake, authenticate, and send statements. Other databases have their own:
+
+| Database | ADO.NET provider |
+|---|---|
+| SQL Server | `Microsoft.Data.SqlClient` |
+| PostgreSQL | `Npgsql` |
+| MySQL | `MySqlConnector` |
+| SQLite | `Microsoft.Data.Sqlite` |
+
+> **A correction worth making explicit.** It is common to see a diagram like `EF Core → ADO.NET → SqlClient → SQL Server`, with ADO.NET drawn as a separate layer in between. That is wrong. `Microsoft.Data.SqlClient` **is** ADO.NET for SQL Server — it is the implementation of those abstract classes, not something sitting beneath them. There is no separate ADO.NET component at runtime.
+
+### The bottom layer, in code
+
+This is what using the provider directly looks like, with nothing above it:
+
+```csharp
+using Microsoft.Data.SqlClient;
+
+const string connectionString =
+    "Server=localhost,1433;Database=ShiftLedger;User Id=sa;" +
+    "Password=Sh1ftL3dger!Dev;TrustServerCertificate=True";
+
+using var connection = new SqlConnection(connectionString);
+await connection.OpenAsync();
+
+using var command = new SqlCommand(
+    "SELECT EmployeeId, FirstName, LastName FROM dbo.Employees WHERE EmployeeId > @minId",
+    connection);
+
+command.Parameters.AddWithValue("@minId", 1);
+
+using var reader = await command.ExecuteReaderAsync();
+
+while (await reader.ReadAsync())
+{
+    int    id    = reader.GetInt32(0);
+    string first = reader.GetString(1);
+    string last  = reader.GetString(2);
+
+    Console.WriteLine($"{id}: {first} {last}");
+}
+```
+
+Output:
+
+```text
+2: Dana Okoye
+3: Priya Sandhu
+```
+
+Everything the higher layers do eventually reduces to this. Note what is manual here: the SQL is written by hand, columns are read by position, types are converted by hand, and a class to hold the result must be filled in by hand.
+
+### Dapper: mapping only
+
+Dapper's entire job is the last of those: turn result rows into objects.
+
+```csharp
+using Dapper;
+using Microsoft.Data.SqlClient;
+
+using var connection = new SqlConnection(connectionString);
+
+var employees = await connection.QueryAsync<Employee>(
+    "SELECT EmployeeId, FirstName, LastName FROM dbo.Employees WHERE EmployeeId > @minId",
+    new { minId = 1 });
+
+foreach (var e in employees)
+    Console.WriteLine($"{e.EmployeeId}: {e.FirstName} {e.LastName}");
+```
+
+The detail that settles the whole question of layering: **`QueryAsync` is an extension method on `IDbConnection`.** The connection being used is still `SqlConnection`, still from `Microsoft.Data.SqlClient`. Dapper did not replace the provider; it added a method to it. Underneath, Dapper creates a `DbCommand`, adds parameters, calls `ExecuteReader`, and loops over the `DbDataReader` — the same code as above, generated once and cached.
+
+The SQL is still written by hand. That is deliberate.
+
+### EF Core: translation, mapping, and tracking
+
+```csharp
+var employees = await db.Employees
+    .Where(e => e.EmployeeId > 1)
+    .ToListAsync();
+```
+
+No SQL appears anywhere. EF Core does three things the layers below do not:
+
+1. **Translates** the LINQ expression into SQL for the target database.
+2. **Maps** rows to objects, in both directions — including inserts and updates.
+3. **Tracks changes**, so that modifying a loaded object and calling `SaveChanges` produces the right `UPDATE` without anyone writing one.
+
+The translation is directly inspectable:
+
+```csharp
+var query = db.Employees.Where(e => e.EmployeeId > 1);
+Console.WriteLine(query.ToQueryString());
+```
+
+```sql
+SELECT [e].[EmployeeId], [e].[FirstName], [e].[LastName], [e].[HireDate]
+FROM [dbo].[Employees] AS [e]
+WHERE [e].[EmployeeId] > 1
+```
+
+That is T-SQL, in SQL Server's bracket-quoting dialect. Against PostgreSQL the same LINQ produces double-quoted identifiers instead — which is why EF Core needs a database-specific provider of its own.
+
+### Proving that EF Core sits on SqlClient
+
+The layering is not a metaphor. It can be checked at runtime:
+
+```csharp
+var connection = db.Database.GetDbConnection();
+
+Console.WriteLine(connection.GetType().FullName);
+Console.WriteLine(connection is System.Data.Common.DbConnection);
+```
+
+```text
+Microsoft.Data.SqlClient.SqlConnection
+True
+```
+
+EF Core's connection **is** a `SqlConnection`. The same object that the hand-written example created explicitly, EF Core created internally. It can even be borrowed and used directly, Dapper included:
+
+```csharp
+var connection = db.Database.GetDbConnection();
+
+var names = await connection.QueryAsync<string>(
+    "SELECT FirstName FROM dbo.Employees");
+```
+
+EF Core, Dapper and raw ADO.NET running over one connection, because they were never alternatives to one another at that level.
+
+### Two different provider layers
+
+A detail that trips up almost everyone: there are **two** provider packages, and they are not the same thing.
+
+```text
+Microsoft.EntityFrameworkCore.SqlServer    <- the EF Core provider
+        knows T-SQL dialect, how to translate LINQ,
+        what types map to what, how migrations are written
+
+Microsoft.Data.SqlClient                   <- the ADO.NET provider
+        knows TDS, sockets, authentication,
+        connection pooling, how to read result streams
+```
+
+The EF Core provider depends on the ADO.NET provider. Installing the first pulls in the second.
+
+
+## Part 5 — Who is responsible for what
+
+The whole stack, with the process boundary drawn where it actually is:
+
+```text
+┌──────────────────────── the .NET process ────────────────────────┐
+│                                                                  │
+│  C# application                                                  │
+│      "give me active employees"                                  │
+│            │                                                     │
+│            ▼                                                     │
+│  EF Core / Dapper / NHibernate           (pick at most one)      │
+│      LINQ -> SQL, rows -> objects, change tracking               │
+│            │                                                     │
+│            ▼                                                     │
+│  Microsoft.Data.SqlClient                (the ADO.NET provider)  │
+│      implements DbConnection/DbCommand/DbDataReader              │
+│      speaks TDS, manages the connection pool                     │
+│            │                                                     │
+└────────────┼─────────────────────────────────────────────────────┘
+             │  TDS bytes over TCP, port 1433
+┌────────────▼──────── the SQL Server process ─────────────────────┐
+│                                                                  │
+│  database engine                                                 │
+│      parse -> plan -> execute                                    │
+│      locking, logging, recovery                                  │
+│            │                                                     │
+│            ▼                                                     │
+│  buffer pool (8KB pages in memory)                               │
+│            │                                                     │
+│            ▼                                                     │
+│  .mdf (data)        .ldf (transaction log)                       │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Responsible for | Explicitly **not** responsible for |
+|---|---|---|
+| EF Core | Translating LINQ, mapping objects, tracking changes, migrations | Talking to SQL Server |
+| Dapper | Mapping result rows to objects | Writing SQL, talking to SQL Server |
+| `Microsoft.Data.SqlClient` | Sockets, TDS, authentication, pooling, streaming rows | Understanding what the SQL means |
+| Database engine | Planning, indexes, locks, transactions, recovery | Anything C# |
+| `.mdf` / `.ldf` | Holding bytes | Everything else |
+
+The crucial column is the right-hand one. Each layer has a hard boundary, and the layer below is not optional because nothing else does its job.
+
+
+## Part 6 — Choosing a layer
+
+All three can coexist in one application, and frequently do.
+
+| Tool | Best for | Cost |
+|---|---|---|
+| Raw ADO.NET | Bulk loads, unusual operations, maximum control | Every detail is manual |
+| Dapper | Read-heavy queries, reports, hand-tuned SQL | No change tracking, no migrations |
+| EF Core | Normal create/read/update/delete work over a domain model | Generated SQL is not always what would have been written by hand |
+
+A useful rule: **EF Core for writing, Dapper or raw SQL for the queries where the generated plan matters.** Reaching for raw SQL inside an EF Core application is not an admission of defeat; the layers were designed to be mixed.
+
+This also explains a pattern common in older production codebases: an Entity Framework repository that nonetheless contains a method taking a SQL string and an array of `SqlParameter`. That is not inconsistency. It is the bottom layer being used directly for the cases where the top layer is the wrong tool.
+
+
+## Cheat sheet
+
+```text
+FILES
+  a file = bytes + an agreement about what the bytes mean
+  .mdf/.ldf = SQL Server's agreement (proprietary, undocumented)
+  MySQL/InnoDB = a different agreement entirely
+  the storage engine decides the format, not the product name
+  MySQL can hold the same DATA, never the same FILE
+
+VOCABULARY
+  SQL              a language (text)
+  SQL Server       a software product (a DBMS)
+  database engine  the component inside it that does the work
+  database         a named collection of data it manages
+  .mdf / .ldf      the files one database lives in
+  "our database is SQL Server" = "our document is Microsoft Word"
+
+THE ONE BOUNDARY
+  the app is one process; SQL Server is another
+  only TDS bytes over TCP cross the gap
+  everything above the socket exists to produce those bytes
+
+.NET STACK
+  ADO.NET      the MODEL: DbConnection, DbCommand, DbDataReader (abstract)
+  SqlClient    the IMPLEMENTATION for SQL Server -- it IS ADO.NET, not below it
+  Dapper       extension methods on IDbConnection: rows -> objects
+  EF Core      LINQ -> SQL, objects <-> rows, change tracking
+  EF Core needs TWO providers:
+      Microsoft.EntityFrameworkCore.SqlServer   (dialect, translation)
+      Microsoft.Data.SqlClient                  (sockets, TDS)
+
+NOTHING REPLACES ANYTHING
+  Dapper does not replace SqlClient
+  EF Core does not replace SqlClient
+  both sit ON it; db.Database.GetDbConnection() returns a SqlConnection
+```
+
+
+## Checkpoint
+
+1. A `.mdf` file is copied onto a machine running MySQL. Give three separate reasons MySQL cannot open it.
+2. Why does searching a `.mdf` for a recently inserted name sometimes find nothing until `CHECKPOINT` runs?
+3. MySQL can produce `.ibd` files or `.MYD` files from the same SQL. What decides which?
+4. What is wrong with the sentence "we use a SQL Server database"?
+5. `SqlConnection`, `SqlCommand` and `SqlDataReader` all derive from abstract classes. What are those classes for, given they cannot connect to anything?
+6. Dapper's `Query<T>` is an extension method. On what type, and what does that prove about where Dapper sits?
+7. An EF Core application needs two NuGet packages with "SqlServer" or "SqlClient" in the name. What does each one do?
+8. Both the application and SQL Server run on the same laptop. Why is a network protocol still involved?
+
+
+## What comes next
+
+Everything so far has been structural: which program owns which file, which layer produces which bytes. None of it says anything about whether the data is *correct*.
+
+Nothing yet prevents two employees sharing an id, or a shift referring to a store that was deleted last week. The next article moves to the logical model — what a relation actually is, why a primary key is a claim about identity rather than a performance trick, and how declaring one physically rearranges every byte examined in article 1.

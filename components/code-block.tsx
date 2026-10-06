@@ -61,10 +61,19 @@ export function CodeBlock({
           </button>
         )}
       </div>
+      {/* Diagrams opt out of IBM Plex Mono: it has no box-drawing glyphs, so
+          ─ │ ┌ ▼ fall back to another face with a different advance width
+          (12.4px / 10.93px / 17.32px against Plex's 7.8px cell) and the art
+          cannot line up at any character count. The system mono stack carries
+          the whole set at one width. Real code keeps Plex Mono. */}
       <pre
         ref={preRef}
         {...rest}
-        className={`${className ?? ""} overflow-x-auto px-3 py-[14px] font-mono text-[13px] leading-[1.7] whitespace-pre`}
+        // Preflight sets a mono family on `code` too, so the inner <code>
+        // would override whatever the <pre> asks for — force it to inherit.
+        className={`${className ?? ""} overflow-x-auto px-3 py-[14px] text-[13px] leading-[1.7] whitespace-pre [&_code]:[font-family:inherit] ${
+          isDiagram ? "font-diagram" : "font-mono"
+        }`}
       >
         {children}
       </pre>

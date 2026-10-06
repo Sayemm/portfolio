@@ -1,0 +1,1083 @@
+---
+title: "Generic Methods and Constraints in C#"
+date: 2026-09-21
+status: written
+minutes: 24
+order: 9
+lead: "How one method serves every endpoint and every response shape: type parameters, why the compiler cannot infer a response type, what where constraints unlock, how await and JSON fit in, and a complete typed HTTP client that runs without a network."
+---
+
+## The main question
+
+API client code often exposes one method for every GET request:
+
+```csharp
+public async Task<TResponseModel> GET<TRequestModel, TResponseModel>(Endpoints endpoint, TRequestModel requestModel)
+    where TRequestModel  : class
+    where TResponseModel : class
+```
+
+And calls it like this:
+
+```csharp
+var sales = await client.GET<SalesReportRequest, ICollection<SaleLine>>(
+    Endpoints.SalesReport,
+    salesReportRequest);
+```
+
+Angle brackets on the method, angle brackets on the call, two `where` lines, `async`, `Task`, `await`. The method is **generic**: written once, with placeholders for types that each caller fills in.
+
+This article builds generics from zero, explains every part of that signature, runs a complete client end to end against a fake server, then rebuilds it with the lessons applied, also end to end.
+
+Concepts covered, in order:
+
+| Concept | One-line meaning |
+|---|---|
+| Type parameter | A placeholder for a type, filled in by the caller |
+| Generic method | A method with its own type parameters |
+| Type inference | The compiler filling type arguments from the arguments |
+| Constraints | Rules about which types may fill a placeholder |
+| Class vs method generics | Types chosen once per object vs once per call |
+| `Task<T>`, `async`, `await` | A value that arrives later, and waiting for it |
+| JSON deserialization | Text into typed objects, driven by a type argument |
+| `HttpMessageHandler` | The replaceable engine under `HttpClient` |
+| `lock` vs `SemaphoreSlim` | Synchronous vs asynchronous mutual exclusion |
+
+
+## Copy, object, or generic
+
+Three ways to write a client for several endpoints.
+
+**Copy-paste per endpoint.** Every method has the same body with different types:
+
+```csharp
+public List<UserDto>  GetUsers(UserQuery q)          { /* build URL, send, parse into List<UserDto>  */ }
+public List<OrderDto> GetOrders(OrderQuery q)        { /* build URL, send, parse into List<OrderDto> */ }
+public List<SaleLine> GetSales(SalesReportRequest q) { /* build URL, send, parse into List<SaleLine> */ }
+```
+
+Fifty endpoints, fifty near-identical methods.
+
+**Use `object` for everything.** One method, no type safety:
+
+```csharp
+public object Get(Endpoints endpoint, object query) { /* ... */ }
+
+var users = (List<UserDto>)client.Get(Endpoints.Users, query);   // wrong cast = runtime crash
+```
+
+**Use a generic method.** One method, full type safety:
+
+```csharp
+public T Get<T>(Endpoints endpoint, object query) { /* ... */ }
+
+List<UserDto> users = client.Get<List<UserDto>>(Endpoints.Users, query);   // checked at compile time
+```
+
+Generics give the reuse of `object` with the safety of copy-paste.
+
+
+## Value vs type: what a type parameter is
+
+```csharp
+static T Echo<T>(T value) => value;
+
+int    a = Echo<int>(5);
+string b = Echo<string>("hi");
+```
+
+`<T>` declares a **type parameter**: a blank that holds a *type*, the way a normal parameter holds a *value*.
+
+| | Normal parameter | Type parameter |
+|---|---|---|
+| Declared inside | `( )` | `< >` |
+| Holds | a value such as `5` | a type such as `int` |
+| Supplied as | `Echo(5)` | `Echo<int>` |
+
+When a caller writes `Echo<int>`, every `T` in the method means `int` for that call. When another writes `Echo<string>`, every `T` means `string`.
+
+Naming convention: a single type parameter is `T`. Several get descriptive names that start with `T`, such as `TRequestModel` and `TResponseModel`.
+
+> .NET generics are **reified**: the real type argument exists at runtime. `typeof(T)` inside a generic method returns the actual type, and `List<int>` and `List<string>` are different runtime types. Value-type arguments get their own specialized machine code (no boxing); reference-type arguments share one compiled version. This differs from Java, where type arguments are erased at compile time.
+
+```csharp
+static string Describe<T>(T value) => $"{typeof(T).Name}: {value}";
+
+Console.WriteLine(Describe(42));       // Int32: 42
+Console.WriteLine(Describe("hi"));     // String: hi
+```
+
+
+## One blank vs two
+
+```csharp
+static TOut Convert<TIn, TOut>(TIn input, Func<TIn, TOut> converter) => converter(input);
+
+string label = Convert<int, string>(42, n => $"Item #{n}");   // TIn = int, TOut = string
+```
+
+With that shape in mind, the client signature reads clearly:
+
+```csharp
+public async Task<TResponseModel> GET<TRequestModel, TResponseModel>(Endpoints endpoint, TRequestModel requestModel)
+//                returns later    two blanks: what is sent, what comes back       uses blank 1
+```
+
+And the call site fills both blanks:
+
+```csharp
+client.GET<SalesReportRequest, ICollection<SaleLine>>(...)
+//         TRequestModel       TResponseModel
+```
+
+For that call, the compiler treats the method as if it had been written:
+
+```csharp
+public async Task<ICollection<SaleLine>> GET(Endpoints endpoint, SalesReportRequest requestModel)
+```
+
+
+## Inferred vs explicit type arguments
+
+Often the type arguments can be omitted:
+
+```csharp
+Echo(5);                        // T inferred as int
+Convert(42, (int n) => $"#{n}");   // TIn = int, TOut = string, both inferred
+```
+
+The compiler infers type parameters **only from the arguments**. It never looks at the return type, or at the variable the result is assigned to:
+
+```csharp
+static T Parse<T>(string text) where T : IParsable<T> => T.Parse(text, null);
+
+int n = Parse("42");         // error CS0411: type arguments cannot be inferred
+int m = Parse<int>("42");    // fine
+```
+
+`T` appears only in the return type, so no argument reveals it.
+
+The client's `TResponseModel` has exactly this problem. And C# has no partial inference: supplying one type argument means supplying all of them. That is why the call site carries both:
+
+```csharp
+client.GET(Endpoints.SalesReport, request);
+// error CS0411: The type arguments for method 'GET<TRequestModel, TResponseModel>' cannot be inferred from the usage
+```
+
+The explicit response type is not noise. It is the caller stating **what shape of JSON to expect**: `ICollection<SaleLine>` means "the body is a JSON array of sale lines."
+
+
+## Anything vs allowed: constraints
+
+### What an unconstrained T can do
+
+With no constraint, the compiler knows nothing about `T`, so it allows almost nothing:
+
+```csharp
+static void Inspect<T>(T value)
+{
+    Console.WriteLine(value?.ToString());   // allowed: every type has object's members
+    T? fallback = default;                  // allowed: default exists for every type
+
+    // int n = value.Length;                // CS1061: T might not have Length
+    // T copy = new T();                    // CS0304: T might not have a parameterless constructor
+    // T empty = null;                      // CS0403: T might be a value type
+}
+```
+
+A **constraint** is a promise about `T`. Each promise unlocks a specific ability inside the method.
+
+### where T : class
+
+`T` must be a reference type: a class, interface, record class, array, or delegate.
+
+```csharp
+static T? FirstOrNull<T>(IEnumerable<T> items) where T : class
+{
+    foreach (var item in items)
+        return item;
+    return null;                            // allowed now: T is a reference type
+}
+```
+
+The keyword is `class`, but the rule is "reference type", so **interfaces qualify**:
+
+```csharp
+static void Accept<T>() where T : class { }
+
+Accept<string>();                  // class
+Accept<ICollection<int>>();        // interface: allowed
+// Accept<int>();                  // CS0452: int must be a reference type
+```
+
+That is why `ICollection<SaleLine>` satisfies `where TResponseModel : class`.
+
+### where T : struct
+
+`T` must be a non-nullable value type. This unlocks `T?` as `Nullable<T>`:
+
+```csharp
+using System.Globalization;
+
+static T? ParseOrNull<T>(string text) where T : struct, IParsable<T>
+    => T.TryParse(text, CultureInfo.InvariantCulture, out var result) ? result : null;
+
+Console.WriteLine(ParseOrNull<int>("42"));              // 42
+Console.WriteLine(ParseOrNull<int>("abc") is null);     // True
+Console.WriteLine(ParseOrNull<decimal>("19.99"));       // 19.99
+```
+
+> `IParsable<T>` declares a **static abstract** method, `TryParse`. The interface constraint lets generic code call a static method on `T` itself. This feature, added in C# 11, is the foundation of generic math in .NET 7 and later.
+
+### where T : new()
+
+`T` must have a public parameterless constructor. This unlocks `new T()`:
+
+```csharp
+static T CreateDefault<T>() where T : new() => new T();
+
+var list = CreateDefault<List<string>>();   // an empty list
+```
+
+### where T : SomeBaseClass
+
+`T` must be that class or derive from it. This unlocks the base class's members:
+
+```csharp
+public abstract class Animal { public abstract string Speak(); }
+public sealed class Dog : Animal { public override string Speak() => "Woof"; }
+
+static string Chorus<T>(IEnumerable<T> animals) where T : Animal
+    => string.Join(" ", animals.Select(a => a.Speak()));   // Speak is known to exist
+
+Console.WriteLine(Chorus(new[] { new Dog(), new Dog() }));   // Woof Woof
+```
+
+### where T : ISomeInterface
+
+`T` must implement the interface. This unlocks the interface's members, and is the most common constraint in real code:
+
+```csharp
+public interface IHasId { int Id { get; } }
+public sealed record Product(int Id, string Name) : IHasId;
+
+static T FindById<T>(IEnumerable<T> items, int id) where T : IHasId
+    => items.First(item => item.Id == id);
+
+var products = new[] { new Product(1, "Cable"), new Product(2, "Charger") };
+Console.WriteLine(FindById(products, 2).Name);   // Charger
+```
+
+### where T : notnull
+
+`T` must be a non-nullable type, reference or value. `Dictionary<TKey, TValue>` declares `where TKey : notnull`, because a `null` key makes no sense.
+
+### Combining constraints
+
+On one type parameter, constraints are separated by commas, in a fixed order: at most one primary constraint first (`class`, `struct`, `notnull`, or a base class), then interfaces, and `new()` last.
+
+```csharp
+static T Create<T>() where T : Animal, new() => new T();
+```
+
+On several type parameters, each gets its own `where` line. That is the entire syntax behind the client signature:
+
+```csharp
+public async Task<TResponseModel> GET<TRequestModel, TResponseModel>(...)
+    where TRequestModel  : class      // rule for the first blank
+    where TResponseModel : class      // rule for the second blank
+```
+
+### Summary
+
+| Constraint | Meaning | Unlocks |
+|---|---|---|
+| `where T : class` | reference type | `null` for `T` |
+| `where T : class?` | reference type, nullable allowed | the same, without nullable warnings |
+| `where T : struct` | non-nullable value type | `T?` as `Nullable<T>` |
+| `where T : notnull` | non-nullable type | safe use as a dictionary key |
+| `where T : new()` | public parameterless constructor | `new T()` |
+| `where T : Animal` | `Animal` or derived | `Animal`'s members |
+| `where T : IHasId` | implements `IHasId` | `IHasId`'s members, including static abstract ones |
+
+### What the client's constraints actually buy
+
+- `where TRequestModel : class` allows `null` to mean "no query", and blocks passing an `int` as a query model.
+- `where TResponseModel : class` fits JSON objects and arrays.
+
+Both are **loose**. And the second one has a cost: an endpoint that returns a bare number, such as a count, cannot be called, because `int` is not a reference type. The end-to-end run below demonstrates it.
+
+
+## Per object vs per call: class and method generics
+
+```csharp
+// Class-level: the type is fixed when the object is created
+public sealed class Box<T>(T value)
+{
+    public T Value { get; } = value;
+}
+
+var intBox = new Box<int>(5);        // this object is a Box<int> forever
+
+// Method-level: the type is chosen fresh on every call
+var users = await client.GetAsync<List<UserDto>>(Endpoints.Users);
+var count = await client.GetAsync<int>(Endpoints.UserCount);        // same object, different T
+```
+
+| | Class-level | Method-level |
+|---|---|---|
+| Declared on | the class name | the method name |
+| Chosen | once, at construction | on every call |
+| Example | `List<T>`, `Dictionary<TKey, TValue>` | `Enumerable.Select<TSource, TResult>` |
+| Fits | a container of one kind of item | an operation over many kinds |
+
+An API client needs one object that calls many endpoints returning many shapes. That is why `GET` is a **generic method** on a **non-generic** class.
+
+> Class-level generics have a notable property: **each closed type has its own static fields.** `Counter<int>` and `Counter<string>` do not share state.
+
+```csharp
+Console.WriteLine(Counter<int>.Next());      // 1
+Console.WriteLine(Counter<int>.Next());      // 2
+Console.WriteLine(Counter<string>.Next());   // 1
+
+static class Counter<T>
+{
+    private static int _count;
+    public static int Next() => ++_count;
+}
+```
+
+
+## Now vs later: Task, async, await
+
+An HTTP call takes time. A method that waited by freezing its thread would waste that thread. Instead, the method returns a **`Task<T>`**: an object representing a `T` that will be available later.
+
+```csharp
+Task<List<UserDto>> pending = client.GetAsync<List<UserDto>>(Endpoints.Users);   // the promise
+List<UserDto> users = await pending;                                             // wait, then unwrap
+```
+
+`await` does two things: it pauses the method **without blocking the thread**, and when the task completes it **unwraps** `Task<T>` into `T`.
+
+That is why the call site's variable is not a task:
+
+```csharp
+var sales = await client.GET<SalesReportRequest, ICollection<SaleLine>>(...);
+// type of sales: ICollection<SaleLine>, not Task<ICollection<SaleLine>>
+```
+
+The `async` keyword on a method is what permits `await` inside it. The return type of an `async` method is `Task` or `Task<T>`, never the bare `T`.
+
+> Two rules that matter for API clients. First, avoid blocking on tasks with `.Result` or `.GetAwaiter().GetResult()`; it holds a thread hostage and can deadlock in some environments. Second, `await` is not allowed inside a `lock` block (error CS1996). Code that needs mutual exclusion around asynchronous work uses `SemaphoreSlim` and `WaitAsync` instead.
+
+
+## Text vs objects: JSON deserialization
+
+The second type argument exists for one line:
+
+```csharp
+TResponseModel result = JsonSerializer.Deserialize<TResponseModel>(json, options);
+```
+
+The serializer reads the JSON text and builds an instance of whatever type the caller named. For `ICollection<SaleLine>` it reads a JSON array and fills a collection of `SaleLine` objects, matching JSON field names to property names.
+
+```csharp
+using System.Text.Json;
+
+var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+string json = """[ { "productName": "Cable", "quantity": 3 } ]""";
+
+ICollection<SaleLine> lines = JsonSerializer.Deserialize<ICollection<SaleLine>>(json, options)!;
+Console.WriteLine(lines.GetType().Name);          // List`1
+Console.WriteLine(lines.First().ProductName);     // Cable
+
+public class SaleLine
+{
+    public string ProductName { get; set; } = "";
+    public int Quantity { get; set; }
+}
+```
+
+Three details:
+
+- **`JsonSerializerDefaults.Web`** turns on camelCase names and case-insensitive matching, so the JSON field `productName` fills the C# property `ProductName`.
+- **An interface target works.** The serializer cannot create an `ICollection<T>`, so it creates a `List<T>` and returns it as the interface.
+- **Missing fields are not errors.** Properties with no matching JSON keep their default values.
+
+`System.Net.Http.Json` wraps the read-then-deserialize pair into one call, `ReadFromJsonAsync<T>`, which the better version uses.
+
+
+## Real vs fake: HttpMessageHandler
+
+`HttpClient` does not talk to the network itself. It passes each request to an **`HttpMessageHandler`**, and the default handler does the network work:
+
+```text
+HttpClient.SendAsync(request)
+    |
+    v
+HttpMessageHandler.SendAsync(request)     <-- replaceable
+    |
+    v
+network  ->  server  ->  HttpResponseMessage
+```
+
+Replacing the handler replaces the network. A fake handler can inspect every request and return canned responses, which lets a complete client run and be tested with no server and no internet. Both programs below use one.
+
+
+## End to end: the original pattern
+
+A complete client in the original style: a generic `GET` with two type parameters and `class` constraints, synchronous token refresh inside a `lock`, and a fake server. Paste into `Program.cs` of a console app.
+
+```csharp
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+
+var http   = new HttpClient(new FakeApiHandler()) { BaseAddress = new Uri("https://api.example.com") };
+var client = new ApiClient(http);
+
+// ---- a query-like endpoint: both type arguments required ----
+Console.WriteLine("Sales report:");
+var request = new SalesReportRequest { StoreId = "S-42", From = new DateOnly(2026, 9, 1), To = new DateOnly(2026, 9, 7) };
+
+ICollection<SaleLine> sales = await client.GET<SalesReportRequest, ICollection<SaleLine>>(Endpoints.SalesReport, request);
+foreach (var line in sales)
+    Console.WriteLine($"  {line.ProductName,-12} x{line.Quantity}  {line.Total,7:0.00}");
+
+// ---- no query: the caller must still invent a request type ----
+Console.WriteLine("Users:");
+List<UserDto> users = await client.GET<object, List<UserDto>>(Endpoints.Users, null);
+foreach (var user in users)
+    Console.WriteLine($"  #{user.Id} {user.Name}");
+
+// ---- a numeric response cannot be requested at all ----
+// int count = await client.GET<object, int>(Endpoints.UserCount, null);
+// error CS0452: The type 'int' must be a reference type
+
+// ---- errors carry no context ----
+Console.WriteLine("Orders:");
+try
+{
+    await client.GET<object, List<object>>(Endpoints.Orders, null);
+}
+catch (HttpRequestException ex)
+{
+    Console.WriteLine($"  Error: {ex.Message}");
+}
+
+Console.WriteLine();
+Console.WriteLine($"Runtime type behind ICollection<SaleLine>: {sales.GetType().Name}");
+
+// ======================= types =======================
+
+public enum Endpoints { Users, UserCount, Orders, SalesReport }
+
+public class SalesReportRequest
+{
+    public string StoreId { get; set; } = "";
+    public DateOnly From { get; set; }
+    public DateOnly To { get; set; }
+}
+
+public class SaleLine
+{
+    public string ProductName { get; set; } = "";
+    public int Quantity { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class UserDto
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public sealed record TokenResponse(string AccessToken, int ExpiresIn);
+
+public sealed class ApiClient
+{
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly HttpClient _http;
+    private readonly object _tokenLock = new();
+    private string? _accessToken;
+    private DateTime _expiresAt;
+
+    private readonly Dictionary<Endpoints, string> _baseUrls = new()
+    {
+        { Endpoints.Users,       "/api/users"         },
+        { Endpoints.UserCount,   "/api/users/count"   },
+        { Endpoints.Orders,      "/api/orders"        },
+        { Endpoints.SalesReport, "/api/reports/sales" }
+    };
+
+    public ApiClient(HttpClient http) => _http = http;
+
+    public async Task<TResponseModel> GET<TRequestModel, TResponseModel>(Endpoints endpoint, TRequestModel? requestModel)
+        where TRequestModel  : class
+        where TResponseModel : class
+    {
+        Authenticate();
+
+        string url = BuildUrl(endpoint, requestModel);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
+
+        using var response = await _http.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+
+        string json = await response.Content.ReadAsStringAsync();
+
+        return JsonSerializer.Deserialize<TResponseModel>(json, JsonOptions)
+            ?? throw new InvalidOperationException("Empty response body.");
+    }
+
+    private void Authenticate()
+    {
+        lock (_tokenLock)
+        {
+            if (_accessToken is not null && DateTime.UtcNow < _expiresAt)
+                return;
+
+            using var tokenRequest = new HttpRequestMessage(HttpMethod.Post, "/oauth2/token");
+            using var response = _http.Send(tokenRequest);          // synchronous: blocks this thread
+            response.EnsureSuccessStatusCode();
+
+            var token = JsonSerializer.Deserialize<TokenResponse>(response.Content.ReadAsStream(), JsonOptions)!;
+            _accessToken = token.AccessToken;
+            _expiresAt   = DateTime.UtcNow.AddSeconds(token.ExpiresIn - 60);
+        }
+    }
+
+    private string BuildUrl(Endpoints endpoint, object? query)
+    {
+        string baseUrl = _baseUrls[endpoint];
+        if (query is null) return baseUrl;
+
+        var pairs = query.GetType().GetProperties()
+            .Where(p => p.GetIndexParameters().Length == 0)
+            .Select(p => (Name: JsonNamingPolicy.CamelCase.ConvertName(p.Name), Value: p.GetValue(query)))
+            .Where(p => p.Value is not null)
+            .Select(p => $"{Uri.EscapeDataString(p.Name)}={Uri.EscapeDataString(Format(p.Value!))}");
+
+        string queryString = string.Join("&", pairs);
+        return queryString.Length == 0 ? baseUrl : $"{baseUrl}?{queryString}";
+    }
+
+    private static string Format(object value) => value switch
+    {
+        DateOnly d     => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+        _              => value.ToString() ?? ""
+    };
+}
+
+public sealed class FakeApiHandler : HttpMessageHandler
+{
+    private int _tokensIssued;
+
+    // The original client calls the synchronous Send for tokens, so the fake supports both paths.
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        => Respond(request);
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => Task.FromResult(Respond(request));
+
+    private HttpResponseMessage Respond(HttpRequestMessage request)
+    {
+        Console.WriteLine($"  -> {request.Method} {request.RequestUri!.PathAndQuery}");
+
+        string path = request.RequestUri.AbsolutePath;
+
+        if (path == "/oauth2/token")
+        {
+            int n = Interlocked.Increment(ref _tokensIssued);
+            return Json($$"""{ "accessToken": "token-{{n}}", "expiresIn": 3600 }""");
+        }
+
+        if (request.Headers.Authorization is null)
+            return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+
+        return path switch
+        {
+            "/api/users"         => Json("""[ { "id": 1, "name": "Ada" }, { "id": 2, "name": "Linus" } ]"""),
+            "/api/users/count"   => Json("2"),
+            "/api/reports/sales" => Json("""[ { "productName": "Phone Case", "quantity": 3, "total": 59.97 }, { "productName": "Charger", "quantity": 5, "total": 124.95 } ]"""),
+            _                    => new HttpResponseMessage(HttpStatusCode.NotFound)
+        };
+    }
+
+    private static HttpResponseMessage Json(string body) => new(HttpStatusCode.OK)
+    {
+        Content = new StringContent(body, Encoding.UTF8, "application/json")
+    };
+}
+```
+
+Output:
+
+```text
+Sales report:
+  -> POST /oauth2/token
+  -> GET /api/reports/sales?storeId=S-42&from=2026-09-01&to=2026-09-07
+  Phone Case   x3    59.97
+  Charger      x5   124.95
+Users:
+  -> GET /api/users
+  #1 Ada
+  #2 Linus
+Orders:
+  -> GET /api/orders
+  Error: Response status code does not indicate success: 404 (Not Found).
+
+Runtime type behind ICollection<SaleLine>: List`1
+```
+
+Reading it:
+
+- The first call fetches a token, then sends the GET with the query built from the request object. The second call reuses the cached token: no second POST.
+- `ICollection<SaleLine>` came back as a `List<SaleLine>`, created by the serializer.
+- The users call needed `GET<object, List<UserDto>>`: a made-up request type argument, purely to satisfy the signature.
+- The count endpoint exists on the server, but the client cannot call it. `int` fails the `class` constraint.
+- The 404 message names no endpoint. In a log full of calls, it is unclear which one failed.
+
+
+## Why the original is weak
+
+1. **A type parameter that does no work.** `TRequestModel` is immediately converted to `object` in `BuildUrl`. It adds a mandatory type argument to every call, and forces callers with no query to invent one.
+2. **A constraint that blocks valid calls.** `where TResponseModel : class` rejects numeric, boolean, and other value-type responses, with no benefit in return.
+3. **Synchronous work inside a lock.** `Authenticate` blocks a thread on a network call. Under load, every concurrent request waits on a blocked thread. And the lock cannot simply become async, because `await` is not allowed inside `lock`.
+4. **Two token fields read separately.** `_accessToken` and `_expiresAt` are two writes. Code reading them outside the lock can observe one updated and the other stale.
+5. **No cancellation.** A slow call cannot be abandoned by the caller.
+6. **Contextless errors.** `EnsureSuccessStatusCode` reports a status code, not which endpoint produced it.
+7. **Naming.** `GET` in capitals breaks .NET conventions, which use PascalCase and an `Async` suffix for methods returning tasks.
+
+
+## Lock vs SemaphoreSlim: refreshing a token asynchronously
+
+The better version replaces the `lock` with a `SemaphoreSlim` of count 1, which acts as an async-compatible lock:
+
+```csharp
+private readonly SemaphoreSlim _tokenGate = new(1, 1);
+
+await _tokenGate.WaitAsync(cancellationToken);   // wait without blocking a thread
+try
+{
+    // only one caller at a time runs this block
+}
+finally
+{
+    _tokenGate.Release();                        // always release, even on exceptions
+}
+```
+
+It also uses **double-checked** refresh:
+
+```text
+1. Token valid?            -> return it immediately (no waiting at all)
+2. Enter the gate
+3. Token valid now?        -> another caller refreshed it while this one waited; return it
+4. Fetch a new token, store it, return it
+5. Leave the gate
+```
+
+Step 1 keeps the common case fast. Step 3 guarantees that ten concurrent callers arriving with an expired token produce **one** token request, not ten.
+
+The token and its expiry are stored together in one immutable record, so they are always read and written as a single reference. The field is marked `volatile` so that every thread sees the latest reference.
+
+
+## End to end: the better version
+
+One type parameter, no constraints that block valid responses, async token refresh, cancellation, and errors that name the endpoint.
+
+```csharp
+using System.Collections.Frozen;
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+
+CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+
+var urls = new UrlBuilder(new Dictionary<Endpoints, string>
+{
+    { Endpoints.Users,       "/api/users"         },
+    { Endpoints.UserCount,   "/api/users/count"   },
+    { Endpoints.Orders,      "/api/orders"        },
+    { Endpoints.SalesReport, "/api/reports/sales" }
+});
+
+var api = new ApiClient(NewHttpClient(), urls);
+
+// ---- one type argument per call ----
+Console.WriteLine("Sales report:");
+var request = new SalesReportRequest { StoreId = "S-42", From = new DateOnly(2026, 9, 1), To = new DateOnly(2026, 9, 7) };
+
+List<SaleLine> sales = await api.GetAsync<List<SaleLine>>(Endpoints.SalesReport, request);
+foreach (var line in sales)
+    Console.WriteLine($"  {line.ProductName,-12} x{line.Quantity}  {line.Total,7:0.00}");
+
+// ---- no query: nothing to invent ----
+Console.WriteLine("Users:");
+List<UserDto> users = await api.GetAsync<List<UserDto>>(Endpoints.Users);
+foreach (var user in users)
+    Console.WriteLine($"  #{user.Id} {user.Name}");
+
+// ---- value-type responses are allowed ----
+Console.WriteLine("User count:");
+int count = await api.GetAsync<int>(Endpoints.UserCount);
+Console.WriteLine($"  {count}");
+
+// ---- errors name the endpoint ----
+Console.WriteLine("Orders:");
+try
+{
+    await api.GetAsync<List<object>>(Endpoints.Orders);
+}
+catch (ApiException ex)
+{
+    Console.WriteLine($"  Error: {ex.Message}");
+}
+
+// ---- concurrent calls on a fresh client share one token request ----
+Console.WriteLine("Three concurrent calls on a fresh client:");
+var fresh = new ApiClient(NewHttpClient(), urls);
+
+List<UserDto>[] results = await Task.WhenAll(
+    fresh.GetAsync<List<UserDto>>(Endpoints.Users),
+    fresh.GetAsync<List<UserDto>>(Endpoints.Users),
+    fresh.GetAsync<List<UserDto>>(Endpoints.Users));
+
+Console.WriteLine($"  {results.Length} responses, {results.Sum(r => r.Count)} users total");
+
+// ---- cancellation ----
+Console.WriteLine("Cancelled call:");
+using var cts = new CancellationTokenSource();
+cts.Cancel();
+
+try
+{
+    await api.GetAsync<List<UserDto>>(Endpoints.Users, cancellationToken: cts.Token);
+}
+catch (OperationCanceledException)
+{
+    Console.WriteLine("  cancelled before sending");
+}
+
+static HttpClient NewHttpClient() =>
+    new(new FakeApiHandler()) { BaseAddress = new Uri("https://api.example.com") };
+
+// ======================= types =======================
+
+public enum Endpoints { Users, UserCount, Orders, SalesReport }
+
+public class SalesReportRequest
+{
+    public string StoreId { get; set; } = "";
+    public DateOnly From { get; set; }
+    public DateOnly To { get; set; }
+}
+
+public class SaleLine
+{
+    public string ProductName { get; set; } = "";
+    public int Quantity { get; set; }
+    public decimal Total { get; set; }
+}
+
+public class UserDto
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public sealed record TokenResponse(string AccessToken, int ExpiresIn);
+
+public sealed class ApiException(Endpoints endpoint, HttpStatusCode statusCode, string? detail = null)
+    : Exception($"{endpoint} failed with {(int)statusCode} {statusCode}." + (detail is null ? "" : " " + detail))
+{
+    public Endpoints Endpoint { get; } = endpoint;
+    public HttpStatusCode StatusCode { get; } = statusCode;
+}
+
+public sealed class ApiClient(HttpClient http, UrlBuilder urls)
+{
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly SemaphoreSlim _tokenGate = new(1, 1);
+    private volatile CachedToken? _token;
+
+    public async Task<TResponse> GetAsync<TResponse>(
+        Endpoints endpoint,
+        object? query = null,
+        CancellationToken cancellationToken = default)
+    {
+        string accessToken = await GetAccessTokenAsync(cancellationToken);
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, urls.Build(endpoint, query));
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+        using var response = await http.SendAsync(request, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+            throw new ApiException(endpoint, response.StatusCode);
+
+        var body = await response.Content.ReadFromJsonAsync<TResponse>(JsonOptions, cancellationToken);
+        return body ?? throw new ApiException(endpoint, response.StatusCode, "Response body was empty.");
+    }
+
+    private async Task<string> GetAccessTokenAsync(CancellationToken cancellationToken)
+    {
+        if (_token is { IsValid: true } cached)                 // 1. fast path, no waiting
+            return cached.Value;
+
+        await _tokenGate.WaitAsync(cancellationToken);          // 2. enter the gate
+        try
+        {
+            if (_token is { IsValid: true } refreshed)          // 3. refreshed while waiting?
+                return refreshed.Value;
+
+            using var response = await http.PostAsync("/oauth2/token", content: null, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            var token = await response.Content.ReadFromJsonAsync<TokenResponse>(JsonOptions, cancellationToken)
+                ?? throw new InvalidOperationException("Token response was empty.");
+
+            var fresh = new CachedToken(token.AccessToken, DateTimeOffset.UtcNow.AddSeconds(token.ExpiresIn - 60));
+            _token = fresh;                                     // 4. one atomic reference write
+            return fresh.Value;
+        }
+        finally
+        {
+            _tokenGate.Release();                               // 5. always leave the gate
+        }
+    }
+
+    private sealed record CachedToken(string Value, DateTimeOffset ExpiresAt)
+    {
+        public bool IsValid => DateTimeOffset.UtcNow < ExpiresAt;
+    }
+}
+
+public sealed class UrlBuilder(IReadOnlyDictionary<Endpoints, string> baseUrls)
+{
+    private readonly FrozenDictionary<Endpoints, string> _baseUrls = baseUrls.ToFrozenDictionary();
+
+    public string Build(Endpoints endpoint, object? query = null)
+    {
+        if (!_baseUrls.TryGetValue(endpoint, out var baseUrl))
+            throw new InvalidOperationException($"No base URL registered for '{endpoint}'.");
+
+        if (query is null) return baseUrl;
+
+        var pairs = query.GetType().GetProperties()
+            .Where(p => p.GetIndexParameters().Length == 0)
+            .Select(p => (Name: JsonNamingPolicy.CamelCase.ConvertName(p.Name), Value: p.GetValue(query)))
+            .Where(p => p.Value is not null)
+            .Select(p => $"{Uri.EscapeDataString(p.Name)}={Uri.EscapeDataString(Format(p.Value!))}");
+
+        string queryString = string.Join("&", pairs);
+        return queryString.Length == 0 ? baseUrl : $"{baseUrl}?{queryString}";
+    }
+
+    private static string Format(object value) => value switch
+    {
+        DateOnly d     => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+        _              => value.ToString() ?? ""
+    };
+}
+
+public sealed class FakeApiHandler : HttpMessageHandler
+{
+    private int _tokensIssued;
+
+    // The better client is fully async, so the fake only implements SendAsync.
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (request.RequestUri!.AbsolutePath == "/oauth2/token")
+            await Task.Delay(50, cancellationToken);             // a slow token server, to make overlap real
+
+        return Respond(request);
+    }
+
+    private HttpResponseMessage Respond(HttpRequestMessage request)
+    {
+        Console.WriteLine($"  -> {request.Method} {request.RequestUri!.PathAndQuery}");
+
+        string path = request.RequestUri.AbsolutePath;
+
+        if (path == "/oauth2/token")
+        {
+            int n = Interlocked.Increment(ref _tokensIssued);
+            return Json($$"""{ "accessToken": "token-{{n}}", "expiresIn": 3600 }""");
+        }
+
+        if (request.Headers.Authorization is null)
+            return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+
+        return path switch
+        {
+            "/api/users"         => Json("""[ { "id": 1, "name": "Ada" }, { "id": 2, "name": "Linus" } ]"""),
+            "/api/users/count"   => Json("2"),
+            "/api/reports/sales" => Json("""[ { "productName": "Phone Case", "quantity": 3, "total": 59.97 }, { "productName": "Charger", "quantity": 5, "total": 124.95 } ]"""),
+            _                    => new HttpResponseMessage(HttpStatusCode.NotFound)
+        };
+    }
+
+    private static HttpResponseMessage Json(string body) => new(HttpStatusCode.OK)
+    {
+        Content = new StringContent(body, Encoding.UTF8, "application/json")
+    };
+}
+```
+
+Output:
+
+```text
+Sales report:
+  -> POST /oauth2/token
+  -> GET /api/reports/sales?storeId=S-42&from=2026-09-01&to=2026-09-07
+  Phone Case   x3    59.97
+  Charger      x5   124.95
+Users:
+  -> GET /api/users
+  #1 Ada
+  #2 Linus
+User count:
+  -> GET /api/users/count
+  2
+Orders:
+  -> GET /api/orders
+  Error: Orders failed with 404 NotFound.
+Three concurrent calls on a fresh client:
+  -> POST /oauth2/token
+  -> GET /api/users
+  -> GET /api/users
+  -> GET /api/users
+  3 responses, 6 users total
+Cancelled call:
+  cancelled before sending
+```
+
+What the output proves:
+
+- **One type argument per call.** `GetAsync<List<SaleLine>>` states only the response shape. The query is an ordinary `object?` parameter.
+- **`GetAsync<int>` works.** With no `class` constraint, the count endpoint is reachable.
+- **Errors say where they came from.** `Orders failed with 404 NotFound.` identifies the endpoint and the status.
+- **Three overlapping calls, one POST.** The fresh client started with no token. The first caller entered the gate and fetched one; the other two waited, re-checked, and reused it.
+- **Cancellation reaches the network layer.** A cancelled token stops the request before the handler does any work.
+
+A few smaller techniques in the code:
+
+- **Primary constructors** (C# 12) on `ApiClient`, `UrlBuilder`, and `ApiException` put constructor parameters directly on the class declaration and make them available throughout the body.
+- **The property pattern** in `GetAccessTokenAsync` (the `is` check followed by `IsValid: true` in braces, then the name `cached`) tests for non-null, tests a property, and names the result, all in one expression.
+- **`body ?? throw`** works on an unconstrained `TResponse`. A value type such as `int` is never `null`, so the throw applies only to reference types that deserialize to `null`.
+
+
+## In an ASP.NET Core application
+
+A console program creates `HttpClient` by hand. An ASP.NET Core application registers the client as a **typed client**, so the framework manages handler lifetimes and connection reuse:
+
+```csharp
+builder.Services.AddSingleton(new UrlBuilder(new Dictionary<Endpoints, string>
+{
+    { Endpoints.Users,       "/api/users"         },
+    { Endpoints.SalesReport, "/api/reports/sales" }
+}));
+
+builder.Services.AddHttpClient<ApiClient>(client =>
+{
+    client.BaseAddress = new Uri("https://api.example.com");
+});
+```
+
+Any controller or service that takes an `ApiClient` in its constructor then receives one with a correctly configured `HttpClient`. In tests, the same client can be built with a fake handler exactly as above.
+
+
+## Original vs better
+
+| Question | Original | Better |
+|---|---|---|
+| Type arguments per call | Two | One |
+| Calling without a query | Must invent a type, such as `object` | Omit the argument |
+| Value-type responses | Rejected by the `class` constraint | Allowed |
+| Token refresh | `lock` with a blocking network call | `SemaphoreSlim` with `WaitAsync` |
+| Concurrent refresh | Correct, but threads block | Correct, threads free, double-checked |
+| Token state | Two fields written separately | One immutable record, one reference |
+| Cancellation | Not supported | `CancellationToken` end to end |
+| Error message | Status code only | Endpoint and status |
+| Deserialization | Read string, then deserialize | `ReadFromJsonAsync` |
+| Name | `GET` | `GetAsync` |
+
+The rules to carry forward:
+
+> A type parameter earns its place when the method **uses** the type: to return it, construct it, or call its members. A type parameter that is immediately converted to `object` is a mandatory argument with no benefit.
+
+> Add a constraint when the method body **needs** the ability it unlocks. A constraint added "to be safe" can block legitimate calls.
+
+> Asynchronous work needs asynchronous coordination. `lock` and `await` do not mix; `SemaphoreSlim` does.
+
+
+## The full journey of one call
+
+```text
+api.GetAsync<List<SaleLine>>(Endpoints.SalesReport, request)
+    |
+    |  compiler: TResponse = List<SaleLine>
+    v
+GetAccessTokenAsync
+    |  valid cached token? reuse it. otherwise: gate, re-check, POST, store
+    v
+urls.Build(SalesReport, request)
+    |  FrozenDictionary lookup            -> "/api/reports/sales"
+    |  reflection over request's properties
+    |  invariant formatting + escaping    -> "?storeId=S-42&from=...&to=..."
+    v
+HttpClient.SendAsync(GET + Bearer token)
+    |
+    v
+HttpMessageHandler  (real network, or a fake in tests)
+    |
+    v
+HttpResponseMessage
+    |  not 2xx?  -> ApiException naming the endpoint
+    v
+ReadFromJsonAsync<List<SaleLine>>
+    |  JSON array -> List<SaleLine>
+    v
+await unwraps Task<List<SaleLine>>  ->  List<SaleLine>
+```
+
+Every stage in that diagram is a topic covered in this series: the lookup table and its indexer-based predecessor, grouping endpoints with flags or with data, building a correct query string, and the generic method that ties it all to typed results.
+
+
+## Checkpoint
+
+1. In `client.GET<SalesReportRequest, ICollection<SaleLine>>(...)`, why can the compiler not infer the second type argument?
+2. Why does `ICollection<SaleLine>` satisfy `where TResponseModel : class`, even though it is an interface?
+3. Which constraint would allow `new T()` inside a method? Where must it appear in a constraint list?
+4. What does `await` return when applied to a `Task<List<UserDto>>`?
+5. Why can the original `Authenticate` method not simply be made `async` and keep its `lock`?
+6. In the double-checked refresh, what would go wrong if step 3, the re-check after entering the gate, were removed?
+7. The better client calls `GetAsync<int>` successfully. What change to the signature made that possible?
+
+
+## Where to go from here
+
+The client is now correct, typed, async, and testable offline. Natural next topics, each building on this one:
+
+- **Resilience.** Retrying transient failures with backoff, using `Microsoft.Extensions.Http.Resilience`.
+- **Source-generated JSON.** `JsonSerializerContext` removes reflection from deserialization entirely, for speed and trimming.
+- **Testing with fakes.** Turning the fake handler into proper unit tests that assert on the exact URLs and headers a client sends.
+- **Generic math.** Static abstract interface members, glimpsed here through `IParsable<T>`, taken further into numeric algorithms.

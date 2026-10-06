@@ -2,9 +2,9 @@
 title: "C# Constructors and properties: how an object gets built and holds its state"
 date: "2026-08-25"
 status: "written"
-minutes: 14
+minutes: 16
 order: 2
-lead: "Every new runs a constructor, whether one is written or not. What the constructor sets, a property stores — behind a backing field, guarded by value. This note covers both halves: how objects come into being, and how their state is kept."
+lead: "Every new runs a constructor, whether one is written or not. Parentheses pass arguments to it; braces run an object initializer afterwards. What the constructor sets, a property stores — behind a backing field, guarded by value. This note covers both halves: how objects come into being, and how their state is kept."
 ---
 
 The main question: **what actually happens when `new` runs, and how do properties store and protect the values a constructor puts into them?**
@@ -53,6 +53,47 @@ new("John")                    -> parameterized, target-typed
 
 "Creating an object without a constructor" via `new` is not a thing. Bypassing the constructor entirely requires *not* using `new` — covered at the end.
 
+## `()` versus `{}`: arguments versus assignments
+
+The two bracket shapes after `new` are unrelated mechanisms that happen to sit next to each other.
+
+| Syntax | What the brackets are | When it runs |
+|---|---|---|
+| `new Employee("Ada", 30m)` | constructor arguments | during construction |
+| `new Employee { Name = "Ada" }` | object initializer | after the constructor returns |
+| `new Employee("Ada", 30m) { Name = "Bob" }` | both | constructor first, then initializer |
+
+Because the initializer runs second, it **overwrites** anything the constructor assigned to the same member:
+
+```csharp
+class Employee
+{
+    public string Name { get; set; }
+    public decimal Rate { get; set; }
+
+    public Employee(string name, decimal rate)
+    {
+        Name = name;
+        Rate = rate;
+    }
+}
+
+var e = new Employee("Ada", 30m) { Name = "Bob" };
+Console.WriteLine($"{e.Name} {e.Rate}");   // Bob 30
+```
+
+```text
+new Employee("Ada", 30m) { Name = "Bob" }
+
+  1. constructor body   -> Name = "Ada", Rate = 30
+  2. object initializer -> Name = "Bob"
+  3. expression result  -> the same object, Name now "Bob"
+```
+
+<NoteToSelf>
+The ordering has a real consequence for validation: a constructor cannot see values that an object initializer is about to assign. A constructor that checks its own arguments is checking a state the caller may immediately overwrite. Invariants that must always hold belong in the property setter itself, or in a design where the values arrive through the constructor only — `init` accessors plus `required` exist to make that second option ergonomic.
+</NoteToSelf>
+
 ## The free constructor disappears the moment one is written
 
 A class with no constructor gets an implicit parameterless one from the compiler.
@@ -78,6 +119,28 @@ var q = new Person("John"); // fine
 
 To keep both, declare both. This is a common surprise: adding a parameterized constructor silently removes the ability to write `new Person()`.
 
+## An object initializer does not replace a constructor
+
+The rule above is where object initializers most often break. An initializer needs a constructor to have produced the object first, so `new Person { ... }` with no arguments requires an accessible **parameterless** constructor.
+
+```csharp
+class Person
+{
+    public string Name { get; set; }
+    public Person(string name) => Name = name;
+}
+
+var a = new Person { Name = "John" };            // CS1729 — no parameterless constructor
+var b = new Person("John") { Name = "Bob" };     // fine — a real constructor is called
+```
+
+The same applies to a primary constructor with parameters: `class Person(string name)` declares one constructor that takes an argument, so the braces-only form stops compiling for that type too.
+
+```text
+object initializer  =  accessible constructor  +  a sequence of assignments
+                       (never a replacement for the first half)
+```
+
 ## Overloading and chaining: one constructor calling another
 
 Multiple constructors can coexist as long as their parameter lists differ. To avoid repeating setup, one constructor delegates to another with `this(...)`.
@@ -102,6 +165,15 @@ class Person
 ```
 
 `new Person()` now runs `this("Unknown")`, which runs `this("Unknown", 0)`, which sets both fields — one real body, reused three ways.
+
+```text
+new Person()
+     -> this("Unknown")
+          -> this("Unknown", 0)
+               -> Name = "Unknown", Age = 0     <- the only body that assigns anything
+```
+
+The chained constructor runs **first**; the delegating constructor's own body, if it has one, runs after the target returns.
 
 For inheritance, `base(...)` calls the parent constructor:
 
@@ -145,6 +217,8 @@ With inheritance the order is easy to get wrong. Creating a `Derived`:
 2. `base(...)` is entered → `Base` field initializers run → `Base` constructor body runs.
 3. `Derived` constructor body runs.
 
+And with an object initializer in the picture, that whole sequence completes before the first assignment in the braces runs.
+
 <NoteToSelf>
 Consequence: derived field initializers run *before* the base constructor body. So a `virtual` method called from a base constructor will hit the derived override while the derived *constructor body* has not run yet. Derived field *initializers* have run, but anything the derived constructor was going to set is still at its default. Never call virtual/overridable methods from a constructor for exactly this reason.
 </NoteToSelf>
@@ -181,8 +255,46 @@ class Person(string name, int age)
 }
 ```
 
+They are called *primary* because they are declared on the type header itself rather than in a separate constructor body. The declaration produces one real constructor: `new Person("John", 25)` works, `new Person()` does not, exactly as if the constructor had been written out by hand.
+
 <NoteToSelf>
 A class primary constructor is *not* a positional record. It creates constructor *parameters*, not public auto-properties, and brings no value equality, no `with`, no `Deconstruct`. `Person(string name, int age)` on a `class` and the same on a `record` look identical and behave completely differently. The `record` keyword is what upgrades the parameters into init-only properties plus the equality machinery.
+</NoteToSelf>
+
+## `where T : new()` reads backwards
+
+A generic constraint can demand the ability to construct `T`:
+
+```csharp
+static T Create<T>() where T : new() => new T();
+```
+
+The constraint is easy to misread as "T has no constructor". It means the opposite:
+
+> `where T : new()` = "T has a **public parameterless** constructor, so `new T()` is legal here."
+
+Without it, `new T()` does not compile, because the compiler has no guarantee that any such constructor exists.
+
+Which types satisfy it:
+
+```csharp
+class A { }                                   // implicit parameterless ctor  -> satisfies new()
+class B { public B() { } }                    // explicit public parameterless -> satisfies new()
+class C { public C(string name) { } }         // only a parameterized ctor     -> does NOT satisfy
+class D { private D() { } }                   // parameterless but private     -> does NOT satisfy
+class E(string name) { }                      // primary ctor with parameters  -> does NOT satisfy
+struct F { }                                  // every struct                  -> satisfies new()
+```
+
+```csharp
+var a = Create<A>();        // fine
+var c = Create<C>();        // CS0310 — 'C' must be a non-abstract type with a public parameterless constructor
+```
+
+Two mechanical details: `new()` must come **last** in a constraint list (`where T : Person, new()`), and the constraint also rules out abstract types, since those cannot be instantiated at all.
+
+<NoteToSelf>
+This is the constraint behind most hand-rolled factories, ORMs and serializers that materialise objects generically. It is also why such libraries insist on a parameterless constructor and then set state through properties — a design that pairs badly with `required` and get-only properties. Where a parameterless constructor is genuinely impossible, the escape hatches are a factory delegate parameter (`Func<T>`) or reflection over a parameterized constructor, neither of which the compiler can verify.
 </NoteToSelf>
 
 ## Properties: an auto-property is a field plus two methods
@@ -225,6 +337,8 @@ private decimal _hourlyRate;
 ```
 
 When code writes `employee.HourlyRate = 25m`, the compiler calls the setter with `value` bound to `25m`. Its type is always the property's type. There is no way to rename it — `value` is fixed.
+
+Because an object initializer is just a sequence of assignments, a setter like this runs for initializer values too — which is the one kind of validation that *does* survive the constructor-then-initializer ordering.
 
 ## The explicit backing field, and the `field` keyword that replaces it
 
@@ -307,7 +421,7 @@ var p = new Person { Name = "John" };  // ok
 var q = new Person { Age = 25 };       // COMPILE ERROR — Name is required
 ```
 
-This pairs naturally with `init`: immutable *and* mandatory, without a hand-written constructor.
+This pairs naturally with `init`: immutable *and* mandatory, without a hand-written constructor. It is also the compiler-checked answer to the ordering problem above — the caller is forced to supply the value, rather than the constructor hoping it arrives.
 
 ## Creating an object without a constructor
 
@@ -341,7 +455,10 @@ Point origin = default;   // struct: all fields 0
 
 ## Gotchas worth remembering
 
-- **Defining a constructor removes the free parameterless one.** Re-add it explicitly if `new T()` must still work.
+- **Defining a constructor removes the free parameterless one.** Re-add it explicitly if `new T()` must still work. A primary constructor with parameters removes it too.
+- **Parentheses and braces are different mechanisms.** `()` passes constructor arguments; `{}` assigns members afterwards, and can overwrite what the constructor set.
+- **An object initializer is not a creation path.** It always needs an accessible constructor to have run first.
+- **`where T : new()` means T *has* a public parameterless constructor**, not that it lacks one — and `new()` goes last in a constraint list.
 - **`value` and `field` are contextual keywords**, not variables to declare — `value` is the setter's input, `field` is its storage.
 - **Auto-properties always have a backing field**, even the get-only ones; the field just isn't nameable.
 - **Field initializers run before the constructor body**, and in inheritance, derived initializers run before the base body.
@@ -351,4 +468,4 @@ Point origin = default;   // struct: all fields 0
 
 ## Handoff
 
-A constructor is the one guaranteed entry point for `new`, running field initializers then its body, chaining through `this` and `base`, and — since C# 12 — able to live in the type header. A property is the guarded gate to each value it sets: an auto-property hides a backing field; `value` names the input; `field` names the storage; `set` / `init` / get-only decide when writes are allowed. Together they answer *how an object is built* and *how it keeps what it was built with*. The next note looks at where that state lives once construction finishes — stack versus heap, and how `struct` and `class` split along that line.
+A constructor is the one guaranteed entry point for `new`, running field initializers then its body, chaining through `this` and `base`, and — since C# 12 — able to live in the type header. Parentheses feed it arguments; braces run an object initializer once it returns. A property is the guarded gate to each value it sets: an auto-property hides a backing field; `value` names the input; `field` names the storage; `set` / `init` / get-only decide when writes are allowed. Together they answer *how an object is built* and *how it keeps what it was built with*. The next note looks at where that state lives once construction finishes — stack versus heap, and how `struct` and `class` split along that line.

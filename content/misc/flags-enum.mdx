@@ -1,0 +1,659 @@
+---
+title: "Flags Enums in C#"
+date: 2026-09-21
+status: written
+minutes: 15
+order: 7
+lead: "How one enum variable holds several values at once, what the bitwise operators and HasFlag actually compute, what the Flags attribute really changes, and when a plain set says the same thing more clearly."
+---
+
+## The main question
+
+API client code sometimes contains a line like this:
+
+```csharp
+if (Endpoints.QueryLikeEndpointsWithParameters.HasFlag(endpoint))
+{
+    // this endpoint must be called with query parameters
+}
+```
+
+`QueryLikeEndpointsWithParameters` is not a real endpoint. It is a **group of endpoints stored inside the enum itself**, and `HasFlag` asks whether a given endpoint belongs to that group. Making that work requires thinking about numbers as bits.
+
+This article builds flags enums from the bit level up, shows where they are exactly the right tool, runs the endpoint-group pattern end to end with its traps exposed, then replaces it with a clearer design, also end to end.
+
+Concepts covered, in order:
+
+| Concept | One-line meaning |
+|---|---|
+| Enum values | Every enum member is a named integer |
+| Binary and powers of two | Each power of two switches on exactly one bit |
+| Flag values | Enum members given one distinct bit each |
+| `\|` (OR) | Combine flags: switch bits on |
+| `&` (AND) | Test flags: keep only shared bits |
+| `HasFlag` | A readable name for the AND test |
+| `~` and `^` | Clear and toggle flags |
+| `[Flags]` attribute | Mostly changes how values print |
+| Stored groups | A combination saved as its own enum member |
+| The three traps | Zero, overlapping bits, running out of bits |
+
+
+## Names vs numbers: what an enum really is
+
+```csharp
+public enum Endpoints { Users, Orders, Products, Reports }
+```
+
+Every member is an integer. When no values are written, the compiler numbers them from zero:
+
+```text
+Users    = 0
+Orders   = 1
+Products = 2
+Reports  = 3
+```
+
+```csharp
+Console.WriteLine((int)Endpoints.Reports);   // 3
+Console.WriteLine((Endpoints)1);             // Orders
+```
+
+A variable of a normal enum holds **one** member at a time. The whole point of flags is to let one variable hold **several**.
+
+
+## Decimal vs binary
+
+Every integer is stored as bits. Powers of two have a special property: each one switches on **exactly one bit**, and never the same bit as another power of two.
+
+| Decimal | Binary | Bit that is on |
+|---|---|---|
+| 1 | `0001` | 1st |
+| 2 | `0010` | 2nd |
+| 4 | `0100` | 3rd |
+| 8 | `1000` | 4th |
+
+That property turns each bit into an independent on/off switch. Four switches, four possible members, any combination of them storable in one number.
+
+```csharp
+Console.WriteLine(Convert.ToString(12, 2));   // 1100   (bits 3 and 4 on)
+```
+
+
+## One bit per member
+
+A flags enum gives each member its own bit:
+
+```csharp
+[Flags]
+public enum Endpoints
+{
+    None     = 0,
+    Users    = 1 << 0,   // 1   0001
+    Orders   = 1 << 1,   // 2   0010
+    Products = 1 << 2,   // 4   0100
+    Reports  = 1 << 3    // 8   1000
+}
+```
+
+`1 << n` is the **left shift** operator: take the bits of `1` and move them `n` places to the left. `1 << 3` is `1000`, which is 8. Writing `1, 2, 4, 8` directly is equivalent; the shift form makes "each member takes the next bit" obvious at a glance.
+
+Binary literals are a third equivalent style:
+
+```csharp
+Users    = 0b0001,
+Orders   = 0b0010,
+Products = 0b0100,
+Reports  = 0b1000
+```
+
+The bit layout, visualised:
+
+```text
+             bit:  4 3 2 1
+                   -------
+Users    =  1      0 0 0 1
+Orders   =  2      0 0 1 0
+Products =  4      0 1 0 0
+Reports  =  8      1 0 0 0
+```
+
+
+## On vs test: `|` and `&`
+
+### `|` switches bits on
+
+Bitwise OR produces a bit that is on if it is on in **either** operand:
+
+```text
+Products   0100
+Reports    1000
+           ----
+   |       1100    = 12
+```
+
+```csharp
+var group = Endpoints.Products | Endpoints.Reports;
+
+Console.WriteLine((int)group);   // 12
+Console.WriteLine(group);        // Products, Reports
+```
+
+One variable now holds two members.
+
+### `&` keeps only shared bits
+
+Bitwise AND produces a bit that is on only if it is on in **both** operands. That makes it a membership test.
+
+Is `Reports` in the group?
+
+```text
+group      1100
+Reports    1000
+           ----
+   &       1000    equals Reports  ->  yes
+```
+
+Is `Users` in the group?
+
+```text
+group      1100
+Users      0001
+           ----
+   &       0000    not equal to Users  ->  no
+```
+
+```csharp
+bool hasReports = (group & Endpoints.Reports) == Endpoints.Reports;   // true
+bool hasUsers   = (group & Endpoints.Users)   == Endpoints.Users;     // false
+```
+
+
+## Contains vs belongs: reading `HasFlag`
+
+`HasFlag` is the AND test above with a readable name:
+
+```csharp
+group.HasFlag(Endpoints.Reports);   // true
+group.HasFlag(Endpoints.Users);     // false
+```
+
+The direction matters. `a.HasFlag(b)` means:
+
+> Does `a` contain **all** of `b`'s bits?
+
+The container goes on the left, the thing being looked for goes in the parentheses. So the line from the opening reads:
+
+```csharp
+Endpoints.QueryLikeEndpointsWithParameters.HasFlag(endpoint)
+// "Is this endpoint one of the ones in the query-required group?"
+```
+
+### All-of vs any-of
+
+When the argument is itself a combination, `HasFlag` requires **every** bit:
+
+```csharp
+var editor = Endpoints.Users | Endpoints.Orders;
+
+editor.HasFlag(Endpoints.Users | Endpoints.Orders);     // true   (has both)
+editor.HasFlag(Endpoints.Users | Endpoints.Reports);    // false  (lacks Reports)
+```
+
+"Has **any** of these" needs a different test: AND the two, and check that something survived:
+
+```csharp
+bool hasAny = (editor & (Endpoints.Users | Endpoints.Reports)) != 0;   // true
+```
+
+
+## Clear vs toggle: `~` and `^`
+
+Two more operators complete the toolkit.
+
+`~` (bitwise NOT) flips every bit. Combined with `&`, it **removes** a flag:
+
+```text
+group            1100
+~Reports         0111   (and all higher bits on)
+                 ----
+group & ~Reports 0100   = Products
+```
+
+```csharp
+var withoutReports = group & ~Endpoints.Reports;   // Products
+```
+
+`^` (bitwise XOR) flips only the bits that are on in the right operand. It **toggles** a flag: on becomes off, off becomes on.
+
+```csharp
+var toggled = group ^ Endpoints.Users;      // Users, Products, Reports
+var back    = toggled ^ Endpoints.Users;    // Products, Reports
+```
+
+| Goal | Expression |
+|---|---|
+| Add a flag | `value \| flag` |
+| Test all of | `value.HasFlag(flags)` |
+| Test any of | `(value & flags) != 0` |
+| Remove a flag | `value & ~flag` |
+| Toggle a flag | `value ^ flag` |
+
+
+## Printing vs working: what `[Flags]` actually does
+
+A common belief: the `[Flags]` attribute makes the bitwise operations work. It does not. Its main visible effect is on **formatting**:
+
+```csharp
+// with [Flags]
+Console.WriteLine(Endpoints.Users | Endpoints.Orders);   // Users, Orders
+
+// without [Flags]
+Console.WriteLine(Endpoints.Users | Endpoints.Orders);   // 3
+```
+
+What `[Flags]` does **not** do:
+
+- It does **not** assign powers of two. Members without explicit values still get `0, 1, 2, 3`, and those overlap.
+- It is **not** required for `|`, `&`, `~`, `^`, or `HasFlag` to compile or run.
+
+Its real role is documentation: it tells readers, tooling, and `ToString` that the enum is designed to be combined. That promise must be backed by correct values written by hand.
+
+> Parsing understands the combined text form as well: `Enum.Parse<Endpoints>("Users, Orders")` returns the value 3.
+
+
+## Stored groups: a combination as a member
+
+A combination can be saved as its own member:
+
+```csharp
+[Flags]
+public enum Endpoints
+{
+    None     = 0,
+    Users    = 1 << 0,
+    Orders   = 1 << 1,
+    Products = 1 << 2,
+    Reports  = 1 << 3,
+
+    QueryLikeEndpointsWithParameters = Products | Reports   // 12, binary 1100
+}
+```
+
+This member is not an endpoint. It is a **named set** that lives inside the enum. Every check against it is one AND:
+
+```text
+endpoint = Reports    1100 & 1000 = 1000  ->  in the group
+endpoint = Users      1100 & 0001 = 0000  ->  not in the group
+```
+
+Framework enums use the same idea. `FileAccess.ReadWrite` is defined as `Read | Write`, a stored combination of two real flags.
+
+
+## The three traps
+
+### Trap 1: zero is in every group
+
+```csharp
+Endpoints.QueryLikeEndpointsWithParameters.HasFlag(Endpoints.None);   // true
+```
+
+Any value AND zero is zero, and zero equals zero, so the test always passes. If a real member accidentally ends up with value 0, it silently belongs to **every** group. This is the reason flags enums reserve 0 for a member named `None` and give real members bits starting at 1.
+
+### Trap 2: overlapping bits give wrong answers
+
+```csharp
+[Flags]
+public enum BrokenEndpoints
+{
+    Users    = 1,   // 0001
+    Orders   = 2,   // 0010
+    Products = 3    // 0011  <- not a power of two
+}
+
+Console.WriteLine(BrokenEndpoints.Products.HasFlag(BrokenEndpoints.Users));   // True
+```
+
+`Products` shares bits with both `Users` and `Orders`, so it "contains" them. Every membership test involving it is now unreliable, and nothing warns about it at compile time.
+
+### Trap 3: the bits run out
+
+An enum's underlying type is `int` by default: 32 bits, so at most 32 single-bit members (31 if the sign bit is avoided). Declaring `enum Endpoints : long` raises the ceiling to 64. Beyond that, the approach stops working. An API client with a long list of endpoints can hit this ceiling.
+
+
+## Right tool: permissions
+
+Flags are the natural choice when a value is **genuinely several options at once**. Permissions are the classic case: a user holds some combination of rights, and the combination fits in one integer column in a database.
+
+```csharp
+var editor = Permission.Read | Permission.Write;
+Console.WriteLine($"editor:        {editor}");
+Console.WriteLine($"can write:     {editor.HasFlag(Permission.Write)}");
+Console.WriteLine($"can delete:    {editor.HasFlag(Permission.Delete)}");
+
+var admin = editor | Permission.Delete;
+Console.WriteLine($"admin:         {admin}");
+
+var demoted = admin & ~Permission.Write & ~Permission.Delete;
+Console.WriteLine($"demoted:       {demoted}");
+
+var sharer = editor ^ Permission.Share;
+Console.WriteLine($"sharer:        {sharer}");
+
+bool canModifyAnything = (demoted & (Permission.Write | Permission.Delete)) != 0;
+Console.WriteLine($"demoted can modify: {canModifyAnything}");
+
+Console.WriteLine($"All contains editor: {Permission.All.HasFlag(editor)}");
+
+var parsed = Enum.Parse<Permission>("Read, Share");
+Console.WriteLine($"parsed:        {parsed} (stored as {(int)parsed})");
+
+[Flags]
+public enum Permission
+{
+    None   = 0,
+    Read   = 1 << 0,
+    Write  = 1 << 1,
+    Delete = 1 << 2,
+    Share  = 1 << 3,
+
+    All = Read | Write | Delete | Share
+}
+```
+
+Output:
+
+```text
+editor:        Read, Write
+can write:     True
+can delete:    False
+admin:         Read, Write, Delete
+demoted:       Read
+sharer:        Read, Write, Share
+demoted can modify: False
+All contains editor: True
+parsed:        Read, Share (stored as 9)
+```
+
+Every operator from the toolkit appears once. Nothing here is awkward: each member is a real permission, and combinations are meaningful values in their own right.
+
+
+## End to end: the original pattern
+
+Now the endpoint-group pattern from the opening, including a look at its traps. The query is a plain string here, so the focus stays on the flag logic.
+
+```csharp
+using System.Text;
+
+var urls = new UrlTable();
+
+// ---- normal use ----
+Console.WriteLine(urls.Build(Endpoints.Users,    null));
+Console.WriteLine(urls.Build(Endpoints.Users,    "page=2"));
+Console.WriteLine(urls.Build(Endpoints.Reports,  "from=2026-09-01"));
+Console.WriteLine(urls.Build(Endpoints.Products, "category=cables"));
+
+try
+{
+    urls.Build(Endpoints.Reports, null);
+}
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ---- looking inside the group ----
+var group = Endpoints.QueryLikeEndpointsWithParameters;
+Console.WriteLine($"Group value: {(int)group}, binary: {Convert.ToString((int)group, 2)}");
+Console.WriteLine($"Combined endpoints print as: {Endpoints.Users | Endpoints.Orders}");
+
+Console.WriteLine();
+Console.WriteLine("Every enum member, checked against the group:");
+foreach (var e in Enum.GetValues<Endpoints>())
+    Console.WriteLine($"  {e,-33} requires query: {group.HasFlag(e)}");
+
+// ---- the traps, live ----
+Console.WriteLine();
+TryBuild(Endpoints.None, null);                                // zero trap
+TryBuild(Endpoints.QueryLikeEndpointsWithParameters, "x=1");   // a group passed as an endpoint
+
+void TryBuild(Endpoints endpoint, string? query)
+{
+    try
+    {
+        Console.WriteLine(urls.Build(endpoint, query));
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"{endpoint} -> {ex.GetType().Name}: {ex.Message}");
+    }
+}
+
+// ======================= types =======================
+
+[Flags]
+public enum Endpoints
+{
+    None     = 0,
+    Users    = 1 << 0,
+    Orders   = 1 << 1,
+    Products = 1 << 2,
+    Reports  = 1 << 3,
+
+    QueryLikeEndpointsWithParameters = Products | Reports
+}
+
+public sealed class UrlTable
+{
+    private readonly Dictionary<Endpoints, string> _baseUrls = new()
+    {
+        { Endpoints.Users,    "/api/users"    },
+        { Endpoints.Orders,   "/api/orders"   },
+        { Endpoints.Products, "/api/products" },
+        { Endpoints.Reports,  "/api/reports"  }
+    };
+
+    public string Build(Endpoints endpoint, string? query)
+    {
+        bool requiresQuery = Endpoints.QueryLikeEndpointsWithParameters.HasFlag(endpoint);
+
+        if (requiresQuery && string.IsNullOrEmpty(query))
+            throw new ArgumentException($"'{endpoint}' requires query parameters.", nameof(query));
+
+        var builder = new StringBuilder(_baseUrls[endpoint]);
+
+        if (!string.IsNullOrEmpty(query))
+            builder.Append('?').Append(query);
+
+        return builder.ToString();
+    }
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users?page=2
+/api/reports?from=2026-09-01
+/api/products?category=cables
+Error: 'Reports' requires query parameters. (Parameter 'query')
+Group value: 12, binary: 1100
+Combined endpoints print as: Users, Orders
+
+Every enum member, checked against the group:
+  None                              requires query: True
+  Users                             requires query: False
+  Orders                            requires query: False
+  Products                          requires query: True
+  Reports                           requires query: True
+  QueryLikeEndpointsWithParameters  requires query: True
+
+None -> ArgumentException: 'None' requires query parameters. (Parameter 'query')
+QueryLikeEndpointsWithParameters -> KeyNotFoundException: The given key 'QueryLikeEndpointsWithParameters' was not present in the dictionary.
+```
+
+Reading it:
+
+- The first five lines are the pattern working correctly: `Products` and `Reports` are in the group, `Users` is not.
+- The member list shows the enum contains **six** values, and only four are endpoints. `None` and the group are mixed in with the real ones.
+- `None` reports that it "requires a query". That is trap 1 producing a misleading error: the real problem is that `None` is not an endpoint at all.
+- The group itself compiles as a valid argument to `Build`. The type system cannot tell a set of endpoints from a single endpoint.
+
+
+## Why flags are a weak fit here
+
+The pattern works, but the evidence above points at four costs:
+
+1. **Fake members.** `None` and `QueryLikeEndpointsWithParameters` share a type with real endpoints. Anything that iterates the enum, binds it to a dropdown, or accepts it as a parameter sees them.
+2. **Silent traps.** Zero and overlapping values fail without compiler errors, and both are easy to introduce when adding a new endpoint months later.
+3. **A hard ceiling.** 32 or 64 endpoints, then a redesign.
+4. **Scattered knowledge.** The URL for an endpoint lives in one file; whether it requires a query lives in the enum definition, somewhere else. Adding an endpoint means editing both and remembering to.
+
+The underlying mismatch: an endpoint is **one thing**. It is never "Users and Orders at once". Flags model values that are several things at once. Here they are borrowed purely as a compact way to store a set.
+
+
+## End to end: the better version
+
+Keep the enum plain, and store everything about an endpoint **together**: its path and whether it requires a query.
+
+```csharp
+using System.Collections.Frozen;
+using System.Text;
+
+var urls = new EndpointUrls(new Dictionary<Endpoints, EndpointInfo>
+{
+    { Endpoints.Users,    new("/api/users",    RequiresQuery: false) },
+    { Endpoints.Orders,   new("/api/orders",   RequiresQuery: false) },
+    { Endpoints.Products, new("/api/products", RequiresQuery: true)  },
+    { Endpoints.Reports,  new("/api/reports",  RequiresQuery: true)  }
+});
+
+// ---- normal use ----
+Console.WriteLine(urls.Build(Endpoints.Users));
+Console.WriteLine(urls.Build(Endpoints.Users,    "page=2"));
+Console.WriteLine(urls.Build(Endpoints.Reports,  "from=2026-09-01"));
+Console.WriteLine(urls.Build(Endpoints.Products, "category=cables"));
+
+try
+{
+    urls.Build(Endpoints.Reports);
+}
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ---- only real endpoints exist ----
+Console.WriteLine();
+Console.WriteLine("Every enum member:");
+foreach (var e in Enum.GetValues<Endpoints>())
+    Console.WriteLine($"  {e,-9} requires query: {urls.RequiresQuery(e)}");
+
+// ---- an invalid value fails with a clear message ----
+Console.WriteLine();
+try
+{
+    urls.Build((Endpoints)99);
+}
+catch (InvalidOperationException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ======================= types =======================
+
+public enum Endpoints { Users, Orders, Products, Reports }
+
+public sealed record EndpointInfo(string Path, bool RequiresQuery);
+
+public sealed class EndpointUrls
+{
+    private readonly FrozenDictionary<Endpoints, EndpointInfo> _endpoints;
+
+    public EndpointUrls(IReadOnlyDictionary<Endpoints, EndpointInfo> endpoints)
+    {
+        _endpoints = endpoints.ToFrozenDictionary();
+    }
+
+    public bool RequiresQuery(Endpoints endpoint) => Get(endpoint).RequiresQuery;
+
+    public string Build(Endpoints endpoint, string? query = null)
+    {
+        var info = Get(endpoint);
+
+        if (string.IsNullOrEmpty(query))
+        {
+            if (info.RequiresQuery)
+                throw new ArgumentException($"'{endpoint}' requires query parameters.", nameof(query));
+
+            return info.Path;
+        }
+
+        return new StringBuilder(info.Path).Append('?').Append(query).ToString();
+    }
+
+    private EndpointInfo Get(Endpoints endpoint) =>
+        _endpoints.TryGetValue(endpoint, out var info)
+            ? info
+            : throw new InvalidOperationException($"No endpoint registered for '{endpoint}'.");
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users?page=2
+/api/reports?from=2026-09-01
+/api/products?category=cables
+Error: 'Reports' requires query parameters. (Parameter 'query')
+
+Every enum member:
+  Users     requires query: False
+  Orders    requires query: False
+  Products  requires query: True
+  Reports   requires query: True
+
+Error: No endpoint registered for '99'.
+```
+
+What changed:
+
+- **The enum lists only endpoints.** No `None`, no stored group, no bit values. `Users` being 0 is harmless because nothing does bit math.
+- **Each endpoint's facts live on one line.** Adding an endpoint is one entry that states its path and its rule together.
+- **No ceiling.** The dictionary holds any number of endpoints.
+- **Invalid values fail clearly.** An out-of-range cast produces a specific message instead of a misleading "requires query" error.
+
+> A lighter variant keeps the URL table as plain strings and adds a separate `FrozenSet<Endpoints>` for the query-required group, checked with `Contains`. It fixes the traps but still stores the two facts in two places. The record-per-endpoint shape above keeps them together.
+
+
+## Original vs better
+
+| Question | Flags group in the enum | Plain enum + endpoint info |
+|---|---|---|
+| Does the enum contain non-endpoints? | Yes, `None` and the group | No |
+| Can a group be passed as an endpoint? | Yes, it compiles | No such value exists |
+| Zero trap possible? | Yes | No bit math, no trap |
+| Overlapping-value trap possible? | Yes, silently | No |
+| Maximum endpoints | 32 or 64 | Unlimited |
+| Where is the "requires query" rule? | In the enum file | Next to the path |
+| Adding an endpoint | Edit enum bits and group, plus URL table | One entry |
+
+The rule to carry forward:
+
+> Use flags when a single value is **genuinely several options at once**, like permissions or file access modes. When the members are distinct things and only a grouping is needed, store the grouping as data: a set, or a property on each item.
+
+
+## Checkpoint
+
+1. With `Products = 4` and `Reports = 8`, what is `Products | Reports` in decimal and binary?
+2. Write out the bit math for `(Products | Reports).HasFlag(Orders)`, with `Orders = 2`. What does it return?
+3. Why does `anything.HasFlag(None)` always return `true`?
+4. What single expression removes `Write` from a `Permission` value?
+5. `editor.HasFlag(Permission.Write | Permission.Delete)` returns `false` for a user with Read and Write. Why, and what expression would test "has either"?
+6. In the original end-to-end run, why did `None` produce a "requires query parameters" error instead of a "not registered" error?
+
+
+## Next
+
+Both versions here accept the query as a ready-made string. Real clients accept a **query object** instead, such as a request model with `Page`, `StoreId`, and `From` properties, and turn it into `?page=2&storeId=S-42&from=2026-09-01` automatically. That conversion involves reflection, URL escaping, and tuple return values, and the code that calls it is often a single nested ternary with a `throw` inside. The next article takes that code apart and rebuilds it with guard clauses.

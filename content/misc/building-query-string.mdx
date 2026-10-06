@@ -1,0 +1,709 @@
+---
+title: "Building Query Strings in C#"
+date: 2026-09-21
+status: written
+minutes: 18
+order: 8
+lead: "How a query object becomes ?page=2&sort=name: reading a nested ternary with a throw inside, what nameof and tuples are for, how reflection reads properties at runtime, and the escaping and culture bugs a naive version hides."
+---
+
+## The main question
+
+API client code sometimes contains a return statement like this:
+
+```csharp
+return RequiresQuery.Contains(key) && !anyQueryParameters
+    ? throw new ArgumentException("Provided parameter must have value for performing a query-like request", nameof(queryModel))
+    : anyQueryParameters
+        ? builder.Append(ToQueryString(queryModel).queryStringData).ToString()
+        : builder.ToString();
+```
+
+Several features are compressed into one statement: a **nested conditional operator**, a **throw expression**, **`nameof`**, and a method that returns a **tuple**. Behind `ToQueryString` sits **reflection**, the code that turns an arbitrary object into `?page=2&sort=name`.
+
+This article takes each feature apart, runs the original pattern end to end with its hidden bugs exposed, then rebuilds it with guard clauses and a correct query-string helper, also end to end.
+
+Concepts covered, in order:
+
+| Concept | One-line meaning |
+|---|---|
+| Conditional operator `?:` | An if/else that produces a value |
+| Nested conditional | A conditional inside a conditional's branch |
+| Throw expression | `throw` used where a value is expected |
+| `nameof` | A compiler-checked name as a string |
+| Tuples | Several values returned together, with names |
+| Reflection | Reading an object's properties at runtime |
+| URL escaping | Making text safe inside a URL |
+| Invariant culture | Formatting numbers and dates the same everywhere |
+| Guard clauses | Early exits that replace nested branching |
+
+
+## Statement vs expression: the conditional operator
+
+An `if` is a **statement**. It does something, but it has no value:
+
+```csharp
+string label;
+if (age >= 18)
+    label = "adult";
+else
+    label = "minor";
+```
+
+The conditional operator is an **expression**. It evaluates to a value:
+
+```csharp
+string label = age >= 18 ? "adult" : "minor";
+//             condition ? if-true : if-false
+```
+
+Two rules follow from "it is an expression":
+
+- Both branches must produce a compatible type. `age >= 18 ? "adult" : 42` does not compile.
+- Only one branch runs. The other is never evaluated.
+
+
+## Flat vs nested
+
+A nested conditional places another conditional inside a branch, usually the false branch:
+
+```csharp
+string size = n < 10 ? "small" : n < 100 ? "medium" : "large";
+```
+
+The operator is **right-associative**, so the compiler groups it from the right:
+
+```csharp
+string size = n < 10 ? "small" : (n < 100 ? "medium" : "large");
+```
+
+Which is exactly this chain:
+
+```csharp
+string size;
+if (n < 10)       size = "small";
+else if (n < 100) size = "medium";
+else              size = "large";
+```
+
+Applied to the statement from the opening, with parentheses added:
+
+```csharp
+return (requiresQuery && !anyQueryParameters)
+    ? throw new ArgumentException(...)
+    : (anyQueryParameters
+        ? builder.Append(queryString).ToString()
+        : builder.ToString());
+```
+
+And as an if/else chain with identical behavior:
+
+```csharp
+if (requiresQuery && !anyQueryParameters)
+    throw new ArgumentException("Provided parameter must have value...", nameof(queryModel));
+else if (anyQueryParameters)
+    return builder.Append(ToQueryString(queryModel).queryStringData).ToString();
+else
+    return builder.ToString();
+```
+
+As a decision table:
+
+| Endpoint requires a query? | Query object given? | Result |
+|---|---|---|
+| Yes | No | throw `ArgumentException` |
+| Yes | Yes | base URL + query string |
+| No | Yes | base URL + query string |
+| No | No | base URL only |
+
+> Reading tip for any nested conditional: find each `?`, and read the text before it as an `if` condition. Each `:` is an `else`.
+
+
+## Statement vs expression, again: throw expressions
+
+`throw` is normally a statement. Since C# 7 it can also appear as an **expression** in three places:
+
+```csharp
+// 1. A branch of the conditional operator
+int Half(int n) => n % 2 == 0 ? n / 2 : throw new ArgumentException("Must be even.");
+
+// 2. The right side of ??
+string name = input ?? throw new ArgumentNullException(nameof(input));
+
+// 3. An expression-bodied member or lambda
+public void NotYet() => throw new NotImplementedException();
+```
+
+A throw expression has no type of its own; it adopts whatever type the context needs. That is why the opening statement can put a `throw` in one branch and a `string` in another: the whole conditional is a `string`, and the throw branch simply never produces one.
+
+The `?? throw` form is the most common in practice. It turns "look something up, and fail clearly if it is missing" into one line:
+
+```csharp
+string baseUrl = lookup.GetValueOrDefault(key) ?? throw new InvalidOperationException($"Unknown endpoint '{key}'.");
+```
+
+
+## String vs nameof
+
+```csharp
+throw new ArgumentException("Query is required.", "queryModel");       // hard-coded
+throw new ArgumentException("Query is required.", nameof(queryModel)); // compiler-checked
+```
+
+`nameof(queryModel)` becomes the string `"queryModel"` at compile time. The difference appears during refactoring: rename the parameter, and `nameof` updates with it or fails to compile. A hard-coded string silently goes stale.
+
+The second argument of `ArgumentException` is the **parameter name**. It is what produces the `(Parameter 'queryModel')` suffix in exception messages, and what tools such as ASP.NET Core use to point at the offending input.
+
+
+## One value vs several: tuples
+
+A method can return one value. To return several without defining a class, C# has **tuples**:
+
+```csharp
+(string text, int count) Describe()
+{
+    return ("?page=2&size=10", 2);
+}
+
+var result = Describe();
+Console.WriteLine(result.text);    // ?page=2&size=10
+Console.WriteLine(result.count);   // 2
+```
+
+That is exactly the shape behind `ToQueryString(queryModel).queryStringData`: the method returns a tuple, and the caller reads one named element from it.
+
+### Deconstruction and discards
+
+A tuple can be unpacked into separate variables. Elements not needed can be discarded with `_`:
+
+```csharp
+var (text, count) = Describe();       // two variables
+var (onlyText, _) = Describe();       // keep one, discard the other
+```
+
+### Names are optional, and only for humans
+
+```csharp
+var unnamed = ("?page=2", 1);
+Console.WriteLine(unnamed.Item1);     // ?page=2
+Console.WriteLine(unnamed.Item2);     // 1
+```
+
+Element names exist at compile time only. Underneath, every tuple is a `System.ValueTuple` with fields `Item1`, `Item2`, and so on. Tuples are **value types** and compare by value:
+
+```csharp
+Console.WriteLine((1, "a") == (1, "a"));   // True
+```
+
+### Tuple vs record
+
+| Situation | Better choice |
+|---|---|
+| Private helper returning two or three values | Tuple |
+| Local, short-lived grouping | Tuple |
+| Part of a public API | Record |
+| Value that travels through several layers | Record |
+
+```csharp
+public sealed record QueryStringResult(string Text, int ParameterCount);
+```
+
+A record carries its names into the type system permanently and can gain methods later. A tuple is lighter, but its meaning lives only in element names.
+
+
+## Compile time vs run time: reflection
+
+A query-string helper must accept **any** object: a `UserQuery`, a `ProductQuery`, even an anonymous object. It cannot know their properties at compile time. **Reflection** is the runtime API for inspecting a type:
+
+```csharp
+using System.Reflection;
+
+var model = new UserQuery { Page = 2, Size = 10 };
+
+Type type = model.GetType();
+Console.WriteLine(type.Name);
+
+foreach (PropertyInfo property in type.GetProperties())
+{
+    object? value = property.GetValue(model);
+    Console.WriteLine($"{property.Name} ({property.PropertyType.Name}) = {value}");
+}
+
+public class UserQuery
+{
+    public int Page { get; set; }
+    public int Size { get; set; }
+}
+```
+
+Output:
+
+```text
+UserQuery
+Page (Int32) = 2
+Size (Int32) = 10
+```
+
+The pieces:
+
+| Member | Meaning |
+|---|---|
+| `GetType()` | The runtime type of the object |
+| `GetProperties()` | Every public instance property, as `PropertyInfo` objects |
+| `PropertyInfo.Name` | The property's name as a string |
+| `PropertyInfo.PropertyType` | The property's declared type |
+| `PropertyInfo.GetValue(obj)` | Read the property's current value from a specific object |
+
+Anonymous objects work the same way, because the compiler generates a real class for them:
+
+```csharp
+var anon = new { Page = 3, Sort = "name" };
+Console.WriteLine(anon.GetType().Name);                           // <>f__AnonymousType0`2
+Console.WriteLine(anon.GetType().GetProperty("Sort")!.GetValue(anon));   // name
+```
+
+> Two reflection costs matter in real code. Reading metadata is slow compared to normal property access, so the `PropertyInfo[]` for each type should be looked up once and cached. And an **indexer** appears in `GetProperties()` as a property named `Item` that needs arguments; calling `GetValue` on it without arguments throws. Filtering with `GetIndexParameters().Length == 0` skips indexers.
+
+> `GetProperties()` returns properties in declaration order in practice, which is why `page` comes before `size`. The documentation does not guarantee an order.
+
+
+## Text vs URL-safe text
+
+Some characters have meaning inside a URL. `&` separates parameters, `=` separates a name from its value, `?` starts the query, `#` starts a fragment, and a space is not allowed at all. A value containing any of them must be **percent-encoded**:
+
+```csharp
+Console.WriteLine(Uri.EscapeDataString("Cables & Adapters"));   // Cables%20%26%20Adapters
+Console.WriteLine(Uri.EscapeDataString("a=b?c#d"));             // a%3Db%3Fc%23d
+Console.WriteLine(Uri.EscapeDataString("S-42"));                // S-42
+```
+
+Letters, digits, and `-`, `_`, `.`, `~` pass through unchanged. Everything else becomes `%` plus a hex code.
+
+Without escaping, a category of `Cables & Adapters` produces this URL:
+
+```text
+/api/products?category=Cables & Adapters
+```
+
+A server reads that as `category=Cables ` followed by a separate, nameless parameter ` Adapters`. The request is wrong, and no exception says so.
+
+
+## Local vs invariant: culture-dependent formatting
+
+`ToString()` on numbers and dates follows the **current culture** of the thread:
+
+```csharp
+using System.Globalization;
+
+decimal price = 19.99m;
+var date = new DateOnly(2026, 9, 1);
+
+CultureInfo.CurrentCulture = new CultureInfo("en-US");
+Console.WriteLine($"{price} | {date}");     // 19.99 | 9/1/2026
+
+CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+Console.WriteLine($"{price} | {date}");     // 19,99 | 01.09.2026
+```
+
+The same code produces different URLs depending on the machine or server region. An API expecting `19.99` receives `19,99`. The fix is to format with `CultureInfo.InvariantCulture` and explicit date formats:
+
+```csharp
+Console.WriteLine(price.ToString(CultureInfo.InvariantCulture));                 // 19.99
+Console.WriteLine(date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));    // 2026-09-01
+```
+
+Booleans have their own quirk. `true.ToString()` returns `True` with a capital T, while most HTTP APIs expect lowercase `true`.
+
+
+## End to end: the original pattern
+
+A realistic naive version. The helper returns a tuple, the builder uses the nested conditional, and nothing escapes or controls culture. The second half of the program exposes each hidden bug.
+
+```csharp
+using System.Globalization;
+using System.Text;
+
+CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;   // make the first half deterministic
+
+var urls = new UrlBuilder();
+
+// ---- normal use ----
+Console.WriteLine(urls.Build(Endpoints.Users, null));
+Console.WriteLine(urls.Build(Endpoints.Users, new UserQuery { Page = 2, Size = 10 }));
+Console.WriteLine(urls.Build(Endpoints.Users, new { Page = 3, Sort = "name" }));
+Console.WriteLine(urls.Build(Endpoints.Products, new ProductQuery { Category = "cables", MaxPrice = 19.99m, InStock = true }));
+
+try
+{
+    urls.Build(Endpoints.Reports, null);
+}
+catch (ArgumentException ex)
+{
+    Console.WriteLine($"Error: {ex.Message}");
+}
+
+// ---- hidden bugs ----
+Console.WriteLine();
+Console.WriteLine("1. " + urls.Build(Endpoints.Reports, new { }));
+Console.WriteLine("2. " + urls.Build(Endpoints.Products, new ProductQuery { Category = "Cables & Adapters" }));
+Console.WriteLine("3. " + urls.Build(Endpoints.Products, new ProductQuery { Tags = ["usb-c", "braided"] }));
+
+CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+Console.WriteLine("4. " + urls.Build(Endpoints.Products, new ProductQuery { MaxPrice = 19.99m }));
+Console.WriteLine("5. " + urls.Build(Endpoints.Reports, new ReportQuery { StoreId = "S-42", From = new DateOnly(2026, 9, 1) }));
+
+// ======================= types =======================
+
+public enum Endpoints { Users, Products, Reports }
+
+public class UserQuery
+{
+    public int Page { get; set; }
+    public int Size { get; set; }
+}
+
+public class ProductQuery
+{
+    public string? Category { get; set; }
+    public decimal? MaxPrice { get; set; }
+    public bool? InStock { get; set; }
+    public string[]? Tags { get; set; }
+}
+
+public class ReportQuery
+{
+    public string StoreId { get; set; } = "";
+    public DateOnly From { get; set; }
+}
+
+public sealed class UrlBuilder
+{
+    private static readonly HashSet<Endpoints> RequiresQuery = [Endpoints.Reports];
+
+    private readonly Dictionary<Endpoints, string> _baseUrls = new()
+    {
+        { Endpoints.Users,    "/api/users"    },
+        { Endpoints.Products, "/api/products" },
+        { Endpoints.Reports,  "/api/reports"  }
+    };
+
+    public string Build(Endpoints key, object? queryModel)
+    {
+        var builder = new StringBuilder(_baseUrls[key]);
+        bool anyQueryParameters = queryModel != null;
+
+        return RequiresQuery.Contains(key) && !anyQueryParameters
+            ? throw new ArgumentException("Provided parameter must have value for performing a query-like request", nameof(queryModel))
+            : anyQueryParameters
+                ? builder.Append(ToQueryString(queryModel!).queryStringData).ToString()
+                : builder.ToString();
+    }
+
+    private static (string queryStringData, int parameterCount) ToQueryString(object model)
+    {
+        var builder = new StringBuilder();
+        int count = 0;
+
+        foreach (var property in model.GetType().GetProperties())
+        {
+            object? value = property.GetValue(model);
+            if (value is null) continue;
+
+            builder.Append(count == 0 ? '?' : '&')
+                   .Append(char.ToLowerInvariant(property.Name[0]))
+                   .Append(property.Name[1..])
+                   .Append('=')
+                   .Append(value);
+
+            count++;
+        }
+
+        return (builder.ToString(), count);
+    }
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users?page=2&size=10
+/api/users?page=3&sort=name
+/api/products?category=cables&maxPrice=19.99&inStock=True
+Error: Provided parameter must have value for performing a query-like request (Parameter 'queryModel')
+
+1. /api/reports
+2. /api/products?category=Cables & Adapters
+3. /api/products?tags=System.String[]
+4. /api/products?maxPrice=19,99
+5. /api/reports?storeId=S-42&from=01.09.2026
+```
+
+The first five lines look correct, apart from `inStock=True`. The numbered lines are the bugs:
+
+1. **An empty object passes the rule.** `anyQueryParameters` only checks for `null`. An object with no properties counts as "has parameters", produces no query string, and `Reports` is called with no query at all. Ironically, `ToQueryString` already returns `parameterCount`, the exact value needed to catch this, and the caller throws it away.
+2. **No escaping.** The space and `&` break the URL silently.
+3. **Collections are printed, not expanded.** `Append(object)` calls `ToString()` on the array, which returns its type name.
+4. **Culture leaks into numbers.** The same code on a German-locale server sends `19,99`.
+5. **Culture leaks into dates.** `01.09.2026` is unlikely to parse on the server.
+
+None of these throw. Each one produces a plausible-looking URL that is wrong.
+
+
+## Why the original is weak
+
+Beyond the five bugs, the structure itself makes them hard to see:
+
+- **Four decisions in one statement.** Validation, branching, building, and formatting are compressed into a single `return`. Adding a fifth case means nesting deeper.
+- **The check tests the input, not the result.** "Was an object passed" is a weaker question than "did the object produce any parameters".
+- **Unused tuple element.** `parameterCount` is computed on every call and never read.
+- **Uncached reflection.** Property metadata is looked up on every call.
+- **`StringBuilder` for a single join.** The builder in `Build` performs one append; the real assembly work is in the helper.
+
+
+## Nested vs flat: guard clauses
+
+A **guard clause** checks one condition at the top of a method and exits immediately, with a `return` or a `throw`. Each rule gets its own line, and the "normal path" runs unindented at the bottom:
+
+```csharp
+public string Build(Endpoints endpoint, object? query = null)
+{
+    string baseUrl = ...;                                  // step 1: find the base URL, or fail
+    string queryString = ...;                              // step 2: build the query, possibly empty
+
+    if (queryString.Length == 0 && requiresQuery)          // step 3: one rule, one line
+        throw new ArgumentException(...);
+
+    return baseUrl + queryString;                          // step 4: the normal path
+}
+```
+
+The conditional operator is still welcome where it is flat and short, such as `query is null ? "" : QueryString.From(query)`. The problem was never the operator, only the nesting.
+
+
+## End to end: the better version
+
+The query-string helper now escapes names and values, formats with the invariant culture, lowercases booleans, expands collections into repeated keys, skips indexers, and caches reflection metadata. The builder checks the **result**, not the input.
+
+```csharp
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
+using System.Globalization;
+using System.Reflection;
+using System.Text.Json;
+
+CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+
+var urls = new UrlBuilder(
+    baseUrls: new Dictionary<Endpoints, string>
+    {
+        { Endpoints.Users,    "/api/users"    },
+        { Endpoints.Products, "/api/products" },
+        { Endpoints.Reports,  "/api/reports"  }
+    },
+    requiresQuery: [Endpoints.Reports]);
+
+// ---- normal use ----
+Console.WriteLine(urls.Build(Endpoints.Users));
+Console.WriteLine(urls.Build(Endpoints.Users, new UserQuery { Page = 2, Size = 10 }));
+Console.WriteLine(urls.Build(Endpoints.Users, new { Page = 3, Sort = "name" }));
+Console.WriteLine(urls.Build(Endpoints.Products, new ProductQuery { Category = "cables", MaxPrice = 19.99m, InStock = true }));
+
+TryBuild(Endpoints.Reports, null);
+
+// ---- the same five cases that were bugs ----
+Console.WriteLine();
+TryBuild(Endpoints.Reports, new { }, "1. ");
+Console.WriteLine("2. " + urls.Build(Endpoints.Products, new ProductQuery { Category = "Cables & Adapters" }));
+Console.WriteLine("3. " + urls.Build(Endpoints.Products, new ProductQuery { Tags = ["usb-c", "braided"] }));
+
+CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+Console.WriteLine("4. " + urls.Build(Endpoints.Products, new ProductQuery { MaxPrice = 19.99m }));
+Console.WriteLine("5. " + urls.Build(Endpoints.Reports, new ReportQuery { StoreId = "S-42", From = new DateOnly(2026, 9, 1) }));
+
+void TryBuild(Endpoints endpoint, object? query, string prefix = "")
+{
+    try
+    {
+        Console.WriteLine(prefix + urls.Build(endpoint, query));
+    }
+    catch (ArgumentException ex)
+    {
+        Console.WriteLine($"{prefix}Error: {ex.Message}");
+    }
+}
+
+// ======================= types =======================
+
+public enum Endpoints { Users, Products, Reports }
+
+public class UserQuery
+{
+    public int Page { get; set; }
+    public int Size { get; set; }
+}
+
+public class ProductQuery
+{
+    public string? Category { get; set; }
+    public decimal? MaxPrice { get; set; }
+    public bool? InStock { get; set; }
+    public string[]? Tags { get; set; }
+}
+
+public class ReportQuery
+{
+    public string StoreId { get; set; } = "";
+    public DateOnly From { get; set; }
+}
+
+public sealed class UrlBuilder
+{
+    private readonly FrozenDictionary<Endpoints, string> _baseUrls;
+    private readonly FrozenSet<Endpoints> _requiresQuery;
+
+    public UrlBuilder(IReadOnlyDictionary<Endpoints, string> baseUrls, IEnumerable<Endpoints> requiresQuery)
+    {
+        _baseUrls      = baseUrls.ToFrozenDictionary();
+        _requiresQuery = requiresQuery.ToFrozenSet();
+    }
+
+    public string Build(Endpoints endpoint, object? query = null)
+    {
+        if (!_baseUrls.TryGetValue(endpoint, out var baseUrl))
+            throw new InvalidOperationException($"No base URL registered for '{endpoint}'.");
+
+        string queryString = query is null ? "" : QueryString.From(query);
+
+        if (queryString.Length == 0 && _requiresQuery.Contains(endpoint))
+            throw new ArgumentException($"'{endpoint}' requires at least one query parameter.", nameof(query));
+
+        return baseUrl + queryString;
+    }
+}
+
+public static class QueryString
+{
+    private static readonly ConcurrentDictionary<Type, PropertyInfo[]> PropertyCache = new();
+
+    public static string From(object model)
+    {
+        var pairs = new List<string>();
+
+        foreach (var property in ReadableProperties(model.GetType()))
+        {
+            object? value = property.GetValue(model);
+            if (value is null) continue;
+
+            string name = Uri.EscapeDataString(JsonNamingPolicy.CamelCase.ConvertName(property.Name));
+
+            if (value is IEnumerable items && value is not string)
+            {
+                foreach (var item in items)
+                {
+                    if (item is not null)
+                        pairs.Add($"{name}={Uri.EscapeDataString(Format(item))}");
+                }
+                continue;
+            }
+
+            pairs.Add($"{name}={Uri.EscapeDataString(Format(value))}");
+        }
+
+        return pairs.Count == 0 ? "" : "?" + string.Join("&", pairs);
+    }
+
+    private static PropertyInfo[] ReadableProperties(Type type) =>
+        PropertyCache.GetOrAdd(type, static t => t
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.CanRead && p.GetIndexParameters().Length == 0)
+            .ToArray());
+
+    private static string Format(object value) => value switch
+    {
+        bool b         => b ? "true" : "false",
+        DateOnly d     => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        DateTime dt    => dt.ToString("yyyy-MM-dd'T'HH:mm:ss", CultureInfo.InvariantCulture),
+        Enum e         => e.ToString(),
+        IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
+        _              => value.ToString() ?? ""
+    };
+}
+```
+
+Output:
+
+```text
+/api/users
+/api/users?page=2&size=10
+/api/users?page=3&sort=name
+/api/products?category=cables&maxPrice=19.99&inStock=true
+Error: 'Reports' requires at least one query parameter. (Parameter 'query')
+
+1. Error: 'Reports' requires at least one query parameter. (Parameter 'query')
+2. /api/products?category=Cables%20%26%20Adapters
+3. /api/products?tags=usb-c&tags=braided
+4. /api/products?maxPrice=19.99
+5. /api/reports?storeId=S-42&from=2026-09-01
+```
+
+Every numbered case is fixed, and the German culture at the end no longer changes anything.
+
+How each fix works:
+
+| Bug | Fix |
+|---|---|
+| Empty object passed the rule | The rule checks `queryString.Length`, the result, not whether an object was passed |
+| No escaping | `Uri.EscapeDataString` on every name and value |
+| Arrays printed as type names | `IEnumerable` values (except `string`) expand into repeated keys |
+| Culture in numbers | `IFormattable` values format with `CultureInfo.InvariantCulture` |
+| Culture in dates | Explicit `yyyy-MM-dd` format |
+| `True` instead of `true` | Booleans handled explicitly |
+| Reflection on every call | `PropertyInfo[]` cached per type in a `ConcurrentDictionary` |
+
+Three smaller techniques in the helper are worth naming:
+
+- **`string.Join("&", pairs)`** replaces the "question mark first, ampersand after" counter. Collect the pairs, join them once, prefix one `?`.
+- **`JsonNamingPolicy.CamelCase.ConvertName`** turns `MaxPrice` into `maxPrice` using the same rules as the JSON serializer, so query names and JSON names stay consistent.
+- **The `switch` expression** in `Format` picks a formatting rule by the value's runtime type. Order matters: `Enum` and `DateOnly` are also `IFormattable`, so they are listed before the general `IFormattable` case. The first matching arm wins.
+
+> `string` is checked separately from `IEnumerable` because a string is itself a sequence of characters. Without `value is not string`, `"cables"` would expand into `category=c&category=a&...`.
+
+
+## Original vs better
+
+| Question | Original | Better |
+|---|---|---|
+| Readability of the decision | One nested conditional | Guard clauses, one rule per line |
+| What the "requires query" rule checks | Was an object passed | Did the object produce parameters |
+| Return type of the helper | Tuple with an unused element | Plain string, empty when no parameters |
+| Special characters | Break the URL silently | Percent-encoded |
+| Collections | Printed as a type name | Repeated keys |
+| Numbers and dates | Depend on server culture | Invariant, explicit formats |
+| Booleans | `True` | `true` |
+| Reflection cost | Every call | Once per type |
+
+The rules to carry forward:
+
+> A conditional operator is fine when it is flat. When one is nested, rewrite it as guard clauses: one condition, one exit, per line.
+
+> Validate the **output** of a transformation, not just the presence of its input.
+
+> Any value written into a URL needs two treatments: invariant formatting, then escaping.
+
+
+## Checkpoint
+
+1. Add parentheses to `a ? b : c ? d : e` to show how the compiler groups it.
+2. Why can one branch of a conditional be `throw new ArgumentException(...)` while the other is a `string`?
+3. What does `nameof(queryModel)` produce, and what advantage does it have over the literal `"queryModel"`?
+4. A method returns `(string text, int count)`. Write one line that keeps only `count` in a variable.
+5. In the original version, why did `urls.Build(Endpoints.Reports, new { })` succeed?
+6. Why does `QueryString.From` check `value is not string` before treating a value as a collection?
+7. What would `Uri.EscapeDataString("50% off")` produce, and why is the percent sign itself encoded?
+
+
+## Next
+
+The URL is now correct. The last step is to send it, receive JSON back, and turn that JSON into typed C# objects, all through **one** method that works for every endpoint and every response shape. That method is generic, with a signature like `GET<TRequestModel, TResponseModel>` and `where` constraints under it. The next article builds generics from zero, explains why the compiler cannot infer the response type, and finishes with a complete typed HTTP client that runs without a network connection.

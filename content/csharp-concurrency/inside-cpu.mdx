@@ -1,0 +1,90 @@
+---
+title: "Inside the CPU: the control unit, the ALU, and the registers"
+date: 2026-09-10
+status: written
+minutes: 12
+order: 2
+lead: 'Part 1 treated the CPU as one box that executes instructions. This part opens it: the control unit that fetches and directs, the ALU that calculates, and the registers — the CPU''s handful of tiny internal slots, including the program counter, the instruction register, and the stack and base pointers that later parts depend on.'
+---
+
+Part 1 left the CPU as a single "it executes instructions" box. That box has an inside, and the pieces inside it are named in almost every later idea — the program counter, the stack pointer, registers. This part opens the CPU and names them, so nothing above ever has to treat them as magic.
+
+## The two working parts: control unit and ALU
+
+The part of the CPU that does the actual processing splits into two:
+
+```text
+CPU processing unit
++-- Control Unit (CU)   directs: fetches instructions, decodes them, tells the rest what to do
++-- ALU                 calculates: arithmetic (+ - * /) and logic (and, or, not, compare)
+```
+
+- The **control unit (CU)** is the coordinator. It fetches the next instruction from memory, decodes what it means, and then directs the other parts to carry it out. It does no arithmetic itself — it *organises*.
+- The **ALU** (arithmetic logic unit) is the calculator. It performs the actual operations: adding, subtracting, multiplying, comparing two values, logical and/or/not. It acts only when the control unit tells it to, on values the control unit hands it.
+
+So the division of labour is: the control unit *decides and directs*, the ALU *computes*. Everything the CPU does is those two working together, one instruction at a time.
+
+## Registers: the CPU's tiny instant scratchpad
+
+The control unit and ALU need somewhere to hold the values they are working on *right now* — and that place is not RAM. Reaching into RAM, even though it is fast, is slow compared with the CPU itself. So the CPU has a small set of internal slots called **registers**: extremely fast, extremely few, each holding one value of the machine's width (Part 1 — 64 bits on a 64-bit machine).
+
+```text
+RAM        huge, relatively slow, lives outside the CPU
+registers  tiny (a few dozen), instant, live inside the CPU
+```
+
+Registers are the CPU's working hands. To add two numbers, the values are loaded from RAM into registers, the ALU adds them, and the result goes into a register — then perhaps back out to RAM. The CPU is always operating on values *in registers*; RAM is where values rest between operations.
+
+There are only a handful, which is why they are precious. The ones that matter for this path fall into two groups: the special-purpose registers that steer execution, and the general-purpose registers that hold working values.
+
+## The registers that steer execution
+
+A few registers do not hold ordinary data — they track *where the CPU is* and *what it is doing*. These are the ones later parts lean on hardest.
+
+**The program counter (PC).** Holds the **address** (Part 1 — a number naming a cell in RAM) of the **next instruction** to run. This single register is how the CPU knows where it is in a program. After each instruction, the program counter advances to the next; a jump or a method call works by *changing* the program counter. When later parts say "the OS switches which code runs," what is really being changed is this register's value.
+
+**The instruction register (IR).** Holds the **current instruction** — the one just fetched from the address the program counter pointed at, now sitting in the CPU to be decoded and carried out. The program counter says *where*; the instruction register holds *what*.
+
+**The stack pointer (SP)** and **the base pointer (BP).** Two registers that track the current function's slice of memory — its stack frame. The **stack pointer** marks the current top (the most recent end) of the stack; the **base pointer** marks a fixed reference point within the current frame, used to locate that function's parameters and local variables by offset. These two do very little until the call stack appears (Part 7), but they are named now because they are registers, and Part 7 will use them heavily. For now: two pointers that between them frame "the function running right now."
+
+## The registers that hold working values
+
+The rest are the **general-purpose registers** — the scratch slots the ALU actually computes with. On the classic x86 family they have historical names, and it is worth seeing them once because they appear in low-level notes and disassembly:
+
+```text
+Accumulator   often holds an operand and the result of arithmetic
+Base          a general working register
+Counter       often used to count loop iterations
+Data          a general working register, often paired with the accumulator
+```
+
+Their exact names matter far less than the idea: these are interchangeable holders for the values an instruction operates on. "Add the number in this register to the number in that register, put the result in a third" is the shape of most work.
+
+> **A note on the historical names and widths.** These registers grew with the machine's bit width, which is why one physical register has several names for its different sizes — the accumulator is `AL` as 8 bits, `AX` as 16, `EAX` as 32, and `RAX` as 64, all the same slot seen at different widths. That naming is x86 history, not something to memorise; the point that carries forward is only that general-purpose registers are the CPU's working scratch space, sized to the machine's width from Part 1.
+
+## Putting the pieces together
+
+The whole CPU, at the level this path needs, is now visible:
+
+```text
+Control Unit  -- directs -->  ALU (calculates)
+     |                             |
+     |  both work through the registers below
+     v                             v
+  Program Counter       -> address of the next instruction
+  Instruction Register  -> the current instruction
+  Stack / Base Pointer  -> the current function's frame
+  General-purpose regs  -> the working values instructions compute with
+```
+
+The control unit reads what the program counter points to, loads it into the instruction register, decodes it, and drives the ALU and registers to carry it out — then the program counter moves on. That loop is the subject of the next part.
+
+Nothing here is C#-specific yet, and that is intentional: these registers are the same whether the machine is running C#, Go, or anything else. When the .NET runtime eventually turns C# into machine instructions (Part 4), *these* are the registers those instructions drive.
+
+## The one idea to hold onto
+
+> Inside the CPU, the **control unit** fetches and decodes instructions and directs everything; the **ALU** does the actual arithmetic and logic. Both work on values held in **registers** — the CPU's few, instant internal slots. Some registers steer execution: the **program counter** holds the address of the next instruction, the **instruction register** holds the current one, and the **stack** and **base pointers** frame the running function. The rest are **general-purpose** scratch holders for the values instructions compute with.
+
+## What comes next
+
+The pieces are all named; **Part 3** sets them in motion — the **fetch-decode-execute cycle**. It follows one instruction from start to finish: the control unit fetches the instruction the program counter points at, loads it into the instruction register, decodes it, directs the ALU using the general-purpose registers, stores the result, and advances the program counter. That single loop, repeated billions of times a second, is the whole of what a CPU does.

@@ -48,9 +48,9 @@ export const topics: Topic[] = [
     chip: { bg: "#e2e9f7", fg: "#14479e" },
   },
   {
-    id: "sql",
-    name: "SQL",
-    blurb: "Indexes, plans, isolation and multi-tenant data.",
+    id: "database",
+    name: "Database",
+    blurb: "Database in depth with Entity Framework Core and SQL Server.",
     order: 4,
     chip: { bg: "#f7ecdb", fg: "#8a5400" },
   },
@@ -98,6 +98,13 @@ export const topics: Topic[] = [
     blurb: "Iteration from first principles — foreach, yield, LINQ, laziness.",
     order: 1.6,
     chip: { bg: "#fae9ec", fg: "#9b1c3d" },
+  },
+  {
+    id: "csharp-concurrency",
+    name: "Concurrency in C#",
+    blurb: "Threads, tasks, async and locks — and what actually runs at the same time.",
+    order: 1.3,
+    chip: { bg: "#ebeedd", fg: "#4f5a17" },
   },
   {
     id: "design-patterns",

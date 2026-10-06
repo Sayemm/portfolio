@@ -40,6 +40,11 @@
 
   --font-sans: var(--font-archivo), system-ui, sans-serif;
   --font-mono: var(--font-plex-mono), ui-monospace, monospace;
+  /* ASCII diagrams only. Plex Mono ships no box-drawing glyphs, so ─ │ ┌ ▼
+     fall back to a face with a different cell width and the art never aligns.
+     These faces all carry U+2500–257F at the same advance as their letters. */
+  --font-diagram: ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "DejaVu Sans Mono", monospace;
 
   --radius-none: 0px;
   --radius-xs: 0px;

@@ -1,0 +1,457 @@
+---
+title: "Normalization: giving every fact exactly one home"
+date: 2026-09-30
+status: written
+minutes: 28
+order: 3
+lead: "A table that stores the same store name four times will eventually store four different store names. Three anomalies, three normal forms, and the four cases where breaking the rules is the right call."
+---
+
+## The main question
+
+Article 2 produced a table that can identify its own rows. It still cannot stop the same fact being recorded in five places and slowly drifting apart.
+
+Here is a table shaped the way real tables often are — usually because they began life as a report, and nobody went back:
+
+```sql
+CREATE TABLE dbo.ShiftLog
+(
+    ShiftId        INT          NOT NULL PRIMARY KEY,
+    ShiftDate      DATE         NOT NULL,
+    StartTime      TIME         NOT NULL,
+    EndTime        TIME         NOT NULL,
+
+    EmployeeId     INT          NOT NULL,
+    EmployeeName   VARCHAR(100) NOT NULL,
+    EmployeeSkills VARCHAR(200) NOT NULL,   -- comma-separated
+
+    StoreId        INT          NOT NULL,
+    StoreName      VARCHAR(100) NOT NULL,
+    StoreCity      VARCHAR(50)  NOT NULL,
+    StoreManager   VARCHAR(100) NOT NULL
+);
+
+INSERT dbo.ShiftLog VALUES
+ (1,'2026-10-05','08:00','16:00', 1,'Mofakh Rahman','Barista,Till',   10,'Regina Downtown','Regina','Dana Okoye'),
+ (2,'2026-10-05','16:00','23:00', 3,'Priya Sandhu', 'Till,Keyholder', 10,'Regina Downtown','Regina','Dana Okoye'),
+ (3,'2026-10-06','08:00','16:00', 1,'Mofakh Rahman','Barista,Till',   10,'Regina Downtown','Regina','Dana Okoye'),
+ (4,'2026-10-06','09:00','17:00', 4,'Sam Whitecalf','Barista',        20,'Victoria Square','Regina','Lee Tran'),
+ (5,'2026-10-07','12:00','20:00', 3,'Priya Sandhu', 'Till,Keyholder', 20,'Victoria Square','Regina','Lee Tran'),
+ (6,'2026-10-07','08:00','14:00', 1,'Mofakh Rahman','Barista,Till',   10,'Regina Downtown','Regina','Dana Okoye');
+```
+
+Nothing here is syntactically wrong. It has a primary key. Every column has a sensible type. Queries against it work.
+
+Count how many times the string `'Regina Downtown'` is physically stored: four. `'Mofakh Rahman'` is stored three times, `'Dana Okoye'` four times. Each copy is an independent string as far as the engine is concerned, with no relationship to the others.
+
+That redundancy is not merely wasteful. It makes three ordinary operations — update, insert and delete — produce wrong results. Those three failures are called **anomalies**, and normalization exists to eliminate them.
+
+---
+
+## Part 1 — The update anomaly
+
+The store gets renamed. Somebody writes a statement that looks entirely reasonable:
+
+```sql
+UPDATE dbo.ShiftLog
+SET StoreName = 'Regina Central'
+WHERE StoreName = 'Regina Downtown' AND ShiftDate >= '2026-10-06';
+```
+
+```sql
+SELECT DISTINCT StoreId, StoreName FROM dbo.ShiftLog;
+```
+
+```text
+StoreId  StoreName
+-------  ---------------
+     10  Regina Central
+     10  Regina Downtown
+     20  Victoria Square
+```
+
+Store 10 now has two names.
+
+The database does not consider this an error, and could not. As far as the engine knows, `StoreName` is a column of independent strings that happen to coincide. There is no rule stating that all rows with `StoreId = 10` must agree. The data has become self-contradictory and nothing detected it.
+
+> **This is the anomaly that does real damage.** Insert and delete anomalies announce themselves — something fails, or something disappears. An update anomaly produces data that looks fine, queries without error, and is simply wrong. It is typically discovered months later by someone comparing two reports.
+
+---
+
+## Part 2 — The insert anomaly
+
+A new store opens next week. No shifts are scheduled there yet.
+
+```sql
+INSERT dbo.ShiftLog (StoreId, StoreName, StoreCity, StoreManager)
+VALUES (30, 'Harbour Landing', 'Regina', 'Nia Carr');
+```
+
+```text
+Cannot insert the value NULL into column 'ShiftId' ...
+```
+
+The error message is about `NULL`, which is a distraction. The real problem is structural: **a store cannot exist in this schema without a shift to hang it on.**
+
+The table claims to be about shifts. Facts about stores are squatting inside it. So a store only gets to exist as a side effect of someone working there, which is not how the world works. The same applies to a newly hired employee who has not yet been scheduled.
+
+The workaround people reach for — inserting a fake shift with a dummy date — is worse than the problem. It puts rows into the table that mean "this is not really a shift", and every query from then on has to know to exclude them.
+
+---
+
+## Part 3 — The delete anomaly
+
+Shift 4 gets cancelled.
+
+```sql
+DELETE FROM dbo.ShiftLog WHERE ShiftId = 4;
+
+SELECT DISTINCT EmployeeId, EmployeeName FROM dbo.ShiftLog;
+```
+
+```text
+EmployeeId  EmployeeName
+----------  -------------
+         1  Mofakh Rahman
+         3  Priya Sandhu
+```
+
+Sam Whitecalf has vanished from the database entirely.
+
+Shift 4 was the only row he appeared in, so deleting a shift deleted a person. The fact "Sam Whitecalf is an employee" had exactly one copy, and that copy was riding on a shift row.
+
+The three anomalies have one shared cause, and it is worth stating plainly:
+
+> A fact that lives in only one place can be lost when that place is removed. A fact that lives in many places can disagree with itself. Normalization gives every fact exactly one home — no more and no fewer.
+
+---
+
+## Part 4 — The comma-separated column
+
+`EmployeeSkills` holds values like `'Barista,Till'`. Querying it appears to work:
+
+```sql
+SELECT EmployeeName, EmployeeSkills
+FROM dbo.ShiftLog
+WHERE EmployeeSkills LIKE '%Till%';
+```
+
+Four problems, in increasing order of severity.
+
+**1. No item boundaries.** `LIKE '%Till%'` matches `'Tillage'` and `'Untilled'`. The usual patch is sentinel commas — `LIKE '%,Till,%'` with the string stored as `',Barista,Till,'` — which is a sign the design is wrong, not a fix.
+
+**2. Aggregation becomes parsing.** "How many staff hold each skill" should be a `GROUP BY`. Against a CSV column it requires splitting every string at query time with `STRING_SPLIT` or a user-defined function.
+
+**3. Renaming is a string operation.** Changing `'Till'` to `'Register'` everywhere means `REPLACE` across every row — which will also corrupt `'Tillage'` on the way past.
+
+**4. An index cannot help.** This is the important one.
+
+An index on `EmployeeSkills` stores whole strings in sorted order. A prefix search can seek, because all matching values form one contiguous range:
+
+```text
+sorted index on EmployeeSkills
+
+  'Barista'              LIKE 'Till%'   -> the matches are adjacent:
+  'Barista,Till'                           start at the first value >= 'Till',
+  'Keyholder'                              stop at the first value > 'Tillz'
+  'Till,Keyholder'    <--+                 a SEEK
+  'Till,Register'     <--+
+```
+
+A contains-search cannot, because matching values are scattered throughout the sorted order with non-matching values between them. There is no range to seek to, so the engine must examine every row.
+
+```text
+  LIKE 'Till%'    -> can SEEK   (a prefix defines a contiguous range)
+  LIKE '%Till%'   -> must SCAN  (matches are scattered everywhere)
+```
+
+A B-tree can only seek on a prefix — the same reason a phone book cannot find everyone whose surname *contains* "ill". This property is called **SARGability**, and it gets a full article later.
+
+That is the real content of **first normal form**. "Values must be atomic" is not an aesthetic preference. A non-atomic column is unindexable, unjoinable, and uncountable.
+
+---
+
+## Part 5 — Functional dependencies: the one idea underneath
+
+Normalization is usually taught as three rules to memorize. It is really one idea with three failure modes.
+
+The notation `A → B` reads "A determines B": knowing A tells you exactly one B. Writing out every dependency in `ShiftLog`:
+
+```text
+ShiftId     ->  ShiftDate, StartTime, EndTime, EmployeeId, StoreId
+EmployeeId  ->  EmployeeName, EmployeeSkills
+StoreId     ->  StoreName, StoreCity, StoreManager
+```
+
+**Three determinants, one table.** That mismatch is the entire problem. Facts about stores depend on `StoreId`, but they are stored in a table keyed by `ShiftId`, so they get repeated once per shift at that store.
+
+A table is correctly normalized when it has exactly one determinant, and that determinant is its primary key.
+
+The three normal forms are three ways this goes wrong:
+
+| Form | Violated when | In this schema |
+|---|---|---|
+| **1NF** | A column holds more than one value | `EmployeeSkills` CSV |
+| **2NF** | A column depends on *part* of a composite key | needs a composite key — see below |
+| **3NF** | A column depends on another *non-key* column | `StoreName` depends on `StoreId`, not `ShiftId` |
+
+`ShiftLog` has a single-column key, so 2NF cannot be violated there. This table does violate it:
+
+```sql
+CREATE TABLE dbo.ShiftAssignment
+(
+    ShiftId       INT          NOT NULL,
+    EmployeeId    INT          NOT NULL,
+    EmployeeName  VARCHAR(100) NOT NULL,   -- depends on EmployeeId alone
+    HoursWorked   DECIMAL(5,2) NOT NULL,   -- depends on both: correct
+    PRIMARY KEY (ShiftId, EmployeeId)
+);
+```
+
+`HoursWorked` genuinely requires both columns to be meaningful. `EmployeeName` requires only half the key — a **partial dependency**. That is what 2NF forbids.
+
+3NF forbids the **transitive** case: `ShiftId → StoreId → StoreName`. `StoreName` reaches the key only by travelling through another non-key column.
+
+One sentence covers all three, and it is worth memorizing exactly:
+
+> Every non-key column must depend on **the key, the whole key, and nothing but the key.**
+
+```text
+"the key"            -> 1NF: there is a key, and values are atomic
+"the whole key"      -> 2NF: no dependence on part of a composite key
+"nothing but the key"-> 3NF: no dependence on another non-key column
+```
+
+---
+
+## Part 6 — Decomposition
+
+Each determinant becomes its own table:
+
+```sql
+CREATE TABLE dbo.Stores
+(
+    StoreId    INT          NOT NULL PRIMARY KEY,
+    StoreName  VARCHAR(100) NOT NULL,
+    City       VARCHAR(50)  NOT NULL,
+    ManagerId  INT          NULL
+);
+
+CREATE TABLE dbo.Staff
+(
+    StaffId    INT          NOT NULL PRIMARY KEY,
+    FullName   VARCHAR(100) NOT NULL
+);
+
+CREATE TABLE dbo.Skills
+(
+    SkillId    INT          NOT NULL PRIMARY KEY,
+    SkillName  VARCHAR(50)  NOT NULL UNIQUE
+);
+
+CREATE TABLE dbo.StaffSkills
+(
+    StaffId  INT NOT NULL,
+    SkillId  INT NOT NULL,
+    PRIMARY KEY (StaffId, SkillId)
+);
+
+CREATE TABLE dbo.Shifts
+(
+    ShiftId    INT  NOT NULL PRIMARY KEY,
+    ShiftDate  DATE NOT NULL,
+    StartTime  TIME NOT NULL,
+    EndTime    TIME NOT NULL,
+    StaffId    INT  NOT NULL,
+    StoreId    INT  NOT NULL
+);
+```
+
+Three structural points in that schema.
+
+**`ManagerId` is an integer, not a name.** A manager is a member of staff, so the column points at `Staff`. The name is stored once, in one place.
+
+**`StaffSkills` is a table whose entire content is its own primary key.** That is how a many-to-many relationship is represented: one row per pairing, no columns beyond the two keys. This is exactly what the CSV column was failing to be.
+
+**Nothing is repeated.** `'Regina Downtown'` is stored once. Shifts reference store 10 with four bytes.
+
+### The anomalies, retested
+
+```sql
+-- UPDATE: one row changes, drift is impossible
+UPDATE dbo.Stores SET StoreName = 'Regina Central' WHERE StoreId = 10;
+
+-- INSERT: a store with no shifts
+INSERT dbo.Stores VALUES (30, 'Harbour Landing', 'Regina', NULL);
+
+-- DELETE: cancel a shift
+DELETE FROM dbo.Shifts WHERE ShiftId = 4;
+SELECT * FROM dbo.Staff WHERE StaffId = 4;
+```
+
+```text
+StaffId  FullName
+-------  -------------
+      4  Sam Whitecalf
+```
+
+Sam survives, because his existence is now recorded in a table about people rather than smuggled into a table about shifts.
+
+And the query that was impossible before becomes ordinary:
+
+```sql
+SELECT sk.SkillName, COUNT(*) AS staff_count
+FROM dbo.StaffSkills ss
+JOIN dbo.Skills sk ON sk.SkillId = ss.SkillId
+GROUP BY sk.SkillName
+ORDER BY staff_count DESC;
+```
+
+---
+
+## Part 7 — What it costs
+
+Nothing is free. The denormalized table answered "who worked where" with no joins at all. Now it takes four:
+
+```sql
+SELECT s.ShiftDate, s.StartTime, st.FullName, so.StoreName, m.FullName AS Manager
+FROM dbo.Shifts s
+JOIN      dbo.Staff  st ON st.StaffId = s.StaffId
+JOIN      dbo.Stores so ON so.StoreId = s.StoreId
+LEFT JOIN dbo.Staff  m  ON m.StaffId  = so.ManagerId
+ORDER BY s.ShiftDate, s.StartTime;
+```
+
+`dbo.Staff` appears twice under different aliases — a **self-join**, because a manager is just another member of staff. That is only expressible because the data was decomposed.
+
+The cost can be measured:
+
+```sql
+SET STATISTICS IO ON;
+```
+
+The Messages tab then reports one line per table touched: `Table 'Shifts'. Scan count 1, logical reads 1`. The denormalized query touches one table; the normalized one touches four and reads `Staff` twice.
+
+> **On six rows every number is 1 or 2, and the comparison proves nothing.** Performance claims measured on toy data are noise. The honest comparison is structural, and the real measurements come once there is enough data for the optimizer to make non-trivial choices.
+
+| | Denormalized | Normalized |
+|---|---|---|
+| Reads | One scan, no joins | Several seeks, joined |
+| Writes | Update N rows, risk drift | Update one row |
+| Correctness | Enforced by convention | Enforced by the engine |
+| Storage | Repeated strings | Repeated integers |
+
+The familiar summary "normalize for writes, denormalize for reads" is half right and mostly misleading. Normalized schemas are frequently **faster** to read, because narrower rows mean more rows per 8KB page, and a join to a small lookup table is a seek into a handful of permanently cached pages.
+
+Article 2 measured this directly: twelve extra bytes per row cost 8.6% more pages and 8.6% more I/O on every scan, forever. Storing `'Regina Downtown'` instead of `10` costs considerably more than twelve bytes.
+
+---
+
+## Part 8 — When denormalizing is correct
+
+Four legitimate cases. Everything outside them is usually laziness wearing a performance costume.
+
+**1. Point-in-time facts.** An invoice line must record the price *at the time of sale*:
+
+```sql
+UnitPriceAtSale DECIMAL(10,2) NOT NULL
+```
+
+Joining to `Products.Price` instead would silently rewrite history whenever prices changed. The test to apply:
+
+> If the source value changes, should the stored copy change too? If no, it was never a duplicate. It is an independent fact that merely resembles one.
+
+**2. Materialized aggregates.** `Stores.ShiftCount` is derivable, so storing it duplicates data. But if a dashboard recomputes it across 50 million rows on every page load, storing it is correct. The cost moves to keeping it accurate.
+
+**3. Immutable history.** Audit logs and event records should capture the world as it was. If an employee's name changes, last year's log of what they did should still show the old name.
+
+**4. Measured hot paths.** There is a plan, a profile, and a number showing the join is the bottleneck. Note the order: measure, then denormalize. Never the reverse.
+
+---
+
+## Part 9 — What is still missing
+
+The schema is now correctly decomposed. It is also still broken, in a new way:
+
+```sql
+INSERT dbo.Shifts VALUES (99, '2026-12-01', '08:00', '16:00', 999, 888);
+```
+
+Staff 999 does not exist. Store 888 does not exist. The insert succeeds anyway, producing an **orphan row** pointing at nothing.
+
+And in the other direction:
+
+```sql
+DELETE FROM dbo.Staff WHERE StaffId = 1;
+SELECT * FROM dbo.Shifts WHERE StaffId = 1;
+```
+
+Three shifts now reference a person who no longer exists.
+
+Normalization split the data into correct pieces. Nothing yet *connects* them. `Shifts.StaffId` is an ordinary integer column, and the engine has no idea it is supposed to mean something.
+
+---
+
+## Cheat sheet
+
+```text
+THE THREE ANOMALIES
+  update   same fact stored N times -> the copies disagree, silently
+  insert   a store cannot exist without a shift to hang it on
+  delete   removing the last shift removes the employee too
+
+  all three cause: a fact without exactly one home
+
+FUNCTIONAL DEPENDENCY
+  A -> B   "knowing A tells you exactly one B"
+  a table is normalized when it has ONE determinant, and that is its key
+
+THE THREE FORMS
+  1NF   atomic values        -> no CSV columns, no repeating groups
+  2NF   no partial deps      -> nothing depends on PART of a composite key
+  3NF   no transitive deps   -> nothing depends on another NON-key column
+
+  "the key, the whole key, and nothing but the key"
+
+WHY CSV COLUMNS FAIL
+  '%Till%' also matches 'Tillage'
+  counting requires parsing at query time
+  renaming is a string REPLACE
+  LIKE 'Till%'  -> can SEEK   (prefix = contiguous range)
+  LIKE '%Till%' -> must SCAN  (matches scattered through sorted order)
+
+MANY-TO-MANY
+  a junction table whose whole content is its own primary key
+  StaffSkills(StaffId, SkillId) PRIMARY KEY (StaffId, SkillId)
+
+DENORMALIZE ONLY FOR
+  point-in-time facts    (price at time of sale -- not a duplicate at all)
+  materialized aggregates (measured, and kept accurate)
+  immutable history      (audit logs record the world as it was)
+  measured hot paths     (measure FIRST, then denormalize)
+```
+
+---
+
+## Checkpoint
+
+1. Which of the three anomalies is the most dangerous in practice, and why?
+2. The insert anomaly produced an error about `NULL`. Why is that error message a distraction from the real problem?
+3. What single property do all three anomalies share?
+4. Why can an index not help `LIKE '%Till%'` when it can help `LIKE 'Till%'`?
+5. `ShiftLog` had three determinants. What does the number of determinants tell you about how many tables there should be?
+6. A table has `PRIMARY KEY (ShiftId, EmployeeId)` and columns `EmployeeName` and `HoursWorked`. Which one violates 2NF, and how do you tell?
+7. What makes a transitive dependency different from a partial one?
+8. `StaffSkills` has no columns beyond its own primary key. Why is a table like that useful rather than pointless?
+9. An invoice line stores `UnitPriceAtSale` rather than joining to `Products.Price`. Explain why this is not a normalization violation.
+10. After decomposition, a shift can still reference a store that does not exist. What does that say about what normalization does and does not provide?
+
+---
+
+## What comes next
+
+Two gaps remain before the schema can be trusted.
+
+The first is `Stores.ManagerId`, declared `NULL` because a new store may not have a manager yet. That one word opens up three-valued logic, where comparisons return true, false, or unknown, and where `WHERE ManagerId <> 5` silently omits every store without a manager. The next article is about `NULL` and the surprising number of ways it breaks ordinary-looking queries.
+
+After that comes the mechanism that closes the orphan gap: foreign keys, cascade rules, and what the engine does to enforce them.

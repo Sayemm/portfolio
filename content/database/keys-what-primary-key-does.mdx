@@ -1,0 +1,590 @@
+---
+title: "Relations, keys, and what a primary key physically does"
+date: 2026-09-30
+status: written
+minutes: 30
+order: 2
+lead: "A table with no key will happily store the same person twice. Declaring a key fixes that — and rebuilds the entire table, changes how deletes work, and decides how much disk every future index will consume."
+---
+
+## The main question
+
+Article 1 established what a database is physically: files, 8KB pages, records laid out byte by byte. None of it had any opinion about whether the data made sense.
+
+Here is what that costs.
+
+```sql
+CREATE TABLE dbo.Employees
+(
+    EmployeeId  INT          NOT NULL,
+    Email       VARCHAR(100) NOT NULL,
+    FirstName   VARCHAR(50)  NOT NULL,
+    LastName    VARCHAR(50)  NOT NULL,
+    HireDate    DATE         NOT NULL
+);
+
+INSERT dbo.Employees VALUES
+    (1, 'mofakh@shiftledger.dev', 'Mofakh', 'Rahman', '2026-05-25'),
+    (2, 'dana@shiftledger.dev',   'Dana',   'Okoye',  '2024-11-03'),
+    (3, 'priya@shiftledger.dev',  'Priya',  'Sandhu', '2023-02-17');
+
+-- the same employee id, a completely different person
+INSERT dbo.Employees VALUES (1, 'imposter@shiftledger.dev', 'Someone', 'Else', '2020-01-01');
+
+-- a byte-for-byte duplicate of an existing row
+INSERT dbo.Employees VALUES (2, 'dana@shiftledger.dev', 'Dana', 'Okoye', '2024-11-03');
+```
+
+Every statement succeeds. The table now holds five rows, two of which claim to be employee 1, and two of which are indistinguishable copies of employee 2.
+
+Now consider this perfectly ordinary statement:
+
+```sql
+UPDATE dbo.Employees SET Email = 'new@shiftledger.dev' WHERE EmployeeId = 1;
+```
+
+There is no correct answer to what it should do. "The employee with id 1" does not refer to anything, because two different people answer to that description. The table has lost the ability to identify its own rows.
+
+This article is about the thing that fixes it. Declaring a key turns out to be far more than a rule the engine checks: it rebuilds the table, changes what a delete physically does, and silently determines how much disk space every future index will consume.
+
+---
+
+## Part 1 — A table is not a relation
+
+The word "relational" comes from mathematics, where a **relation** is a *set* of tuples. Being a set carries two guarantees:
+
+```text
+1. No duplicates.  A set containing Dana twice is just a set containing Dana.
+2. No order.       There is no "first" element of a set.
+```
+
+SQL tables honour neither by default.
+
+The duplicate `Dana` row above violates the first. What the table actually holds is a **bag** — a multiset — not a set.
+
+The second is subtler and causes more damage in practice:
+
+```sql
+SELECT EmployeeId, FirstName FROM dbo.Employees;
+```
+
+The rows will probably come back in insertion order. That is not a promise. Article 1 showed a heap has no page chain and no ordering at all; the apparent order is an accident of where records happened to land.
+
+> **Without `ORDER BY`, a result set has no defined order.** Not "usually insertion order" — undefined. The engine is free to return rows in whatever sequence its chosen plan produces. Code that depends on accidental ordering passes every test, works for a year, and then breaks the day someone adds an index and the plan changes. This is one of the most common classes of production bug in database work.
+
+So a relational table is what a bag becomes once it is constrained back into a set. The constraint that does it is a key.
+
+---
+
+## Part 2 — Four words for keys
+
+They nest, from loosest to strictest:
+
+| Term | Definition |
+|---|---|
+| **Superkey** | Any set of columns whose combined values are unique across all rows |
+| **Candidate key** | A superkey with nothing unnecessary in it — remove any column and uniqueness breaks |
+| **Primary key** | The one candidate key chosen as the row's official identity |
+| **Alternate key** | Every other candidate key, enforced with `UNIQUE` |
+
+In this table there are two candidate keys: `EmployeeId` and `Email`. Each identifies a row on its own.
+
+`(EmployeeId, Email)` is a superkey — the pair is certainly unique — but it is **not** a candidate key, because `EmployeeId` alone already guarantees uniqueness, making `Email` dead weight. Minimality is what separates the two.
+
+Choosing between candidate keys is a design decision, not a technical one:
+
+| | Natural key (`Email`) | Surrogate key (`EmployeeId`) |
+|---|---|---|
+| Meaning | Carries real-world meaning | Meaningless by design |
+| Stability | People change email addresses | Never changes |
+| Width | 20–100 bytes | 4 bytes |
+| Foreign keys | Copy a long string everywhere | Copy 4 bytes everywhere |
+
+The width argument turns out to matter far more than it first appears — Part 7 measures exactly how much.
+
+---
+
+## Part 3 — Declaring the key rebuilds the table
+
+Clean up the duplicates, then declare both keys:
+
+```sql
+ALTER TABLE dbo.Employees
+    ADD CONSTRAINT PK_Employees PRIMARY KEY (EmployeeId);
+```
+
+The nonsense inserts now fail, which is the obvious part. The interesting part is what happened to the bytes.
+
+Before the `ALTER`, the rows lived on page 392. After it:
+
+```sql
+SELECT sys.fn_PhysLocFormatter(%%physloc%%) AS FilePageSlot, * FROM dbo.Employees;
+```
+
+```text
+FilePageSlot  EmployeeId  Email                   FirstName  LastName
+------------  ----------  ----------------------  ---------  --------
+(1:512:0)              1  mofakh@shiftledger.dev  Mofakh     Rahman
+(1:512:1)              2  dana@shiftledger.dev    Dana       Okoye
+(1:512:2)              3  priya@shiftledger.dev   Priya      Sandhu
+```
+
+A different page entirely. Adding a primary key did not annotate the existing structure — it **rebuilt the whole table**: new pages allocated, every row copied into them in key order, old pages released.
+
+On a 50-million-row table this is a long, fully logged operation needing roughly double the table's size in free space while it runs. It is not a metadata change, and it is not something to run casually on a live system.
+
+---
+
+## The clustered index *is* the table
+
+```sql
+SELECT i.name, i.type_desc, i.index_id, p.rows, au.total_pages
+FROM sys.indexes i
+JOIN sys.partitions p        ON p.object_id = i.object_id AND p.index_id = i.index_id
+JOIN sys.allocation_units au ON au.container_id = p.partition_id
+WHERE i.object_id = OBJECT_ID('dbo.Employees');
+```
+
+```text
+name          type_desc  index_id  rows  total_pages
+------------  ---------  --------  ----  -----------
+PK_Employees  CLUSTERED         1     3            9
+```
+
+That `index_id` column carries the whole story:
+
+| `index_id` | Meaning |
+|---|---|
+| 0 | A heap — rows in an unordered pile |
+| 1 | A clustered index — the rows themselves, held in key order |
+| 2 or above | A nonclustered index — a separate structure that points at the rows |
+
+Before the `ALTER` this read 0. There is no `index_id = 0` entry any more, because the heap no longer exists.
+
+> **A clustered index is not something attached to a table. It is the table.** `PK_Employees` and `dbo.Employees` are the same bytes on the same pages. The leaf level of the clustered index holds the actual rows; there is no second copy anywhere. This is also why a table can have at most one clustered index — rows can only be physically arranged one way at a time.
+
+### 9 pages for 3 rows
+
+```sql
+SELECT allocated_page_page_id, page_type_desc, is_allocated, is_iam_page
+FROM sys.dm_db_database_page_allocations(
+        DB_ID('ShiftLedger'), OBJECT_ID('dbo.Employees'), NULL, NULL, 'DETAILED')
+ORDER BY allocated_page_page_id;
+```
+
+```text
+allocated_page_page_id  page_type_desc  is_allocated  is_iam_page
+----------------------  --------------  ------------  -----------
+                   477  IAM_PAGE                   1            1
+                   512  DATA_PAGE                  1            0
+                   513  NULL                       0            0
+                   514  NULL                       0            0
+                   ...  (515 through 519)          0            0
+```
+
+Three rows occupying about 160 bytes reserve nine pages:
+
+- **8 pages** form one **extent** — the allocation unit, 8 contiguous pages, 64KB. Small tables get a dedicated uniform extent immediately.
+- **1 page** is the **IAM** page (Index Allocation Map), the bookkeeping page recording which extents belong to this structure.
+
+Only page 512 is actually allocated. The other seven are reserved and empty, waiting.
+
+> **A field that lies.** The page header shows `m_indexId = 256`, which is not an index id at all — it is part of an internal allocation-unit identifier. `DBCC PAGE` decodes the real value separately on the same line as `Metadata: IndexId = 1`. Always read the `Metadata:` values and ignore `m_indexId`.
+
+---
+
+## Part 4 — The slot array is where the ordering lives
+
+A clustered index keeps rows in key order. The obvious assumption is that it does so by keeping them in order *physically*. It does not, and the proof is a single insert.
+
+Before inserting, the page header read `m_freeData = 257` — used space ended at byte 257. Now add a row whose key sorts before everything else:
+
+```sql
+INSERT dbo.Employees VALUES (0, 'zero@shiftledger.dev', 'Zero', 'Row', '2020-01-01');
+```
+
+```sql
+SELECT sys.fn_PhysLocFormatter(%%physloc%%) AS FilePageSlot, EmployeeId FROM dbo.Employees;
+```
+
+```text
+FilePageSlot  EmployeeId
+------------  ----------
+(1:512:0)              0
+(1:512:1)              1
+(1:512:2)              2
+(1:512:3)              3
+```
+
+The new row took **slot 0**, pushing everything else down a slot. Key order is respected. But the page dump shows where the bytes actually went:
+
+```text
+slot    offset         EmployeeId
+  0     0x101  (257)        0      <- inserted last, stored last
+  1     0x60   (96)         1
+  2     0x98   (152)        2
+  3     0xCB   (203)        3
+```
+
+Offset 257 is exactly where free space began. The three existing records are at 0x60, 0x98 and 0xCB — precisely where they sat before. **Not one byte of row data moved.** Only the slot array was rewritten.
+
+The header arithmetic confirms it twice:
+
+```text
+m_freeData:  257 -> 306     +49   = the new record's size, appended at the end
+m_freeCnt:  7929 -> 7878    -51   = 49 bytes of record + 2 bytes of new slot entry
+```
+
+```text
+PHYSICAL ORDER (bytes on the page)      LOGICAL ORDER (the slot array)
+
+  0x60   EmployeeId = 1                   slot 0 -> 0x101   (id 0)
+  0x98   EmployeeId = 2                   slot 1 -> 0x60    (id 1)
+  0xCB   EmployeeId = 3                   slot 2 -> 0x98    (id 2)
+  0x101  EmployeeId = 0                   slot 3 -> 0xCB    (id 3)
+```
+
+A scan walks the slot array in order and follows each pointer to wherever that record happens to sit. "Clustered" means ordered by slot array, never ordered by byte offset.
+
+The cost consequence is large and positive. Inserting into the middle of a clustered index costs: write the bytes into any free space, then shift entries in a tiny array. It does **not** cost moving kilobytes of records around. That holds right up until the page has no free bytes left — and what happens then is measured in Part 7.
+
+---
+
+## Part 5 — On a clustered index, a delete changes one byte
+
+Article 1 deleted a row from a heap and the record vanished, with its bytes immediately counted as free. The same statement against a clustered index behaves completely differently.
+
+```sql
+DELETE FROM dbo.Employees WHERE EmployeeId = 2;
+```
+
+The record is still there, with exactly one byte changed:
+
+```text
+before:  30 00 0b 00 02 00 00 00 ...
+after:   3c 00 0b 00 02 00 00 00 ...
+         ^^
+```
+
+Article 1 established that the record type lives in bits 1 to 3 of the status byte:
+
+```text
+0x30 = 0011 0000   ->  (0x30 >> 1) & 7 = 0   PRIMARY_RECORD
+0x3c = 0011 1100   ->  (0x3c >> 1) & 7 = 6   GHOST_DATA_RECORD
+```
+
+That is the entire physical delete. The email, the names, the date, the key hash, the record's offset and its length are all untouched. The row is not removed — it is **relabelled**.
+
+### Nothing at all was freed
+
+| | Heap (article 1) | Clustered index |
+|---|---|---|
+| `Record Type` | record removed entirely | `GHOST_DATA_RECORD` |
+| `m_slotCnt` | 3 → 3 (dead entry left behind) | 4 → **4** |
+| `m_freeCnt` | 7998 → 8027 (+29) | 7878 → **7878** |
+| `m_freeData` | 188 → 188 | 306 → **306** |
+| `m_ghostRecCnt` | 0 | **1** |
+
+The heap released its bytes immediately. The clustered index released none. The page is exactly as full after the delete as before it.
+
+One other field moved:
+
+```text
+before:  PFS (1:1) = 0x40 ALLOCATED 0_PCT_FULL
+after:   PFS (1:1) = 0x48 ALLOCATED 0_PCT_FULL
+```
+
+Bit `0x08` means **this page contains ghost records**. A background process called the ghost cleanup task wakes periodically and reclaims them, and this bit is how it finds them without scanning everything. The free-space map doubles as a work queue.
+
+The row is invisible to queries throughout:
+
+```sql
+SELECT COUNT(*) FROM dbo.Employees;   -- 3, not 4
+```
+
+Four slots, three rows. Every scan checks the record type and skips type 6. The space comes back later:
+
+```sql
+EXEC sp_clean_db_free_space @dbname = N'ShiftLedger';
+-- m_ghostRecCnt returns to 0 and m_freeCnt finally rises by 51
+```
+
+### Why bother
+
+Four reasons, and all four are things a heap has no need of:
+
+**Rollback.** Undoing the delete means flipping one byte back. The record, its key order position and its slot number are all still intact.
+
+**Locking.** The page dump shows a `KeyHashValue` on every record — a hash of the clustering key. This is how rows in a clustered index are locked. A heap locks rows by physical address instead. A key-based lock survives the row moving; a RID-based lock does not. A transaction holding a lock on `EmployeeId = 2` does not lose its grip merely because someone deleted the row.
+
+**Readers entitled to see it.** Under snapshot isolation, a query that began before the delete must still be able to return the row. If the bytes were gone, it could not.
+
+**Key-range integrity.** The ghost marks a position in the ordering. Removing it would collapse the gap between keys 1 and 3, and the locks that prevent phantom inserts into a range depend on those positions existing.
+
+Every one of these is a concurrency requirement, which is the real answer to "why does a delete not delete". A heap has no key order and no key-based locks, so it has nothing to preserve. All four get full treatment in the transactions articles.
+
+---
+
+## Part 6 — What a second key builds
+
+`Email` is the alternate key. Enforcing it creates a new structure:
+
+```sql
+ALTER TABLE dbo.Employees
+    ADD CONSTRAINT UQ_Employees_Email UNIQUE (Email);
+```
+
+```text
+name                type_desc     index_id
+------------------  ------------  --------
+PK_Employees        CLUSTERED            1
+UQ_Employees_Email  NONCLUSTERED         4
+
+allocated_page_page_id  page_type_desc  index_id
+----------------------  --------------  --------
+                   477  IAM_PAGE               1
+                   512  DATA_PAGE              1
+                   552  IAM_PAGE               4
+                   544  INDEX_PAGE             4
+```
+
+Two details before opening the page.
+
+**`index_id = 4`, not 2.** Only 0 and 1 have fixed meanings. Anything of 2 or above simply means "a nonclustered index"; the numbers are allocated as structures are created and dropped, and are not reused tidily. Never read meaning into the specific number.
+
+**`INDEX_PAGE`, not `DATA_PAGE`.** That one word is the structural distinction. The leaf of a clustered index is a *data* page because it holds the rows themselves. The leaf of a nonclustered index is an *index* page because it holds only key values plus a way to find the row.
+
+### What is actually in the leaf
+
+```sql
+DBCC PAGE('ShiftLedger', 1, 544, 3);
+```
+
+```text
+Row  Level  Email (key)             EmployeeId  Row Size
+---  -----  ----------------------  ----------  --------
+  0      0  mofakh@shiftledger.dev           1        34
+  1      0  priya@shiftledger.dev            3        33
+  2      0  zero@shiftledger.dev             0        32
+```
+
+`Email` and `EmployeeId`, and nothing else. **No RID. No `(1:512:n)` anywhere.**
+
+On a heap, an index entry stored the physical address, because that was the only way to find a row. But rows move constantly — the `ALTER TABLE` in Part 3 relocated this entire table from page 392 to page 512, and page splits relocate half a page at a time. Every stored RID in every index would have to be found and updated.
+
+A clustered table avoids this completely. Nonclustered indexes point at the **clustering key**, not at a location. Rows can be shuffled anywhere, split across pages, or relocated wholesale, and no nonclustered index needs touching, because `EmployeeId = 2` still finds the row wherever it now lives.
+
+The price is a second lookup. Finding an employee by email means seeking the email index to obtain the `EmployeeId`, then seeking the clustered index with that id to fetch the remaining columns. That second step is the **Key Lookup** operator, and it is the single most common reason a query is slower than expected.
+
+Three more observations from that small output:
+
+**Dana is absent** — three entries, not four. The ghost record was still present in the clustered index when this index was built, and the build skipped it. Ghosts are invisible to everything except the cleanup task.
+
+**A completely different ordering.** Sorted by email, the `EmployeeId` column reads 1, 3, 0 — scrambled relative to clustered order. This is what a nonclustered index *is*: a second physical arrangement of a subset of the same data.
+
+**A dramatic size difference.** 32 to 34 bytes per entry, against 49 to 56 in the clustered index, because the index carries no `FirstName`, `LastName` or `HireDate`. Far more entries fit per page, so a seek reads far fewer pages. That is the whole economic basis of indexing.
+
+> **A nuance worth filing away.** Because this index is `UNIQUE`, the clustering key sits in the leaf as a payload column. In a *non-unique* nonclustered index it is appended to the key itself, as a tiebreaker that makes every entry distinct. Same bytes, different role.
+
+### The hidden cost of the clustering key
+
+The clustering key is copied into **every entry of every nonclustered index**. That makes the width of the primary key a decision with consequences far beyond the table it sits on.
+
+A 4-byte `INT` costs 4 bytes per index entry. A 16-byte `UNIQUEIDENTIFIER` costs 16. On a table with six nonclustered indexes and ten million rows, the difference is roughly 700MB of pure overhead.
+
+---
+
+## Part 7 — Measuring the cost of the key
+
+Two tables, identical in every respect except the type of the primary key:
+
+```sql
+CREATE TABLE dbo.KeyTest_Int
+(
+    Id       INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    Payload  CHAR(200)         NOT NULL
+);
+
+CREATE TABLE dbo.KeyTest_Guid
+(
+    Id       UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+    Payload  CHAR(200)        NOT NULL
+);
+
+INSERT dbo.KeyTest_Int  (Payload) SELECT TOP 50000 'x' FROM sys.all_columns a CROSS JOIN sys.all_columns b;
+INSERT dbo.KeyTest_Guid (Payload) SELECT TOP 50000 'x' FROM sys.all_columns a CROSS JOIN sys.all_columns b;
+```
+
+```sql
+SELECT OBJECT_NAME(object_id) AS table_name, page_count,
+       avg_page_space_used_in_percent, avg_fragmentation_in_percent
+FROM sys.dm_db_index_physical_stats(DB_ID('ShiftLedger'), NULL, NULL, NULL, 'DETAILED')
+WHERE index_level = 0 AND OBJECT_NAME(object_id) LIKE 'KeyTest%';
+```
+
+```text
+table_name     page_count  avg_page_space_used  avg_fragmentation
+-------------  ----------  -------------------  -----------------
+KeyTest_Int          1316            99.959318           0.075988
+KeyTest_Guid         1429            97.240413           0.069979
+```
+
+Every one of those numbers can be derived from row width alone. Usable space on a page is 8192 − 96 = 8096 bytes, and each row costs its record size plus 2 bytes of slot array:
+
+```text
+KeyTest_Int
+  4 status + 4 int + 200 char + 3 null bitmap  = 211 bytes
+  211 + 2 slot entry                           = 213
+  8096 / 213 = 38.0                            -> 38 rows per page
+  50000 / 38 = 1315.8                          -> 1316 pages        matches
+  (38 x 211 + 76) / 8096                       = 99.97%             matches
+
+KeyTest_Guid
+  4 status + 16 guid + 200 char + 3 null bitmap = 223 bytes
+  223 + 2 slot entry                            = 225
+  8096 / 225 = 35.98                            -> 35 rows per page
+  50000 / 35 = 1428.6                           -> 1429 pages       matches
+  (35 x 223 + 70) / 8096                        = 97.3%             matches
+```
+
+The 97.24% is not wasted space — it is the 221-byte remainder after 35 rows, too small to hold a 36th. Both tables are packed perfectly.
+
+The cost is **113 extra pages, 8.6% more**, from twelve extra bytes per row. That is 8.6% more I/O on every scan and 8.6% more of the buffer pool consumed, permanently.
+
+### The experiment above is wrong
+
+Random GUIDs are supposed to fragment a table badly. Fragmentation came back at 0.07%. Something is off, and it is the measurement, not the result.
+
+`INSERT ... SELECT TOP 50000` is a bulk operation. Given a large enough row estimate, the optimizer inserts a **Sort** on the clustering key before the insert — so even random GUIDs arrive in sorted order and append sequentially. No splits, no fragmentation.
+
+Real applications insert one row per transaction. That is what has to be measured:
+
+```sql
+CREATE TABLE dbo.KeyTest_GuidLoop
+(
+    Id       UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
+    Payload  CHAR(200)        NOT NULL
+);
+
+SET NOCOUNT ON;
+DECLARE @i INT = 0;
+WHILE @i < 20000
+BEGIN
+    INSERT dbo.KeyTest_GuidLoop (Payload) VALUES ('x');
+    SET @i += 1;
+END
+```
+
+```text
+table_name         page_count  avg_page_space_used  avg_fragmentation
+-----------------  ----------  -------------------  -----------------
+KeyTest_GuidLoop          837            66.399123          99.163680
+```
+
+```text
+                       pages   rows/page   fill     fragmentation
+bulk-loaded GUID        1429      35.0     97.3%        0.07%
+one-at-a-time GUID       837      23.9     66.4%       99.16%
+```
+
+Same type, same row width, same engine. Only the insert pattern differs.
+
+> **The lesson about benchmarks is as valuable as the lesson about GUIDs.** The first measurement was clean, repeatable, and answered a question nobody asked. A benchmark that does not reproduce the real access pattern will confidently report nothing at all.
+
+### What a page split is
+
+A random GUID sorts into the middle of a page that is already full. The key order cannot be violated and there is no free space. So the engine:
+
+1. Allocates a brand-new page.
+2. Moves roughly half the records onto it.
+3. Fixes `m_prevPage` and `m_nextPage` on three pages.
+4. Updates the level above.
+5. Logs every bit of it.
+
+Two pages now sit around 50% full where one sat at 100%.
+
+**66.4% is the signature of continuous splitting.** Split pages start at 50% and refill toward 100%, so a table under sustained random insertion settles in the 65 to 75% band. 20,000 rows occupy 837 pages where 572 would do — every scan reads 46% more pages, forever.
+
+**99.16% fragmentation** means the page that is next in key order is almost never the page that is next on disk. Split pages get allocated wherever there is room, so the logical chain zigzags across the file and sequential read-ahead stops working.
+
+### What to do about it
+
+| Approach | Effect |
+|---|---|
+| `NEWSEQUENTIALID()` instead of `NEWID()` | Generates ascending values; inserts append instead of splitting |
+| A `FILLFACTOR` below 100 | Leaves deliberate free space on each page for future inserts |
+| GUID primary key, different clustering key | The primary key and the clustered index need not be the same column |
+
+The third is the common production answer. `PRIMARY KEY NONCLUSTERED` on the GUID, with the clustered index on something sequential, keeps globally unique identifiers while giving the physical structure an ascending key to append to.
+
+---
+
+## Cheat sheet
+
+```text
+RELATION vs TABLE
+  a relation is a SET: no duplicates, no order
+  a SQL table is a BAG until constrained by a key
+  without ORDER BY, result order is UNDEFINED -- never "probably insertion order"
+
+KEY VOCABULARY
+  superkey        any unique set of columns
+  candidate key   a superkey with nothing unnecessary in it
+  primary key     the candidate key chosen as official identity
+  alternate key   the others, enforced with UNIQUE
+
+index_id
+  0        heap
+  1        clustered index -- this IS the table, there is no second copy
+  2+       nonclustered index (the number carries no meaning)
+
+ADDING A PRIMARY KEY
+  rebuilds the entire table: new pages, rows copied in key order
+  not a metadata change -- needs ~2x the table size in free space
+
+ORDERING
+  lives in the SLOT ARRAY, not in byte offsets
+  a mid-key insert appends the bytes anywhere and rewrites a tiny array
+  cheap -- until the page is full, then it splits
+
+DELETE
+  heap               -> record removed, bytes freed immediately
+  clustered index    -> one byte flipped: 0x30 -> 0x3c, type 0 -> type 6
+                        nothing freed, PFS bit 0x08 flags the page
+                        ghosts exist for rollback, locking, snapshot
+                        readers and key-range locks
+
+NONCLUSTERED INDEX LEAF
+  holds: its own key + the CLUSTERING key   (never a physical address)
+  so rows can move freely without updating any index
+  the second hop to fetch other columns = Key Lookup
+  the clustering key is copied into EVERY entry of EVERY nc index
+
+KEY WIDTH AND SHAPE
+  INT vs GUID, same rows: 1316 vs 1429 pages  (+8.6%, forever)
+  bulk insert sorts first -> no fragmentation (and measures nothing)
+  row-by-row random GUID  -> 66% full, 99% fragmented
+  fixes: NEWSEQUENTIALID, FILLFACTOR, or cluster on a different column
+```
+
+---
+
+## Checkpoint
+
+1. A table has no primary key and contains two identical rows. Why can neither be updated individually?
+2. What exactly is the difference between a superkey and a candidate key?
+3. Why does `ALTER TABLE ... ADD PRIMARY KEY` need free space roughly equal to the table's size?
+4. A row is inserted whose key sorts before every existing row on a full-ish page. Explain why none of the existing records move.
+5. One byte changes when a row is deleted from a clustered index. Which byte, and what does the change mean?
+6. Give two reasons a ghost record cannot simply be removed at delete time.
+7. A nonclustered index leaf entry contains the index key and the clustering key, but no page number. What problem does that avoid, and what does it cost?
+8. Two tables hold 50,000 identical rows; one has an `INT` key and one a `UNIQUEIDENTIFIER`. Why does the second occupy more pages even when both are perfectly packed?
+9. Bulk-inserting random GUIDs produced almost no fragmentation, but inserting them one at a time produced 99%. What accounts for the difference?
+
+---
+
+## What comes next
+
+There is now a way to identify a row and a way to enforce that identity. There is still no way to express that a shift belongs to a store, or to prevent the same fact being recorded in two places and slowly drifting apart.
+
+The next article is about normalization: what repeating data actually costs, the anomalies it produces on insert, update and delete, how first through third normal form eliminate them, and when deliberately breaking those rules is the correct engineering decision.

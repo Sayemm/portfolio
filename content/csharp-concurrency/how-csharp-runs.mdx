@@ -1,0 +1,89 @@
+---
+title: "The CPU, memory, and storage: the three parts that run everything"
+date: 2026-09-10
+status: written
+minutes: 11
+order: 1
+lead: 'Before a single line of C# means anything, three pieces of hardware have to be clear: the CPU that executes, the RAM that holds what is running now, and the storage that keeps things when the power is off. This part builds those three, plus what a memory address and a bit width actually are — the ground everything else stands on.'
+---
+
+This is the bottom of the path. Async, threads, the stack — all of it eventually runs on three pieces of hardware, and confusion higher up almost always traces back to a fuzzy picture of these. So the start is deliberately physical: no C# yet, just the machine that C# will later run on.
+
+## Three parts, three jobs
+
+A computer, reduced to what matters here, is three things:
+
+```text
+CPU       executes instructions        (does the work)
+RAM       holds what is running now     (fast, forgotten when power is off)
+Storage   keeps things permanently      (slow, survives power off)
+```
+
+- The **CPU** (central processing unit) is the part that actually *does* things — it runs instructions, one tiny step at a time. It holds almost no data of its own.
+- **RAM** (random-access memory) is the working space. Whatever a program is doing *right now* — its code and its data — lives in RAM while it runs. RAM is fast, but it is **volatile**: cut the power and it is wiped.
+- **Storage** (a hard drive or SSD) is the long-term keep. Files, programs, and documents sit here whether the machine is on or off. Storage is **persistent**, but far slower than RAM.
+
+The relationship that matters most for everything later: **the CPU works on data in RAM, not in storage.** A program sitting in storage does nothing. To run, it must first be copied into RAM, where the CPU can reach it.
+
+## Why the split exists: speed versus permanence
+
+RAM and storage seem redundant until the trade they make is clear. RAM is fast but forgets; storage remembers but is slow. No single technology is both fast and permanent and cheap, so a computer uses both: storage to *keep* things, RAM to *work on* them.
+
+The speed gap is enormous — the CPU can do many millions of operations in the time a disk takes to fetch a chunk of data. That gap is not a minor detail; it is the entire reason later parts of this path care about "waiting on I/O." When the CPU asks storage for something, it is asking a far slower device, and that mismatch is where async eventually earns its place.
+
+## Memory is a long line of numbered cells
+
+RAM is not a vague "space." It is a long sequence of **cells**, each holding a small fixed amount of data, and each with its own **address** — a number identifying that cell. Picture it as a numbered strip:
+
+```text
+address:  0     1     2     3     4     5     6   ...
+         [   ] [   ] [   ] [   ] [   ] [   ] [   ]
+```
+
+An **address** is just the cell's position — cell 0, cell 1, cell 2. When something needs to be read or written, it is named by its address. This is what "random-access" means: any cell can be reached directly by its number, without walking through the ones before it. Addresses are the foundation for everything about memory later — the program counter that points at the next instruction, the stack pointer that tracks the current call, a reference that points at an object: all of them are, underneath, an address into this numbered line of cells.
+
+## Bits and bytes: what a cell holds
+
+The smallest unit of data is a **bit** — a single 0 or 1. Bits are grouped into **bytes** of 8 bits. A byte is the standard small chunk, and the usual size of one memory cell:
+
+```text
+one bit   = 0 or 1
+one byte  = 8 bits, e.g. 0 1 1 0 1 0 0 1
+```
+
+Eight bits give 256 possible patterns (0 to 255) — enough for a single character, a small number, or part of a larger value. Larger values simply span several bytes (several cells) in a row.
+
+## What "32-bit" and "64-bit" actually mean
+
+A machine described as "32-bit" or "64-bit" is described by **how many bits it handles at once** — the width of its registers (the CPU's internal slots, covered next part) and, closely tied to it, how large a memory address can be.
+
+The practical consequences of the width:
+
+- **How much can be processed in one step.** A 64-bit machine works on 64-bit chunks natively; a 32-bit machine on 32-bit chunks. Wider means larger numbers handled in a single operation.
+- **How much memory can be addressed.** An address is itself a number of a fixed bit width. A 32-bit address can count up to about 4 billion distinct cells — roughly 4 GB of addressable memory. A 64-bit address can count vastly higher, which is why modern machines with more than 4 GB of RAM are 64-bit: a 32-bit address simply cannot name a cell beyond that limit.
+
+So "64-bit" is not marketing — it sets both the size of chunk the CPU handles at once and the ceiling on how much memory it can even refer to.
+
+> **A note on how cells are counted.** Raw memory is addressable in single bytes (cell 0, 1, 2, ...). But a machine usually *works with* memory in units of its width — a 64-bit machine reads and writes 8-byte chunks at a time, a 32-bit machine 4-byte chunks — so values are typically laid out and aligned on those boundaries. The mental model to keep is the simple one: memory is a numbered line of byte-sized cells, and the machine's width is how big a piece it grabs at once.
+
+## Where this is heading
+
+Putting the three together, the shape of everything above this becomes visible:
+
+```text
+Storage (files, programs)  --- loaded into --->  RAM (numbered cells)
+                                                   ^
+                                                   |  reads and writes
+                                                   |  data at addresses
+                                                 CPU (executes instructions)
+```
+
+A program lives in storage. To run, it is copied into RAM as a line of bytes at real addresses. The CPU then reads instructions and data from those addresses and executes them. Everything in this series is a refinement of that picture: the next part opens the CPU to see *how* it reads and executes an instruction, using its internal registers.
+
+## The one idea to hold onto
+
+> A computer is a **CPU** that executes, **RAM** that holds what is running now (fast, wiped on power-off), and **storage** that keeps things permanently (slow, survives power-off). The CPU only ever works on data in RAM, so programs are loaded from storage into RAM to run. RAM is a long line of **numbered cells** (addresses), each usually one byte; a machine's **bit width** sets how big a chunk it handles at once and how much memory it can address.
+
+## What comes next
+
+The CPU has been treated as a single "it executes instructions" box. **Part 2** opens that box: the control unit and the ALU that make up the processing part, and the **registers** — the CPU's handful of tiny, instant internal slots, including the program counter that points at the next instruction and the stack and base pointers that will matter a great deal once the call stack appears. Those registers are where the fetch-decode-execute cycle in Part 3 does its work.

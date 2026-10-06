@@ -1,0 +1,605 @@
+---
+title: "Virtual, Abstract, and Override in C#"
+date: 2026-09-22
+status: written
+minutes: 20
+order: 5.5
+lead: "What decides which method runs when a variable's type and its object's type differ: non-virtual calls, virtual and override, hiding with new, sealed, abstract classes and members, the full can-and-cannot rulebook, and why some classes can be safely extended while others cannot."
+---
+## The main question
+
+```csharp
+Animal animal = new Dog();
+animal.Speak();
+```
+
+The variable is an `Animal`, but the object is a `Dog`. Does the animal version of `Speak` run, or the dog version?
+
+The answer depends on two keywords: `virtual` and `abstract`. Both are about **inheritance**, meaning a child class building on a parent class.
+
+The short version:
+
+| Keyword | Meaning |
+|---|---|
+| `virtual` | "Here is a default. Child classes **may** change it." |
+| `abstract` | "There is no default. Child classes **must** provide one." |
+| `override` | "This child class is changing it." |
+
+
+## Two types for one object
+
+In this line:
+
+```csharp
+Animal animal = new Dog();
+```
+
+there are two types:
+
+- The **variable type** is `Animal`. This is what the compiler sees.
+- The **object type** is `Dog`. This is what actually exists.
+
+A `Dog` can be stored in an `Animal` variable because a dog **is an** animal. The question is which type gets to choose the method.
+
+
+## Without virtual: the variable type decides
+
+```csharp
+Animal animal = new Dog();
+animal.Speak();
+
+public class Animal
+{
+    public void Speak() => Console.WriteLine("Animal sound");
+}
+
+public class Dog : Animal
+{
+    public void Speak() => Console.WriteLine("Woof");
+}
+```
+
+Output:
+
+```text
+Animal sound
+```
+
+`Speak` in `Animal` is a normal method. The compiler looks at the **variable type**, `Animal`, and calls that version. The dog's version is ignored.
+
+The compiler also shows a warning here: `Dog.Speak` hides `Animal.Speak`. The two methods just happen to share a name; they are not connected.
+
+
+## With virtual: the object type decides
+
+Add `virtual` to the parent and `override` to the child:
+
+```csharp
+Animal animal = new Dog();
+animal.Speak();
+
+public class Animal
+{
+    public virtual void Speak() => Console.WriteLine("Animal sound");
+}
+
+public class Dog : Animal
+{
+    public override void Speak() => Console.WriteLine("Woof");
+}
+```
+
+Output:
+
+```text
+Woof
+```
+
+Now the program checks the **actual object** at runtime. The object is a `Dog`, so the dog's version runs.
+
+- `virtual` in the parent: *this can be replaced.*
+- `override` in the child: *this replaces it.*
+
+Both keywords are needed. `override` without a matching `virtual` in the parent is a compile error.
+
+
+## Why this is useful
+
+One variable type can hold many kinds of objects, and each one behaves in its own way:
+
+```csharp
+Animal[] animals = [new Dog(), new Cat(), new Animal()];
+
+foreach (var animal in animals)
+    animal.Speak();
+
+public class Animal
+{
+    public virtual void Speak() => Console.WriteLine("Animal sound");
+}
+
+public class Dog : Animal
+{
+    public override void Speak() => Console.WriteLine("Woof");
+}
+
+public class Cat : Animal
+{
+    public override void Speak() => Console.WriteLine("Meow");
+}
+```
+
+Output:
+
+```text
+Woof
+Meow
+Animal sound
+```
+
+The loop does not need to know which animal it has. It just calls `Speak`, and each object answers correctly. This idea is called **polymorphism**: one type, many behaviors.
+
+Notice the plain `Animal` still says "Animal sound". A virtual method has a **default**, so a class that does not override it keeps the parent's version.
+
+
+## Keeping the parent's version: base
+
+An override can use the parent's version and add to it, with `base`:
+
+```csharp
+Animal animal = new LoudDog();
+animal.Speak();
+
+public class Animal
+{
+    public virtual void Speak() => Console.WriteLine("Animal sound");
+}
+
+public class LoudDog : Animal
+{
+    public override void Speak()
+    {
+        base.Speak();                    // run the parent's version first
+        Console.WriteLine("WOOF!!!");    // then add something
+    }
+}
+```
+
+Output:
+
+```text
+Animal sound
+WOOF!!!
+```
+
+Without `base.Speak()`, the override replaces the parent's version completely. With it, the override **extends** it.
+
+
+## Virtual properties
+
+Properties can be virtual too, and work the same way:
+
+```csharp
+Animal animal = new Dog();
+Console.WriteLine(animal.Sound);
+
+public class Animal
+{
+    public virtual string Sound => "Animal sound";
+}
+
+public class Dog : Animal
+{
+    public override string Sound => "Woof";
+}
+```
+
+Output:
+
+```text
+Woof
+```
+
+This is one reason C# code uses properties so often: a **field cannot be virtual**, but a property can.
+
+
+## Stopping overrides: sealed
+
+`sealed` stops the chain.
+
+On a **class**, it means no one can inherit from it:
+
+```csharp
+public sealed class Dog : Animal { }
+
+public class Puppy : Dog { }   // error: Dog is sealed
+```
+
+On an **override**, it means child classes cannot override that member again:
+
+```csharp
+public class Dog : Animal
+{
+    public sealed override void Speak() => Console.WriteLine("Woof");
+}
+
+public class Puppy : Dog
+{
+    public override void Speak() => Console.WriteLine("Yip");   // error: Speak is sealed
+}
+```
+
+
+## Abstract classes: made to be inherited
+
+An **abstract class** is a parent class that cannot be created directly. It only exists so other classes can inherit from it.
+
+```csharp
+public abstract class Animal
+{
+}
+
+public class Dog : Animal
+{
+}
+
+var dog = new Dog();         // allowed
+var animal = new Animal();   // error: cannot create an instance of an abstract class
+```
+
+Think of `Animal` as a general idea. Nobody owns "an animal" with no species; they own a dog or a cat. The abstract class describes what all animals share.
+
+
+## Abstract methods: no body, must override
+
+An **abstract method** has a name and a signature, but **no body**. It ends with a semicolon:
+
+```csharp
+public abstract class Animal
+{
+    public abstract void Speak();   // no body
+}
+```
+
+This says: *every animal must be able to speak, but this class does not know how.* Each child class must provide the body:
+
+```csharp
+Animal[] animals = [new Dog(), new Cat()];
+
+foreach (var animal in animals)
+    animal.Speak();
+
+public abstract class Animal
+{
+    public abstract void Speak();
+}
+
+public class Dog : Animal
+{
+    public override void Speak() => Console.WriteLine("Woof");
+}
+
+public class Cat : Animal
+{
+    public override void Speak() => Console.WriteLine("Meow");
+}
+```
+
+Output:
+
+```text
+Woof
+Meow
+```
+
+If a child class forgets to override an abstract method, the code does not compile:
+
+```csharp
+public class Fish : Animal
+{
+}
+// error: 'Fish' does not implement inherited abstract member 'Animal.Speak()'
+```
+
+This is the main benefit of `abstract`: the compiler **guarantees** that every child provides the missing piece.
+
+An abstract method can only live inside an abstract class. A normal class could be created with `new`, and then it would have a method with no body, which makes no sense.
+
+
+## Abstract properties
+
+Properties can be abstract too. The child class must provide them:
+
+```csharp
+Animal animal = new Dog();
+Console.WriteLine(animal.Species);
+
+public abstract class Animal
+{
+    public abstract string Species { get; }
+}
+
+public class Dog : Animal
+{
+    public override string Species => "Dog";
+}
+```
+
+Output:
+
+```text
+Dog
+```
+
+When a child class must supply some value, an abstract property is the tool to use, because fields cannot be abstract.
+
+
+## Abstract classes can still have normal code
+
+"Abstract" does not mean "everything inside is abstract". An abstract class can mix normal members with abstract and virtual ones:
+
+```csharp
+Animal dog = new Dog("Rex");
+dog.Eat();
+dog.Speak();
+dog.Sleep();
+
+public abstract class Animal
+{
+    protected Animal(string name) => Name = name;   // constructor used by child classes
+
+    public string Name { get; }                      // normal: shared by every animal
+
+    public void Eat() =>                             // normal: same for every animal
+        Console.WriteLine($"{Name} is eating.");
+
+    public abstract void Speak();                    // abstract: every child MUST provide it
+
+    public virtual void Sleep() =>                   // virtual: a default, child MAY change it
+        Console.WriteLine($"{Name} is sleeping.");
+}
+
+public class Dog : Animal
+{
+    public Dog(string name) : base(name) { }         // pass the name to the parent's constructor
+
+    public override void Speak() => Console.WriteLine($"{Name} says Woof");
+}
+```
+
+Output:
+
+```text
+Rex is eating.
+Rex says Woof
+Rex is sleeping.
+```
+
+What `Dog` gets:
+
+```text
+Animal
+ |-- Name      inherited, nothing to do
+ |-- Eat()     inherited, nothing to do
+ |-- Speak()   abstract, Dog MUST write it
+ |-- Sleep()   virtual, Dog MAY change it (here it keeps the default)
+```
+
+`: base(name)` on the `Dog` constructor passes the name up to the `Animal` constructor. The `Animal` constructor is `protected`, meaning only child classes can call it, which fits: only child classes can be created anyway.
+
+
+## Virtual vs abstract
+
+| Question | `virtual` | `abstract` |
+|---|---|---|
+| Does the parent write the code? | Yes, a default | No |
+| Can the child override it? | Yes | Yes |
+| Must the child override it? | No | Yes |
+| Allowed in a normal class? | Yes | No, only in an abstract class |
+| Can the child call `base` on it? | Yes | No, there is nothing to call |
+
+How to choose:
+
+- Use **`virtual`** when there is a sensible default that most child classes will keep.
+- Use **`abstract`** when there is no sensible default and every child class must decide for itself.
+- Use **neither** when the behavior should be the same for every child class.
+
+
+## What can and cannot be virtual or abstract
+
+| Member | `virtual` | `abstract` | Notes |
+|---|---|---|---|
+| Class | no | yes | an abstract class cannot be created with `new` |
+| Method | yes | yes | an abstract method has no body |
+| Property | yes | yes | the usual replacement for a field |
+| Indexer | yes | yes | works like a property |
+| Event | yes | yes | rarely needed in practice |
+| Field | no | no | use a property instead |
+| Constructor | no | no | abstract classes can still have constructors |
+| Static member | no | no | there is no object to decide which version runs |
+| Private member | no | no | a child class cannot see it, so cannot override it |
+
+Two small extra rules:
+
+- An **abstract member** must be inside an **abstract class**.
+- An **override** must keep the same access level as the parent member. A `public virtual` method is overridden as `public override`.
+
+
+## A common mistake: new instead of override
+
+When a parent method is not virtual, the compiler suggests adding the `new` keyword to the child's method. That silences the warning, but it does **not** make the method replaceable:
+
+```csharp
+Animal asAnimal = new Dog();
+Dog    asDog    = new Dog();
+
+asAnimal.Speak();   // Animal sound
+asDog.Speak();      // Woof
+
+public class Animal
+{
+    public void Speak() => Console.WriteLine("Animal sound");
+}
+
+public class Dog : Animal
+{
+    public new void Speak() => Console.WriteLine("Woof");   // hides, does not override
+}
+```
+
+Output:
+
+```text
+Animal sound
+Woof
+```
+
+The same object gives different answers depending on the variable type. That is almost never what is wanted. If a child class should change a behavior, the parent should mark it `virtual`, and the child should use `override`.
+
+| | `override` | `new` |
+|---|---|---|
+| Through a `Dog` variable | Dog's version | Dog's version |
+| Through an `Animal` variable | **Dog's** version | **Animal's** version |
+
+
+## Full example: a payment system
+
+Everything together in one small program. Every payment:
+
+- has an amount (normal property),
+- must have a name and a way to pay (abstract),
+- has no fee unless it says otherwise (virtual),
+- is processed the same way: calculate the fee, pay, print a receipt (normal method).
+
+```csharp
+using System.Globalization;
+
+CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+
+Payment[] payments =
+[
+    new CardPayment(50m),
+    new PayPalPayment(20m),
+    new CashPayment(10m)
+];
+
+foreach (var payment in payments)
+{
+    payment.Process();
+    Console.WriteLine();
+}
+
+// var p = new Payment(5m);   // error: Payment is abstract
+
+// ======================= classes =======================
+
+public abstract class Payment
+{
+    protected Payment(decimal amount) => Amount = amount;
+
+    public decimal Amount { get; }                  // normal
+
+    public abstract string Method { get; }          // abstract: every payment MUST have a name
+    public abstract void Pay(decimal total);        // abstract: every payment MUST know how to pay
+
+    public virtual decimal Fee() => 0m;             // virtual: default is no fee, MAY be changed
+
+    public void Process()                           // normal: the same steps for every payment
+    {
+        decimal fee   = Fee();
+        decimal total = Amount + fee;
+
+        Console.WriteLine($"{Method}: amount {Amount:0.00}, fee {fee:0.00}");
+        Pay(total);
+        Console.WriteLine($"  Receipt: {total:0.00}");
+    }
+}
+
+public class CardPayment : Payment
+{
+    public CardPayment(decimal amount) : base(amount) { }
+
+    public override string Method => "Card";
+
+    public override void Pay(decimal total) =>
+        Console.WriteLine($"  Charging card {total:0.00}");
+
+    public override decimal Fee() => Amount * 0.03m;   // cards charge a 3% fee
+}
+
+public class PayPalPayment : Payment
+{
+    public PayPalPayment(decimal amount) : base(amount) { }
+
+    public override string Method => "PayPal";
+
+    public override void Pay(decimal total) =>
+        Console.WriteLine($"  Sending PayPal request for {total:0.00}");
+
+    public override decimal Fee() => 0.50m;            // PayPal charges a flat fee
+}
+
+public class CashPayment : Payment
+{
+    public CashPayment(decimal amount) : base(amount) { }
+
+    public override string Method => "Cash";
+
+    public override void Pay(decimal total) =>
+        Console.WriteLine($"  Taking cash {total:0.00}");
+
+    // no Fee override: cash uses the default of 0
+}
+```
+
+Output:
+
+```text
+Card: amount 50.00, fee 1.50
+  Charging card 51.50
+  Receipt: 51.50
+
+PayPal: amount 20.00, fee 0.50
+  Sending PayPal request for 20.50
+  Receipt: 20.50
+
+Cash: amount 10.00, fee 0.00
+  Taking cash 10.00
+  Receipt: 10.00
+```
+
+Reading it:
+
+- `Process` is written **once** in `Payment` and runs for every payment type.
+- Inside `Process`, the calls to `Method`, `Fee()`, and `Pay()` go to the **child's** version, because they are abstract or virtual.
+- `CardPayment` and `PayPalPayment` override `Fee`. `CashPayment` does not, so it gets the default of zero.
+- Adding a new payment type means writing one small class. The compiler makes sure it provides `Method` and `Pay`.
+
+
+## Cheat sheet
+
+```text
+virtual      "Here is a default. Children MAY change it."
+abstract     "No default. Children MUST provide it."
+override     "This child is changing it."
+base.X()     "Also run the parent's version of X."
+sealed       class: no children   |   override: no more changes below this
+new          hides a method, does NOT override it (usually a mistake)
+
+Without virtual   -> the VARIABLE type picks the method
+With virtual      -> the OBJECT type picks the method
+
+Can be virtual or abstract:   methods, properties, indexers, events
+Can be abstract only:         classes
+Can be neither:               fields, constructors, static members, private members
+```
+
+
+## Checkpoint
+
+1. `Animal a = new Dog();` If `Speak` is `virtual` and `Dog` overrides it, which version runs for `a.Speak()`?
+2. What changes if `Speak` is not `virtual`?
+3. Why can a field not be virtual, and what is used instead?
+4. What happens if a class inherits from an abstract class and does not override one of its abstract methods?
+5. In the payment example, why does `CashPayment` show a fee of `0.00`?
+6. When should a method be `virtual` rather than `abstract`?
