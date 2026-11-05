@@ -1,0 +1,237 @@
+---
+title: "LINQ: deferred execution with a nicer syntax"
+date: 2026-10-10
+status: written
+minutes: 13
+order: 6
+lead: 'LINQ is not a new idea — it is Day 4 deferred execution dressed in a readable syntax. Where and Select are yield-based iterators, a chain is one pull-through pipeline, and First can stop the whole thing after two items. The only genuinely new distinction is where the query physically runs: in our process, or in the database.'
+---
+
+## LINQ executes by pulling, not by passing
+
+Start with the chain from the end of the last article and instrument every step, so the execution order becomes visible:
+
+```csharp
+record Shift(string Employee, double Hours);
+
+var shifts = new List<Shift>
+{
+    new("Sharmin", 6), new("Rahim", 9), new("Sharmin", 8),
+    new("Rahim", 10), new("Mofakh", 7), new("Sharmin", 9),
+};
+
+var result = shifts
+    .Where(s => { Console.WriteLine($"  Where checks {s.Employee} ({s.Hours})"); return s.Hours > 8; })
+    .Select(s => { Console.WriteLine($"  Select maps {s.Employee}"); return s.Employee; })
+    .First();
+
+Console.WriteLine($"Result: {result}");
+```
+
+The output is the whole lesson:
+
+```
+  Where checks Sharmin (6)
+  Where checks Rahim (9)
+  Select maps Rahim
+Result: Rahim
+```
+
+Three lines, then it **stops**. It did not check all six shifts. `Where` tested Sharmin (fails), tested Rahim (passes), `Select` mapped that one item, `First()` received its single result and halted the entire pipeline. `Mofakh` and everyone after Rahim were never looked at, and `Select` ran exactly **once** — only on the item that passed `Where` *and* was actually pulled.
+
+This is **pull-based streaming execution**, and it is the direct consequence of deferred iterators: `First()` pulls one item through the chain, each stage pulls from the stage before it, and the moment `First()` is satisfied everything upstream short-circuits. A LINQ chain does not build an intermediate list at each step — it threads *one item at a time* through the whole pipeline.
+
+## LINQ is just extension methods on IEnumerable&lt;T&gt;
+
+There is no magic. `Where`, `Select`, `OrderBy` are **extension methods** on `IEnumerable<T>` in `System.Linq`, and almost all of them are written with `yield return` internally — the same lazy iterators built by hand on Day 4. `Where` is essentially:
+
+```csharp
+static IEnumerable<T> Where<T>(this IEnumerable<T> source, Func<T, bool> predicate)
+{
+    foreach (var item in source)
+        if (predicate(item))
+            yield return item;      // deferred — produces each match only when pulled
+}
+```
+
+That is the trick behind the entire library. Each deferred operator returns a new lazy `IEnumerable<T>` that *wraps* the previous one, which is why chaining does not mean one pass per operator — it builds a single pull-through pipeline. This also gives a reliable tell: if an operator returns `IEnumerable<T>`, it is a recipe that has not run; if it returns a value or a concrete collection, it has run.
+
+## The core operators
+
+Four do most of the work, and every one of these is still deferred — none has touched the data yet:
+
+```csharp
+var longOnes = shifts.Where(s => s.Hours >= 8);          // filter — same shape, fewer items
+var names    = shifts.Select(s => s.Employee);           // project — same count, new shape
+var sorted   = shifts.OrderByDescending(s => s.Hours);   // sort
+var topThree = shifts.OrderByDescending(s => s.Hours).Take(3);   // "top N"
+```
+
+The mental model worth keeping: **`Where` keeps the shape and drops items; `Select` keeps the count and changes the shape.** "Top 3 longest shifts" is `OrderByDescending(...).Take(3)`, and because it is lazy, it reads as cleanly as it sounds. A `Select` into an anonymous type or DTO is the everyday reshape:
+
+```csharp
+var summary = shifts.Select(s => new { s.Employee, IsOvertime = s.Hours > 8 });
+```
+
+## Deferred vs immediate — the rule that prevents the double-run bug
+
+Some operators stay lazy; some force the pipeline to run *now*. The rule is mechanical:
+
+- **Returns `IEnumerable<T>` → deferred** (still a recipe): `Where`, `Select`, `OrderBy`, `Take`, `Skip`, `Distinct`, `GroupBy`.
+- **Returns a single value or a concrete collection → runs immediately**: `ToList`, `ToArray`, `ToDictionary`, `Count`, `First`, `Single`, `Any`, `Sum`, `Max`, `Average`.
+
+So the enumerate-twice trap from Day 4 reappears, now wearing LINQ:
+
+```csharp
+int calls = 0;
+var pipeline = shifts.Where(s => { calls++; return s.Hours > 8; });
+
+int count = pipeline.Count();     // runs the Where
+var list  = pipeline.ToList();    // runs the Where AGAIN
+Console.WriteLine($"calls = {calls}");   // 12 — six per run, twice
+```
+
+`pipeline` is a recipe; `Count()` ran it and `ToList()` ran it again. Same fix as before: `.ToList()` once, then `Count` and iterate the list. Identical bug, now that the source happens to be a LINQ chain.
+
+## GroupBy and aggregation — the real query
+
+This is the shape of query that feels like actual work: group shifts by employee, compute each person's totals, and flag overtime. `GroupBy` turns a flat sequence into groups — each group is itself an `IEnumerable<T>` carrying a `.Key`:
+
+```csharp
+foreach (var group in shifts.GroupBy(s => s.Employee))
+    Console.WriteLine($"{group.Key}: {group.Count()} shifts");   // Key is the employee name
+```
+
+Combined with `Select` and aggregation, it becomes a payroll report. Here is the full version — total, longest shift, average, overtime, filtered to overtime-only, sorted by overtime:
+
+```csharp
+const double WeeklyCap = 18;   // realistic value is 40; 18 lets the toy data actually trigger OT
+
+var report = shifts
+    .GroupBy(s => s.Employee)
+    .Select(g => new
+    {
+        Employee     = g.Key,
+        TotalHours   = g.Sum(s => s.Hours),
+        LongestShift = g.Max(s => s.Hours),
+        AverageShift = g.Average(s => s.Hours),
+        Overtime     = Math.Max(0, g.Sum(s => s.Hours) - WeeklyCap)
+    })
+    .Where(r => r.Overtime > 0)                // filter AFTER the Select
+    .OrderByDescending(r => r.Overtime)
+    .ToList();                                 // one deliberate materialization
+
+foreach (var r in report)
+    Console.WriteLine($"{r.Employee,-10} total {r.TotalHours,4}h  longest {r.LongestShift}h  avg {r.AverageShift:F1}h  OT {r.Overtime}h");
+```
+
+Read in plain English: *group the shifts by employee, turn each group into a summary, keep only those in overtime, sort by most overtime, and run it.* A genuinely useful payroll aggregation in a dozen lines.
+
+The detail that teaches the most is **why `Where` comes after `Select`**. The `Overtime` field does not exist on a `Shift` — it is *computed inside the `Select`*. There is nothing to filter on until the projection has created it. `Where` before `Select` filters the *raw shifts*; `Where` after `Select` filters the *computed summaries* — different shapes. The instinct to carry: *filter on a field, so the filter must come after the field is created.*
+
+<NoteToSelf>
+Two traps in this exact query.
+- **Toy-data trap:** with the real 40h cap and only a handful of small shifts, every `Overtime` is 0 and the `Where` empties the report — which looks like a bug but is correct. Dropping the cap to 18 makes the overtime path visible, so the filter can be *seen* removing people.
+- **Double-sum:** `g.Sum(s => s.Hours)` runs twice here (once for `TotalHours`, once inside `Overtime`), so each group is summed twice. Harmless on tiny groups; on large ones, compute the total once (a `let` in query syntax) rather than re-summing.
+This is also the callback to the collections article: `GroupBy` builds a dictionary-shaped lookup under the hood — hashing by key, exactly the hash-table machinery from before.
+</NoteToSelf>
+
+## IQueryable&lt;T&gt; vs IEnumerable&lt;T&gt; — where the query physically runs
+
+This is the single most important LINQ distinction for backend work, because **the same syntax runs on two completely different engines**:
+
+- **`IEnumerable<T>`** — LINQ-to-Objects. The lambdas compile to **delegates** (real C# methods) and run **in our process**, in memory. Everything above has been this.
+- **`IQueryable<T>`** — LINQ-to-SQL via EF Core. The lambdas compile to **expression trees** — data structures that *describe* the query — which EF translates into **SQL** and runs **in the database**.
+
+Same `.Where(s => s.Hours > 8)`, two worlds: on `IEnumerable` it is a delegate filtering a list; on `IQueryable` it becomes `WHERE Hours > 8` in a SQL statement the server executes. That is why composition order is a correctness issue, not a style choice:
+
+```csharp
+// db.Shifts is IQueryable<Shift>
+
+// GOOD — the Where becomes SQL; the database filters and returns ~3 rows:
+db.Shifts.Where(s => s.Hours > 8).ToList();
+// → SELECT * FROM Shifts WHERE Hours > 8
+
+// BAD — ToList() runs FIRST, pulling the WHOLE table into memory as IEnumerable,
+// THEN Where filters in C#. Two million rows loaded to keep three:
+db.Shifts.ToList().Where(s => s.Hours > 8);
+```
+
+The instant `.ToList()` (or `.AsEnumerable()`) is called, the code **crosses the boundary** from `IQueryable` to `IEnumerable` — from "database does the work" to "our process does the work." Everything *before* the boundary becomes SQL; everything *after* runs in C#. The bad line above is simply *crossing the boundary one method too early.* The defense is the one from Day 4 — **compose while it is `IQueryable`, materialize once at the end** — and now the mechanism underneath it is clear: expression tree versus delegate.
+
+<NoteToSelf>
+Because `IQueryable` must become SQL, not every C# expression is legal inside it — call a local C# method inside a `Where` on `IQueryable` and EF throws *"could not be translated."* "Runs in the DB" comes with "must be expressible as SQL." That is the opening scene of the EF Core / data-access article.
+</NoteToSelf>
+
+## A question worth answering: does a million-row foreach hit the database a million times?
+
+A natural fear once deferred execution clicks: if a query for a million rows is *not* materialized, and it then gets looped over, does each iteration fire its own query — a million round-trips?
+
+The short answer is **no — one database call, one round-trip.** A `foreach` over an un-materialized EF Core query hits the database **once**, opens a stream, and pulls rows **one at a time over that single open connection**.
+
+```csharp
+var query = db.Shifts.Where(s => s.Hours > 8);   // no DB call yet — just a recipe (expression tree)
+
+foreach (var shift in query)                      // the DB call happens HERE, once
+{
+    Process(shift);
+}
+```
+
+The instant the `foreach` starts, EF does this **once**: translates the expression tree into one `SELECT`, opens one connection, sends that one query, and the database begins returning rows over an open reader. Each loop iteration calls `MoveNext()`, which pulls the **next row off that open stream**. One SQL execution; the rows flow back incrementally as the loop asks for them.
+
+So where does the "million hits" fear actually come true? Only when a **new query** is issued *inside* the loop:
+
+```csharp
+// THIS is the million-queries disaster:
+var ids = db.Shifts.Select(s => s.Id).ToList();     // 1 query: all the IDs
+foreach (var id in ids)
+{
+    var shift = db.Shifts.First(s => s.Id == id);   // a NEW query every iteration = 1,000,000 queries
+    Process(shift);
+}
+```
+
+The difference is the rule: **one query enumerated in a loop = one DB hit; a query *called* inside a loop = one hit per iteration.** That second shape is the N+1 problem, which returns in the data-access work.
+
+### The part most people miss: one call does not mean all-in-memory
+
+Does "one call" mean a million rows land in memory at once? That depends entirely on whether the query is materialized.
+
+```csharp
+// STREAMING (no ToList) — one query, ~one row in memory at a time, flat memory:
+foreach (var shift in db.Shifts.Where(s => s.Hours > 8))
+    Process(shift);        // EF reads the next row only when the loop asks
+
+// MATERIALIZED (ToList) — still one query, but ALL million rows pulled into memory now:
+var all = db.Shifts.Where(s => s.Hours > 8).ToList();
+foreach (var shift in all) // iterating an in-memory List — zero DB contact here
+    Process(shift);
+```
+
+Both are **one database call**. The difference is *when and how much memory*: streaming holds roughly one row at a time; `ToList` drains the entire reader into a `List<Shift>` immediately, so a million entities sit in RAM, and the following loop touches the database zero times.
+
+The decision for a genuinely large result set: **processing one-by-one and discarding** (export, transform, aggregate) → stream, do not `ToList` — one call, flat memory. **Needing the data more than once** (iterate twice, random access, pass it around) → `ToList` once, but for a million rows that is a lot of RAM, so prefer streaming in **batches** (pull 1,000, process, pull the next 1,000 — the reusable `Batch<T>` iterator pattern).
+
+<NoteToSelf>
+Two caveats for later. While streaming a query, that DbContext's connection is **busy** — a second query cannot run on the same context mid-stream, and a web request's DbContext is short-lived, so long streams do not fit every scenario. And "one row at a time" is EF Core's default for a plain `foreach`; the exact buffering depends on the provider (SQL Server's reader streams by default, some configs buffer more). The mental model — one call, streamed — is the one to rely on. The async version, `await foreach` over `AsAsyncEnumerable()`, is the same picture with non-blocking waits.
+</NoteToSelf>
+
+## Two spellings, one query
+
+Worth recognising both in a codebase. Everything above used **method syntax**. There is also **query syntax**, which the compiler translates into the exact same method calls:
+
+```csharp
+// query syntax
+var q1 = from s in shifts
+         where s.Hours > 8
+         orderby s.Hours descending
+         select s.Employee;
+
+// identical method syntax
+var q2 = shifts.Where(s => s.Hours > 8)
+               .OrderByDescending(s => s.Hours)
+               .Select(s => s.Employee);
+```
+
+They compile to the same thing. Method syntax is more common and more complete — not every operator has a query-syntax keyword — so it is the sensible default, while `GroupBy`/`Join`-heavy queries sometimes read more clearly in query syntax (and `let` for caching a computed value only exists there). Know both; prefer method.

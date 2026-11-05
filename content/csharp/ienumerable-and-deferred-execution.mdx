@@ -1,0 +1,219 @@
+---
+title: "IEnumerable and deferred execution"
+date: 2026-10-10
+status: written
+minutes: 12
+order: 5
+lead: 'Collections sit on a ladder of interfaces, and the bottom rung — IEnumerable — carries the biggest idea of the day: an IEnumerable is often not data but a recipe, and the recipe does not run until something pulls. Knowing when it runs, and how many times, is what separates clean query code from an accidental second trip to the database.'
+---
+
+## The interface ladder
+
+The collections from Day 3 all sit on a ladder of interfaces, each rung adding one capability:
+
+- **`IEnumerable<T>`** — "I can be iterated." That is the entire contract: `foreach` over me. The bottom rung, and nearly everything stands on it.
+- **`ICollection<T>`** — everything above, plus `Count`, `Add`, `Remove`, `Clear`, `Contains`. A collection we can *modify* and *count*.
+- **`IList<T>`** — everything above, plus **index access** (`this[i]`), `Insert`, `RemoveAt`, `IndexOf`. An *ordered* collection with positions.
+
+There is also a read-only branch that matters for API design: **`IReadOnlyCollection<T>`** (adds just `Count`) and **`IReadOnlyList<T>`** (adds indexing, but no mutation). That read-only list is the type a well-written repository hands back from an `All()` method — and the reason why becomes clear at the end of this article.
+
+## Accept the weakest interface that does the job
+
+The ladder gives a design rule: **a method should ask for the weakest interface that still does its job.** A method that only needs to iterate should take `IEnumerable<T>` — then it accepts *everything*:
+
+```csharp
+static int CountItems<T>(IEnumerable<T> items)
+{
+    int n = 0;
+    foreach (var _ in items) n++;
+    return n;
+}
+
+CountItems(new List<int> { 1, 2, 3 });    // works
+CountItems(new[] { 1, 2, 3 });            // works
+CountItems(new HashSet<int> { 1, 2, 3 }); // works
+```
+
+One method, every collection — because a `List`, an array, and a `HashSet` all implement `IEnumerable<T>`. Typing the parameter as `List<T>` instead would reject the array and the set for no reason. **Weak parameter, strong flexibility.**
+
+## What IEnumerable&lt;T&gt; actually is
+
+Here is the part almost nobody looks at: `foreach` is **syntactic sugar**. It is not a language primitive — the compiler rewrites it into method calls on an *enumerator*. These two blocks are identical:
+
+```csharp
+var nums = new List<int> { 10, 20, 30 };
+
+// what we write:
+foreach (var n in nums)
+    Console.WriteLine(n);
+
+// what the compiler generates:
+using var e = nums.GetEnumerator();   // ask the collection for a cursor
+while (e.MoveNext())                   // advance; false when exhausted
+    Console.WriteLine(e.Current);      // read the item under the cursor
+```
+
+So the whole `IEnumerable<T>` contract is just *"I can hand over a `GetEnumerator()`."* An enumerator is a **cursor** with two moves: `MoveNext()` (step forward, return `false` at the end) and `Current` (read where we are). Every `foreach` ever written is this loop underneath. Once iteration is understood as *"pull one item, then the next, on demand,"* the big idea becomes inevitable.
+
+## Deferred execution — the idea everything hinges on
+
+The mental shift: **an `IEnumerable<T>` is often not data — it is a recipe.** It describes how to produce items, but produces nothing until something *pulls*.
+
+```csharp
+IEnumerable<int> Numbers()
+{
+    Console.WriteLine("  >> body starting");
+    for (int i = 1; i <= 3; i++)
+    {
+        Console.WriteLine($"  >> yielding {i}");
+        yield return i;
+    }
+}
+
+Console.WriteLine("A: before calling Numbers()");
+var seq = Numbers();                  // does the body run here?
+Console.WriteLine("B: got the sequence, before foreach");
+foreach (var n in seq)
+    Console.WriteLine($"C: consumed {n}");
+```
+
+The surprise: calling `Numbers()` prints **nothing**. `"body starting"` does not appear at line B — the body does not run until the `foreach` starts pulling. And it runs *interleaved*: `yielding 1`, then `consumed 1`, then `yielding 2`, then `consumed 2`. The sequence is **lazy** — it computes each item only when asked. That is **deferred execution**.
+
+## The enumerate-twice trap (and the one-line fix)
+
+Deferred execution creates a real bug, not a curiosity. A recipe runs *every time* it is enumerated:
+
+```csharp
+int calls = 0;
+IEnumerable<int> Tracked()
+{
+    for (int i = 1; i <= 3; i++) { calls++; yield return i; }
+}
+
+var q = Tracked();
+int sum = q.Sum();     // enumerates the sequence once
+int max = q.Max();     // enumerates it AGAIN — from scratch
+Console.WriteLine($"calls = {calls}");   // 6, not 3
+```
+
+It prints **6**. Because `q` is a recipe, `Sum()` runs the whole thing, then `Max()` runs the *whole thing again* — two enumerations, double the work. For an in-memory list that is wasted CPU. If `Tracked()` were a database query, that "6" would be **two separate round-trips to the server** — the same bug, now hitting the network.
+
+The fix is to **materialize** — run it once, keep the results:
+
+```csharp
+var results = Tracked().ToList();   // enumerate ONCE, store the items
+int sum2 = results.Sum();           // no re-enumeration — it is a List now
+int max2 = results.Max();           // still no re-enumeration
+```
+
+The rule to carry: **an `IEnumerable` that will be used more than once should be `.ToList()`'d first.** Deferred execution is a feature — it makes big query pipelines cheap — right up until it is triggered twice by accident.
+
+## yield return — authoring a lazy sequence
+
+`yield return` is how a lazy `IEnumerable<T>` gets *written* without ever building a list. The compiler rewrites the method into a **state machine** that remembers where it left off between pulls:
+
+```csharp
+IEnumerable<Shift> GenerateWeek(DateOnly start)
+{
+    for (int day = 0; day < 7; day++)
+    {
+        yield return new Shift
+        {
+            Date = start.AddDays(day),
+            Start = new TimeOnly(9, 0)
+        };
+    }
+}
+
+foreach (var shift in GenerateWeek(new DateOnly(2026, 7, 20)))
+    Console.WriteLine($"{shift.Date:ddd} at {shift.Start}");
+```
+
+No `List<Shift>` is ever created — each `Shift` is produced the instant the `foreach` asks for it, then forgotten. For seven shifts that is nothing; at scale it is the whole game. A million shift rows can be streamed from a file and processed one at a time, with only *one* in memory instead of a million.
+
+Because it is lazy, it can even describe an **infinite** sequence safely:
+
+```csharp
+IEnumerable<int> Naturals()
+{
+    int i = 1;
+    while (true) yield return i++;   // never ends...
+}
+
+var firstFive = Naturals().Take(5).ToList();   // ...but Take pulls only 5 → [1,2,3,4,5]
+```
+
+`Naturals()` would loop forever if fully enumerated — but `Take(5)` pulls five times and stops, and the generator pauses. "Produce only what is pulled" is the reason query operators can chain efficiently.
+
+## Is a returned IEnumerable always a recipe?
+
+This is the question that matters in real code, and the answer is a careful *no — and here is the rule that tells which*.
+
+**The trap first: the return type does not reveal whether the thing is lazy or already finished.** The *same* `IEnumerable<T>` hides both. Compare the recipe above with this:
+
+```csharp
+int calls = 0;
+IEnumerable<int> Tracked()
+{
+    calls++;                          // runs when Tracked() is CALLED
+    return new List<int> { 1, 2, 3 }; // returns a fully-built list, already in memory
+}
+
+var q = Tracked();
+int sum = q.Sum();   // walks an in-memory list
+int max = q.Max();   // walks the same list again — cheap, no side effects
+Console.WriteLine($"calls = {calls}");   // 1
+```
+
+This method has **no `yield`**, so it is an ordinary method: the body runs immediately, `calls++` fires once, and a finished `List<int>` comes back. `Sum()` and `Max()` just walk that same list twice — cheap, so `calls` stays at **1**. Same return type as the `yield` version, `calls = 6` there and `calls = 1` here. **A caller reading only the signature `IEnumerable<int> Tracked()` cannot tell which one it is.**
+
+That uncertainty is exactly why the rule is not "always materialize." It is a rule about risk when the kind is unknown. Materialize only when **both** of these hold:
+
+1. **Each enumeration is costly or has side effects** — a DB round-trip, a file read, a web call — not merely walking an in-memory list.
+2. **The sequence will be enumerated more than once** — two loops, a `Count()` then a `foreach`, handing it to several methods.
+
+If both are true → `.ToList()` once. If either is false → leave it lazy; blindly materializing throws away streaming and early-exit for nothing. And since the signature hides the kind, the safe habit when enumerating more than once is to materialize first: if it was already a list, that costs one cheap allocation; if it was secretly a database query, it just saved a second round-trip.
+
+<NoteToSelf>
+Single enumeration → never materialize. One `foreach`, one `Sum()`, one `First()` — there is no second pass to protect against, and `.ToList()` would only add an allocation. The whole danger is *re-enumeration* of an *expensive* source. Ask one question at the call site: "how many times does this actually get enumerated?"
+</NoteToSelf>
+
+## The database case: compose while lazy, materialize once
+
+The database version has a second edge most people miss. An EF Core query is deferred until enumerated, so it *is* a recipe:
+
+```csharp
+var pending = db.Shifts.Where(s => s.Status == "pending");  // no DB hit yet — still a recipe
+var list = pending.ToList();                                 // THIS is the round-trip
+```
+
+But while it is still `IQueryable<T>`, it can keep being composed, and the **database** does the work. Materializing too *early* is as much a bug as materializing too *late*:
+
+```csharp
+// GOOD — filtering happens in SQL; the DB returns ~10 rows:
+db.Shifts.Where(s => s.EmployeeId == 42).Take(10).ToList();
+
+// BAD — .ToList() drags the ENTIRE table into memory, THEN filters in C#.
+// Two million rows loaded to keep 10:
+db.Shifts.ToList().Where(s => s.EmployeeId == 42).Take(10);
+```
+
+So the database rule has two edges: **compose while it is `IQueryable` (let SQL do the filtering), then materialize once at the very end** — right before the results are used more than once or handed out. The `db.Shifts.ToList().Where(...)` mistake is really "dropped from `IQueryable` to `IEnumerable` too early," which is the heart of the next article.
+
+## What to return, what to accept
+
+The accept-side rule was "take the weakest interface." The return side is its mirror, and it is where the lazy-vs-eager uncertainty gets fixed at the source — because the author *can* tell the truth with the return type:
+
+- **Return `IReadOnlyList<T>`** for finished data that callers may re-enumerate freely. The type now *promises* "materialized, safe to walk twice." This is why a repository's `All()` returns `IReadOnlyList<T>` rather than `List<T>` — a `List` would let any caller do `repo.All().Add(...)` and mutate the repository's private state; the read-only type makes that a compile error.
+- **Return `IEnumerable<T>`** deliberately, for lazy/streaming sequences like `GenerateWeek`, where deferred execution is the point — and treat it as a promise the caller might re-enumerate.
+- **Avoid returning `List<T>` from public methods** — it leaks mutability and nails callers to a concrete type.
+
+The sharp version of the whole day: **a caller cannot trust the type to reveal lazy-vs-eager, so the caller protects itself (`.ToList()` before reuse), and the author tells the truth with the return type (`IReadOnlyList<T>` when it is really done).**
+
+<NoteToSelf>
+Use-cases to cash in later:
+- **The enumerate-twice trap is an EF Core footgun** — a stored `IQueryable` enumerated in a `Count()` and then a `foreach` is two SQL round-trips. Returns in the data-access article.
+- **`IQueryable` vs `IEnumerable` is the whole of Day 5** — expression tree compiled to SQL (runs in the DB) vs a delegate (runs in-process). The `db.Shifts.ToList().Where(...)` bug is the entire topic in one line.
+- **`yield return` streaming is the spine of the Files/Streams work** — reading a huge file line by line, one record in memory at a time, is this exact pattern.
+- **A `Batch<T>(IEnumerable<T>, int size)` iterator** — yielding a source in fixed-size chunks (1,000 rows into pages of 100 for bulk insert) is a reusable lazy building block worth its own note.
+</NoteToSelf>

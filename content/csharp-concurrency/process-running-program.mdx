@@ -1,0 +1,89 @@
+---
+title: "The process: a running program as its own virtual computer"
+date: 2026-10-12
+status: written
+minutes: 14
+order: 6
+lead: 'A process is what the operating system creates when a program starts — the four memory segments plus a share of the CPU, bundled into something that behaves like a small computer of its own. This part builds the process in full: what it contains, why it is isolated, what virtual memory and the kernel are, and exactly how many processes one program has.'
+---
+
+Part 5 laid out the four segments a program occupies in memory — code, data, stack, heap. This part puts a boundary around them and gives the whole running thing its name: a **process**. The reason processes are described as "virtual computers," why one process cannot reach into another's memory, and how many processes a single program spawns, all follow from what a process actually is. This is the last piece of Layer 1 before the call stack.
+
+## What a process is
+
+A **process is a running program** — but more precisely, it is *everything that running program needs to execute*, bundled together by the operating system:
+
+```text
+PROCESS
++-- Code segment      the instructions (Part 5)
++-- Data segment      static / global values
++-- Stack             each call's locals, grows and shrinks
++-- Heap              dynamically allocated objects
++-- a share of the CPU   (registers, program counter, while it runs)
++-- other resources   open files, network connections, etc.
+```
+
+The program on disk is passive — a file of instructions. The *process* is that program brought to life: given memory (the four segments), given time on the CPU, and given a handle on whatever OS resources it uses. "Run the program" and "create a process for it" are the same act.
+
+## Why it is called a virtual computer
+
+A real computer, reduced to essentials, is: memory to hold code and data, a CPU to execute, and a way to reach devices. Look at the process above and it has all of those — its own memory layout, its own slice of CPU time, its own set of resources. From inside, a process behaves as if it owns a whole machine.
+
+That is the sense of **virtual computer**: each process runs as though it had a computer to itself, even though many processes share the one physical machine. The operating system creates this illusion for every process, so each can be written as if nothing else is running. The two illusions that make it convincing are **its own private memory** and **its own CPU** — and both are worth unpacking, because they are the foundation for everything about isolation and, later, concurrency.
+
+## The private-memory illusion: virtual memory
+
+Here is something that surprises people: when Part 5 talked about a program being loaded at "address 40," that address is not a real physical location in the RAM chips. Each process is given its **own private address space** — a complete range of addresses starting, as far as the process can tell, from zero — that is *its alone*. This is **virtual memory**.
+
+```text
+Process A sees:   addresses 0, 1, 2, ...  (its own private space)
+Process B sees:   addresses 0, 1, 2, ...  (a different private space)
+
+                  the operating system + hardware map each process's
+                  virtual addresses to different real physical cells in RAM
+```
+
+So two processes can both use "address 1000" and never collide — because each one's address 1000 is translated, by the operating system working with the CPU's memory hardware, to a *different* physical cell. A process cannot even express an address in another process's space; the addresses it uses are private by construction.
+
+This is why the "virtual computer" is virtual: the memory each process sees is a private, idealised view, not the raw physical RAM. The translation from a process's virtual address to a real physical address happens on every memory access, fast, in hardware — invisible to the running code.
+
+> **This is the mechanical reason processes are isolated.** A process cannot read or corrupt another process's memory not because of a politeness rule, but because it has no way to *name* that memory — its addresses resolve only within its own private space. Isolation is built into the addressing. (This matters again in Layer 3: because processes are isolated like this, sharing data between them is hard, whereas threads inside *one* process share the same space and can share data easily.)
+
+## The private-CPU illusion: a share of execution
+
+The second illusion is the CPU. A process is written as though it has a processor running its instructions start to finish. In reality, as Layer 3 will detail, the operating system gives each process the CPU for a short slice of time, then takes it away and gives it to another, switching fast enough that each process appears to run continuously.
+
+For now the point is only that the process *includes* this notion of "being executed" — its own program counter position, its own register values while it runs. When the process is not currently on the CPU, that execution state is saved and restored later, so from the process's point of view it never stopped. (The mechanism — context switching and the process control block — is Part 9.)
+
+## What runs the process: the kernel
+
+The thing creating these processes, allocating their memory, mapping their virtual addresses, and handing out CPU time is the **operating system** — and specifically its core, the **kernel**. The kernel is the central part of the OS that is always loaded in memory and has full control of the hardware. It is the authority that:
+
+- creates a process when a program is launched, and allocates its memory;
+- maintains the virtual-to-physical address mapping for each process;
+- decides which process (later: which thread) gets the CPU and when;
+- mediates access to hardware and resources (files, network, devices).
+
+A process, by contrast, runs in a restricted mode and cannot touch hardware directly — when it needs something only the kernel can do (read a file, allocate more memory), it *asks* the kernel. That request mechanism is a **system call**, and it becomes central in Layer 3 when I/O enters the picture. For now: the kernel is the manager; processes are the managed.
+
+## How many processes does one program have?
+
+Now the direct question, answered precisely.
+
+**Normally: exactly one.** Launching a program creates a single process. The `.exe` on disk becomes one running process with one set of the four segments and one private address space. Running the same program twice creates two *separate* processes — two independent virtual computers, each with its own isolated memory — even though they came from the same file.
+
+**A program can create more, but only deliberately.** A process can ask the kernel to start *another* program, which becomes its own separate process (for example, a build tool launching a compiler, or a browser running each tab in its own process for isolation). But this is an explicit act of starting a new program — it does not happen on its own, and the new process is fully isolated from the first, with its own private memory.
+
+So the rule to hold: **one running program is one process by default; more processes mean more programs were deliberately started.** This is the ceiling that the *next* idea breaks through — because a single process, as the next layer shows, can do many things at once not by spawning more processes but by running multiple **threads** inside its one shared memory. The reason that is preferable (threads share the process's memory and are cheap to switch between, whereas processes are isolated and expensive) comes straight from the isolation and virtual-memory facts built in this part.
+
+## The .NET angle
+
+For a .NET program, this all holds exactly, with the runtime layered on top. When a .NET application starts, the OS creates **one process**, and inside that process the .NET runtime (the CLR from Part 4) is loaded: it JIT-compiles IL to machine code into the process's code region, manages the process's heap via the garbage collector (Part 8), and runs the program. So a running .NET app is: one OS process, one private address space, with the CLR and the application's code and data living inside it. Everything built in this part — segments, virtual memory, isolation, the single process — describes a .NET program as faithfully as any other; .NET simply adds its runtime as a resident inside that one process.
+
+## The one idea to hold onto
+
+> A **process** is a running program bundled with everything it needs: the four memory segments, a share of the CPU, and its OS resources — which is why it is called a **virtual computer**. Two illusions make it one: **virtual memory** gives each process a private address space (so a process literally cannot name another's memory — that is why processes are isolated), and a **share of CPU time** makes it seem to run continuously. The **kernel** creates and manages processes and hands out the CPU. One running program is **one process** by default; more processes come only from deliberately starting more programs.
+
+## What comes next
+
+The process is the boundary; inside it, the stack segment is where execution actually unfolds call by call. **Part 7** zooms into that stack to follow a single method call in full detail — how a stack frame is built from the return address, the saved base pointer, the parameters, and the locals; how the stack and base pointers move as calls nest and return; and how a variable is found by its offset from the base pointer. It is the most mechanical part of the whole path, and the one that makes "a thread is executing code" concrete.

@@ -1,0 +1,113 @@
+---
+title: "Context switching and the process control block: one CPU, many programs"
+date: 2026-10-12
+status: written
+minutes: 14
+order: 9
+lead: 'Part 3 left a puzzle: the program counter points at one instruction, so how do several programs run at once? This part answers it — the operating system runs one program for a slice of time, saves its entire register state into a process control block, loads another''s saved state, and continues it, switching fast enough to look simultaneous. That mechanism is the foundation for threads, concurrency, and async.'
+---
+
+This opens Layer 3 — doing more than one thing at once — and it starts by paying off a debt from Part 3. There it was clear that the CPU runs one loop: fetch the instruction the program counter points at, execute it, advance. One program counter, one instruction at a time. Yet a computer plainly runs many programs at once — a browser, an editor, music, background services. Part 6 called this an "illusion" of a private CPU per process and promised the mechanism later. This is later. The mechanism is **context switching**, bookkept by the **process control block**, and once it is clear, everything about threads and async in the rest of the path is built from it.
+
+## The puzzle, stated exactly
+
+A single CPU core has one set of the registers from Part 2: one program counter, one stack pointer, one set of general-purpose registers. At any instant it is executing exactly one stream of instructions — the one its program counter points into. So strictly, **one core can only run one thing at a time.**
+
+```text
+one core  =  one program counter  =  one instruction stream at a time
+```
+
+And yet three programs appear to run together. The old, naive answer — run program 1 to completion, then program 2, then program 3 — is clearly wrong: a music player and an editor obviously make progress *together*, not one-after-another-to-the-end. So something else is happening.
+
+## The idea: run a little, switch, run a little
+
+The resolution rests on a number from Part 3: a modern CPU runs on the order of a *billion* instructions a second. A human perceives changes down to maybe a hundredth of a second. In that gap lives the trick.
+
+The operating system does **not** run one program to completion. It runs program 1 for a tiny slice of time — a few milliseconds, millions of instructions — then *stops* it, runs program 2 for a slice, then program 3, then back to 1, and so on, round and round.
+
+```text
+time ->
+
+core:  [ prog 1 ][ prog 2 ][ prog 3 ][ prog 1 ][ prog 2 ] ...
+         slice     slice     slice     slice     slice
+```
+
+Each slice is far too short to notice, and the switches happen so fast that all three *appear* to run continuously and simultaneously. They are not — on one core, only one runs at any instant — but taking rapid turns creates the illusion of together. Stopping one program and starting another is a **context switch**.
+
+## The hard part: how to stop and resume cleanly
+
+Switching sounds simple until the detail bites: when the OS stops program 1 mid-stream to run program 2, program 1 was *in the middle of something*. Its program counter was partway through its code. Its registers held half-finished values. Its stack and base pointers framed a particular call (Part 7).
+
+If the OS just lets program 2 start using the registers, all of program 1's state is **overwritten and lost** — and when program 1 resumes, it would have no idea where it was or what it was doing. So the switch cannot simply hand the CPU over. It must first **save every bit of program 1's state**, and later **restore it exactly**, so that program 1 resumes as if it had never been interrupted.
+
+What exactly has to be saved? The CPU's registers *are* the program's live execution state (Part 7 made this precise):
+
+```text
+must be saved to pause a program cleanly:
+   program counter   (which instruction was next)
+   stack pointer     (top of its stack)
+   base pointer      (its current frame)
+   general-purpose registers (its in-flight values)
+   ... and other CPU state
+```
+
+Save all of that somewhere, and program 1 can be frozen perfectly. Restore it later, and it thaws exactly where it stopped. The place that state is saved is the process control block.
+
+## The process control block
+
+The **process control block (PCB)** is a record the operating system keeps for **each process**, holding everything needed to pause and resume it. Among other things, it stores that process's **saved register state** (program counter, stack and base pointers, general-purpose registers — the full set above) along with identifying and management information.
+
+```text
+PCB for a process holds:
+   process id (PID)        which process this is
+   saved register state    PC, SP, BP, general-purpose regs, ...  (its frozen CPU state)
+   memory info             where its segments / address space are
+   resource info           open files, etc.
+   state                   running / ready / waiting
+   ... more
+```
+
+The OS keeps one PCB per process. A context switch is then, precisely:
+
+1. **Save** the current process's register state into *its* PCB (freeze it).
+2. **Choose** the next process to run (the scheduler decides — more in Part 10).
+3. **Load** that process's saved register state from *its* PCB back into the CPU's registers (thaw it).
+4. The CPU now continues the second process exactly where it left off, because its program counter and all its registers were restored.
+
+```text
+      PCB(prog 1)                 CPU                 PCB(prog 2)
+          |                        |                       |
+  save -> | <-- registers ---------|                       |
+          |                        |-------- registers --> | (overwritten)
+          |                        | <------ registers ----| restore
+          |                        |                       |
+                            now running prog 2
+```
+
+So the single set of physical registers is *time-shared*: whichever process is running has its state loaded into the real registers; every paused process has its state parked in its PCB, waiting to be reloaded. The PCB is what makes the "private CPU" illusion of Part 6 real — each process keeps its own complete CPU state, even though they take turns on one physical CPU.
+
+## This is concurrency
+
+The effect of all this switching has a name: **concurrency** — *handling* many things by interleaving them, making progress on each in turn, so they appear to run together even though, on a single core, only one runs at any instant.
+
+> **The precise distinction to carry forward.** Concurrency is about *dealing with* many things at once — structuring the system so multiple programs (later: tasks) are all in progress, taking turns. It is not the same as doing them literally simultaneously, which requires multiple cores and is *parallelism* (Part 10). On one core, the music player and the editor run *concurrently* — rapidly interleaved — not in parallel. The brain reads the fast interleaving as simultaneous, but it is turns, not true overlap.
+
+## The cost of switching
+
+Context switching is not free, and naming the cost matters for later. Every switch does real work: saving one process's registers to its PCB, choosing the next, loading that one's registers. That bookkeeping takes time during which *no useful program work happens* — it is pure overhead.
+
+A rough illustration: if two tasks need 10 ms and 2 ms of actual work, running them with no switching takes 12 ms. If switching between them repeatedly costs, say, 3 ms of overhead in total, the same work now takes 15 ms. The switching bought *responsiveness* (both tasks make progress together) at the price of total throughput. Whether that trade is worth it depends on the goal, which is why operating systems use careful **scheduling** strategies to decide who runs, for how long, and when to switch — a large topic this path only needs to know exists.
+
+This cost is also exactly why the *next* idea matters: switching between **processes** is relatively expensive, because a process's full state (and its isolated memory, Part 6) must be swapped. **Threads**, coming in Part 11, share a process's memory and carry less state, so switching between them is cheaper — one of the main reasons threads, not processes, are how a single program does many things at once.
+
+## The .NET angle
+
+None of this is .NET-specific — context switching and PCBs are the operating system's job, beneath any runtime. A .NET process is switched on and off the CPU by the OS exactly like any other process, its register state saved to and restored from its PCB. What this sets up for .NET is the layer above: once the OS can interleave *threads* (Part 11) this same way, .NET's thread pool, `Task`, and `async` are all built on top of the OS's ability to pause and resume execution — the ability this part just explained at its root.
+
+## The one idea to hold onto
+
+> One CPU core has one set of registers, so it runs **one instruction stream at a time**. Many programs appear to run together because the OS runs each for a tiny slice, then performs a **context switch**: it **saves** the running process's entire register state (program counter, stack and base pointers, general-purpose registers) into that process's **process control block (PCB)**, loads another process's saved state from its PCB, and continues it exactly where it stopped. Switching fast enough looks simultaneous — that interleaving is **concurrency** (handling many things by taking turns), and it costs real overhead per switch.
+
+## What comes next
+
+Context switching makes *one* core juggle many programs. But real machines have *several* cores — so some work really can happen at the same instant. **Part 10** draws the line between **concurrency** (handling many things by interleaving on a core) and **parallelism** (doing many things at once on multiple cores): what a core and a logical processor are, when switching is needed versus when true simultaneous execution replaces it, and the warning that the word "thread" means something different to CPU hardware than to the operating system — the exact ambiguity that confuses people right before threads are defined properly in Part 11.

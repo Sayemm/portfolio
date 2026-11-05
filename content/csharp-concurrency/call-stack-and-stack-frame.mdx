@@ -1,0 +1,126 @@
+---
+title: "The call stack and stack frames: how a method call actually works"
+date: 2026-10-12
+status: written
+minutes: 15
+order: 7
+lead: 'The stack segment is where execution actually unfolds, one method call at a time. This part is the most mechanical of the path: how calling a method pushes a stack frame built from the return address, the saved base pointer, the parameters, and the locals; how the stack and base pointers move as calls nest and return; and how a variable is found by its offset from the base pointer.'
+---
+
+Part 5 named the stack as the segment holding each method call's locals; Part 6 wrapped it in a process. This part goes all the way in. It is the most mechanical part of the whole path, and worth that detail, because "a thread executes code" only becomes concrete once it is clear what *physically happens* when one method calls another. Every idea after this — blocking, the thread pool, why each thread needs its own stack, how `async` suspends and resumes — rests on knowing how a call frame is built and torn down.
+
+## The stack is a stack
+
+The stack segment is a **stack** in the data-structure sense: things are added and removed only at one end, the top, last-in-first-out. That exactly matches how method calls nest. When `main` calls `DoWork`, and `DoWork` calls `Add`, the calls finish in reverse order — `Add` first, then `DoWork`, then `main`. The most recently started call is always the next to finish, which is precisely the stack's last-in-first-out rule.
+
+Each call gets its own chunk of the stack, called a **stack frame** (or activation record). A frame holds everything that one call needs: its parameters, its local variables, and the bookkeeping to return to whoever called it.
+
+```text
+stack (top is the most recent call):
+
+   +-----------------+
+   | frame: main     |   reserved when main started
+   +-----------------+
+   | frame: DoWork   |   reserved when main called DoWork
+   +-----------------+
+   | frame: Add      |   reserved when DoWork called Add   <- top
+   +-----------------+
+```
+
+Two registers from Part 2 manage this: the **stack pointer (SP)** marks the current top of the stack, and the **base pointer (BP)** marks a fixed spot inside the *current* frame, used to locate that frame's contents. As calls push and pop, these two move. Watching them move is the whole lesson.
+
+## What goes into a frame when a method is called
+
+When a method is called, a new frame is built on top of the stack. Conceptually it is assembled from four things, in this order:
+
+```text
+a new frame, from bottom to top:
+
+   parameters         the values passed in
+   return address     where to resume in the CALLER after this returns
+   saved base pointer  the caller's BP, so it can be restored on return
+   local variables    this method's own locals
+```
+
+- **Parameters** — the arguments the caller passed. They are placed where the called method can find them.
+- **Return address** — the address of the instruction *in the caller* to jump back to when this method finishes. This is how execution knows where to resume: it is the program counter value to restore (Part 3 — a call is just the program counter being set to the method's code, and the return address is how it gets set back).
+- **Saved base pointer** — the *caller's* base pointer value, stashed so it can be put back when this frame is removed. Without saving it, the caller would lose track of its own frame.
+- **Local variables** — space for the variables declared inside this method.
+
+Once the frame is built, the base pointer is set to point into this new frame (so the method can find its own things), and the stack pointer sits at the top of it.
+
+## Finding a variable: offsets from the base pointer
+
+Here is why the base pointer exists. Once it is fixed at a known spot in the current frame, everything in that frame can be reached as a **fixed offset from the base pointer** — a few cells above it, a few below. Parameters sit on one side of the base pointer; local variables on the other.
+
+```text
+            higher addresses
+   | parameter 2     |   BP + something
+   | parameter 1     |   BP + something
+   | return address  |
+   | saved BP        |   <- BP points here
+   | local 1         |   BP - something
+   | local 2         |   BP - something   <- SP (top) during this call
+            lower addresses
+```
+
+So when the method uses a local variable or a parameter, the machine instruction does not need a separate lookup — it computes the address as "base pointer plus (or minus) a known offset" and reads or writes directly. The base pointer is the *anchor*; the stack pointer is the *moving top*. This is the concrete mechanism behind "a method has its own local variables": they are cells at known offsets from this frame's base pointer.
+
+## Walking a call, step by step
+
+Make it concrete with three methods. `main` has a local `a`; it calls `DoWork`, which calls `Add(x, y)`, which computes a result and returns it.
+
+**Before the call to Add.** The `DoWork` frame is on top. Its base pointer anchors it; the stack pointer is at its top.
+
+```text
+| frame: main    |
+| frame: DoWork  |  <- BP anchors here, SP at top
+```
+
+**Calling Add(1, 4).** A new frame is pushed for `Add`:
+
+```text
+| frame: main    |
+| frame: DoWork  |
+| frame: Add     |  parameters x=1, y=4
+|                |  return address (back into DoWork)
+|                |  saved BP (DoWork's BP)
+|                |  local: result     <- BP now anchors Add's frame, SP at top
+```
+
+The stack pointer moved up to make room; the base pointer was repointed to anchor `Add`'s frame; `DoWork`'s base pointer was saved inside the frame first. Inside `Add`, `x` and `y` are found as offsets from the (new) base pointer, and `result` likewise.
+
+**Returning from Add.** `Add` computes `result = x + y = 5` and returns it. Teardown is the build in reverse:
+
+- the return value is handed back to the caller (conceptually, placed where `DoWork` expects it);
+- the base pointer is restored to the saved value — `DoWork`'s base pointer — so `DoWork` can find its own frame again;
+- the stack pointer drops back down, releasing `Add`'s frame;
+- execution jumps to the return address — back into `DoWork` exactly where it left off.
+
+```text
+| frame: main    |
+| frame: DoWork  |  <- BP restored here, SP back at its top
+```
+
+`Add`'s frame is simply gone — the stack pointer moving down *is* the deallocation. No cleanup work, no searching: lowering the top releases everything above it instantly. That is why stack memory is so cheap and automatic, the point Part 5 promised and Part 8 will contrast with the heap.
+
+## Why this makes stack memory fast and bounded
+
+Two consequences fall straight out of the mechanism:
+
+- **Allocation and deallocation are nearly free.** Reserving a frame is "move the stack pointer up"; releasing it is "move the stack pointer down." No bookkeeping of what is free, no search — just a register changing. This is why locals and value types, which live here, cost almost nothing to create.
+- **The stack is finite, and deep nesting can exhaust it.** Each call adds a frame; the stack has a fixed size (Part 11 gives the .NET figure). A method that calls itself without stopping piles frame on frame until the stack runs out of room — the error **stack overflow**. It is literally the stack pointer running past the end of the stack segment.
+
+> **This frame machinery is exactly what a thread carries.** A thread is a path of execution (Part 6 hinted at it; Part 11 defines it), and *its* position in a program is captured by its stack of frames plus its register values — above all the program counter (where it is in the code) and the stack and base pointers (which frame it is in). This is why, in Layer 3, each thread needs its **own** stack: two threads running different methods at the same time each need their own tower of frames. And it is why suspending and resuming execution — what the OS does when switching, and what `async` does at an `await` — comes down to saving and restoring these: the stack and these registers *are* the execution's position.
+
+## The .NET angle, briefly
+
+In .NET the JIT-produced machine code (Part 4) uses the stack exactly as described — frames with parameters, return addresses, saved pointers, and locals, managed by the stack and base pointers. The one addition from earlier notes: **value types and method locals live in the frame on the stack, while objects created with `new` live on the heap** and the frame holds only a reference to them. So a method's frame may contain some values directly and some references pointing off to heap objects — the split that Part 8 takes up in full. The frame mechanics themselves are the same ones every compiled language uses.
+
+## The one idea to hold onto
+
+> Each method call gets a **stack frame** holding its parameters, a **return address** (where to resume in the caller), the **saved base pointer** (the caller's, to restore on return), and its **local variables**. The **base pointer** anchors the current frame so its contents are reached by fixed offsets; the **stack pointer** marks the moving top. Calling pushes a frame and repoints the base pointer; returning restores the saved base pointer, drops the stack pointer (instantly releasing the frame), and jumps to the return address. This makes stack memory nearly free but finite, and this stack-of-frames plus the registers is exactly what captures where a thread is in its execution.
+
+## What comes next
+
+The stack is now fully understood — but it holds only part of a program's data. **Part 8** completes the memory picture by contrasting the **stack with the heap** in .NET terms: value types versus reference types, which lives where and why, how a reference on the stack points to an object on the heap, and what the garbage collector does for heap memory that the stack pointer does automatically for frames. That closes Layer 2, after which Layer 3 turns to running more than one of these at once.

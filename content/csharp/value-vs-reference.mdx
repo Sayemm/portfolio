@@ -9,6 +9,27 @@ lead: 'Value type or reference type is not really "stack vs heap". It is what ge
 
 ## Value types vs reference types
 
+Every type in C# sits on one side of a single split, and each side divides again into what the framework already gives you and what you declare yourself:
+
+<Diagram title="Every C# type is one of these">
+  <DiagramRow>
+    <DiagramNode title=".NET types" sub="every type lands on one side" />
+  </DiagramRow>
+  <DiagramArrow down />
+  <DiagramRow>
+    <DiagramNode title="Value types" sub="copies the data" />
+    <DiagramNode title="Reference types" sub="copies the reference" />
+  </DiagramRow>
+  <DiagramRow>
+    <DiagramNode title="Predefined" items="int, double, bool, char, decimal" />
+    <DiagramNode title="Predefined" items="string, array, delegate, object" />
+  </DiagramRow>
+  <DiagramRow>
+    <DiagramNode title="User-defined" items="struct, enum, record struct" />
+    <DiagramNode title="User-defined" items="class, interface, record class" />
+  </DiagramRow>
+</Diagram>
+
 - `value type:` int, double, bool, DateTime, any struct, any enum, Guid
     - A value-type variable holds the data itself. Assignment copies the data.
 - `reference type:` any class, string, arrays, delegates, interface, record class

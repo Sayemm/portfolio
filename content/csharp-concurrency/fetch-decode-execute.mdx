@@ -1,0 +1,82 @@
+---
+title: "The fetch-decode-execute cycle: the one loop a CPU runs"
+date: 2026-10-12
+status: written
+minutes: 11
+order: 3
+lead: 'Parts 1 and 2 named the pieces — memory, the control unit, the ALU, and the registers. This part sets them in motion, following a single instruction from start to finish: fetch it, decode it, execute it, advance. That one loop, repeated billions of times a second, is the whole of what a CPU does.'
+---
+
+Everything is named now: memory as numbered cells (Part 1), and inside the CPU the control unit, the ALU, and the registers (Part 2). This part is where they move. A CPU does exactly one thing, over and over — it runs a tiny loop called the **fetch-decode-execute cycle**. Once that loop is clear, "the CPU executes a program" stops being a phrase and becomes a mechanism.
+
+## The loop, in four steps
+
+For every single instruction, the CPU does the same four things in order:
+
+```text
+1. FETCH    control unit reads the instruction at the address in the PC,
+            and loads it into the instruction register (IR)
+2. DECODE   control unit works out what that instruction means
+3. EXECUTE  control unit directs the ALU and registers to carry it out
+4. ADVANCE  the PC moves to the next instruction, and the loop repeats
+```
+
+That is the entire cycle. The program counter (PC) says *where* the next instruction is, the instruction register (IR) holds the one *currently* being worked on, and the control unit drives the whole thing. Nothing about it changes from instruction to instruction — the CPU just spins this loop, forever, while powered on.
+
+## Walking one instruction through
+
+Take a concrete instruction: *add the number 3 and the number 5*. Suppose it sits at address 40 in memory, and the program counter currently holds 40.
+
+**Fetch.** The control unit looks at the program counter (40), goes to memory cell 40, reads the instruction stored there, and copies it into the instruction register. The instruction is now inside the CPU, ready to be understood.
+
+```text
+PC = 40  ->  control unit reads memory[40]  ->  IR = "add 3 and 5"
+```
+
+**Decode.** The control unit inspects the instruction register and works out what the instruction is asking for: an addition, with operands 3 and 5. Decoding is just interpreting the bits into "which operation, on which values."
+
+**Execute.** The control unit places the operands into registers — say 3 into one general-purpose register and 5 into another — and tells the ALU to add them. The ALU produces 8, which lands in a register.
+
+```text
+reg A = 3,  reg B = 5  ->  ALU adds  ->  result reg = 8
+```
+
+**Advance.** The control unit increases the program counter so it points at the *next* instruction. Then the loop starts over: fetch whatever the program counter now points at.
+
+```text
+PC = 40  ->  PC = 41   (next instruction)   ->  back to FETCH
+```
+
+That is one full turn of the cycle. A real program is thousands or millions of instructions, and the CPU runs this loop once per instruction, in order, top to bottom.
+
+## "Advance" is the whole secret of control flow
+
+The fourth step looks trivial, but it is where every bit of control flow lives. Normally "advance" just moves the program counter to the next instruction in sequence. But some instructions *change the program counter to a different address* instead:
+
+- A **jump** or a **loop** sets the program counter back to an earlier address, so execution repeats a block.
+- An **if/branch** sets the program counter to one address or another depending on a comparison the ALU made.
+- A **method call** sets the program counter to the address where that method's code begins (and, as Part 7 will show, saves where to come back to).
+
+So there is no separate "control flow engine." Loops, conditionals, and method calls are all just *the program counter being set to a chosen address* instead of the next one in line. Everything a program does, at this level, is the CPU fetching from wherever the program counter points — and instructions occasionally redirecting that pointer.
+
+> **This is why the program counter mattered so much in Part 2.** "The CPU is running this code" means "the program counter is pointing into this code." Later, when the operating system switches between programs or threads, what it physically does is save and restore the program counter (among other registers). Control of the machine *is* control of the program counter.
+
+## How fast this goes, and why the speed gap returns
+
+The CPU runs this loop at the pace of its **clock** — a signal that ticks billions of times a second (a few gigahertz). Each tick drives the cycle forward, so a modern CPU runs on the order of *billions of instructions per second*. The steps are tiny, but there are a staggering number of them.
+
+This is where the speed gap from Part 1 comes back into focus. If the CPU can run billions of these cycles a second, then anything that makes it *stop and wait* is enormously wasteful by comparison. Reaching into RAM is already slow relative to the clock; reaching out to a disk or a network is slower still — millions of cycles' worth of waiting. Holding that contrast in mind now makes the later I/O and async parts land: the whole problem async solves is "this incredibly fast loop is sitting idle, waiting on something slow."
+
+## Nothing here is C#-specific — and that is the point
+
+This cycle is the same on every machine, running any language. It does not know about C#, Go, objects, or methods — it only knows "fetch the instruction at the program counter, decode it, execute it, advance." The job of a language and its runtime is to turn human-written code into a long, correct sequence of these tiny instructions.
+
+That handoff is the next part. The CPU described across Parts 1–3 is the *target*; C# is the *source*. Part 4 shows how C# is turned into the machine instructions this loop runs — and why .NET puts an extra step (IL and a just-in-time compiler) between the two, where a language like Go does not.
+
+## The one idea to hold onto
+
+> A CPU runs one loop, forever: **fetch** the instruction at the address in the program counter into the instruction register, **decode** what it means, **execute** it by directing the ALU and registers, then **advance** the program counter and repeat. Normal execution advances to the next instruction; loops, ifs, and calls work by *setting the program counter to a different address* instead. The loop runs billions of times a second, which is exactly why making it wait on slow things is the problem later parts solve.
+
+## What comes next
+
+The machine is fully built: memory, the CPU's parts, and the cycle that drives them. **Part 4** crosses from hardware to software — how a C# program becomes the machine instructions this cycle runs. It covers the .NET pipeline (C# compiled to IL, then turned into machine code by the just-in-time compiler at run time), what IL is and why it exists, and how this differs from an ahead-of-time compiled language. From there, Part 5 follows a compiled program as it is loaded into memory to run.

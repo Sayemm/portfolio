@@ -1,0 +1,94 @@
+---
+title: "Concurrency versus parallelism: taking turns versus truly at once"
+date: 2026-10-13
+status: written
+minutes: 13
+order: 10
+lead: 'Context switching makes one core juggle many programs by taking turns. But real machines have several cores, so some work really can happen at the same instant. This part draws the line between concurrency (handling many things by interleaving) and parallelism (doing many things at once on multiple cores), explains cores and logical processors, and clears up the word "thread" meaning two different things.'
+---
+
+Part 9 showed how *one* core creates the appearance of many programs running together — by context switching, taking rapid turns. But a modern CPU has *several* cores, and that changes the picture: with more than one core, several instruction streams can genuinely run **at the same instant**, not just take turns. The distinction between those two situations — taking turns versus truly simultaneous — is **concurrency versus parallelism**, and getting it precise here prevents a great deal of confusion once threads and async arrive.
+
+## One core recap, then the new fact
+
+From Part 9: a single core has one set of registers and runs one instruction stream at a time. Many programs on one core *appear* simultaneous only because the OS interleaves them with context switches. On one core, nothing is ever truly running at the same instant.
+
+The new fact: a CPU has multiple **cores**, and each core is a full, independent execution unit — its own control unit, ALU, and register set (Part 2). So each core can run its own instruction stream, genuinely in parallel with the others.
+
+```text
+single-core CPU:   one execution unit  -> one stream at a time (turns only)
+
+multi-core CPU:    Core 1  -> stream A  |
+                   Core 2  -> stream B  |  all at the same instant
+                   Core 3  -> stream C  |
+                   Core 4  -> stream D  |
+```
+
+With four cores, four instruction streams can advance *at the same moment* — real simultaneity, no illusion. That is the capability concurrency alone never had.
+
+## The two words, defined
+
+Now the pair, stated as cleanly as possible:
+
+- **Concurrency is *handling* many things at once** — structuring the system so multiple tasks are all in progress, making progress in turns. It is about *dealing with* multiplicity. It works on a single core (via context switching) and does not require more than one.
+- **Parallelism is *doing* many things at once** — multiple tasks literally executing at the same instant, which *requires* multiple cores (or execution units). It is about *simultaneous execution*.
+
+```text
+Concurrency (handling)              Parallelism (doing)
+- many tasks in progress            - many tasks executing at the same instant
+- interleaved by taking turns       - genuinely simultaneous
+- works on one core                 - needs multiple cores
+- an illusion of "together"         - actually together
+```
+
+The one-line test: **concurrency is about structure (many things underway); parallelism is about execution (many things at the exact same moment).** A single-core machine can be concurrent but never parallel. A multi-core machine can be both — and usually is, running some streams truly in parallel while still context-switching when there are more streams than cores.
+
+A kitchen analogy earns its place here only because it is exact: one cook juggling three dishes — chopping one, then stirring another, then checking the oven — is *concurrency* (one worker, taking turns, all three dishes progressing). Three cooks each on their own dish is *parallelism* (three workers, truly at once). More dishes than cooks, and each cook goes back to juggling — concurrency returns on top of parallelism.
+
+## When switching is needed, and when it is not
+
+Cores change the calculus from Part 9. If there are enough cores for the work, context switching is not needed at all — each task gets its own core and simply runs:
+
+```text
+3 tasks, 4 cores   -> each task on its own core, no switching   (pure parallelism)
+4 tasks, 4 cores   -> one per core, no switching                (pure parallelism)
+7 tasks, 4 cores   -> 4 run in parallel; the other 3 wait and
+                      are interleaved onto cores as they free up (parallelism + concurrency)
+```
+
+So with fewer tasks than cores, the operating system spreads them across cores and they run in parallel, paying none of the context-switch cost. When tasks outnumber cores, the extra ones take turns on the busy cores — concurrency layers back on top. As tasks finish and cores free up, waiting tasks move onto them and parallelism resumes. The OS continually mixes the two depending on how many runnable streams there are versus how many cores exist.
+
+This is also where Part 9's cost note lands concretely: parallelism avoids the context-switch overhead (no save/restore when a task has a core to itself), while concurrency pays it (the price of sharing a core). Neither is "better" — they solve different shortages. Parallelism needs *spare cores*; concurrency makes progress when cores are *scarce*.
+
+## The word "thread" means two different things
+
+A trap waits right before Part 11, and naming it now prevents the confusion later. The word **thread** is used for two different things:
+
+- **A hardware "thread" (a logical processor).** Many CPUs use a technique (Intel calls it Hyper-Threading) that makes one physical core present itself as **two logical processors**, so the operating system can schedule two instruction streams on it and keep the core busier. CPU makers call each of these logical processors a "thread." So a 4-core chip may advertise "8 threads" — meaning 8 logical processors, 2 per core.
+
+```text
+CPU with 4 cores, Hyper-Threading:
+   Core 1 -> logical processor 1, logical processor 2
+   Core 2 -> logical processor 3, logical processor 4
+   Core 3 -> logical processor 5, logical processor 6
+   Core 4 -> logical processor 7, logical processor 8
+   = "4 cores, 8 threads"  (hardware sense of "thread")
+```
+
+- **An operating-system thread (the software kind).** The thread this path actually cares about — a path of execution inside a process that the OS schedules. This is defined properly in Part 11, and it is a *software* concept, unrelated to the hardware count above.
+
+The two are easy to conflate because both are called "thread" and both relate to running instruction streams, but they live at different levels: a **logical processor** is a hardware execution slot (how many streams the chip can run at once); an **OS thread** is a software unit of execution the OS places onto those slots. One is "how many lanes the highway has"; the other is "a car driving on it." When the rest of this path says "thread," it means the *software* kind — the OS thread.
+
+> **A flagged simplification.** A logical processor is not a full second core — the two logical processors on one physical core share that core's actual execution hardware, so two streams on one core via Hyper-Threading run somewhat faster than taking strict turns but not as fast as two separate cores. The precise performance behaviour is out of scope; what matters for this path is only the vocabulary clash: "thread" the hardware term (logical processor) is a different thing from "thread" the OS term defined next.
+
+## The .NET angle
+
+For a .NET program, this all sits underneath the runtime. .NET code does not choose cores or logical processors — it creates *OS threads* (and, higher up, tasks), and the operating system decides which core or logical processor each runs on, and when to context-switch. So from .NET, the relevant knobs are the software kind (threads, tasks, async), and whether the work ends up truly parallel depends on how many cores the machine has and what else is running. A CPU-bound job split across threads can run in real parallel on a multi-core machine; the same job on a single core would merely be concurrent. Part 15's CPU-bound-versus-I/O-bound distinction builds directly on this.
+
+## The one idea to hold onto
+
+> **Concurrency** is *handling* many things by interleaving them — taking turns on a core via context switching, an illusion of together that works even on one core. **Parallelism** is *doing* many things at the same instant, which needs **multiple cores**, each a full execution unit. Fewer tasks than cores run in parallel with no switching cost; more tasks than cores fall back to concurrency on top of parallelism. Beware the word **thread**: a hardware "thread" is a **logical processor** (an execution slot on the chip), while an **OS thread** (the one this path means) is a software unit of execution the OS schedules onto those slots.
+
+## What comes next
+
+Everything so far has talked about scheduling whole *processes*. But a single program usually does many things at once without starting new programs — a server handling many requests, a music player updating the time while playing audio. It does that with **threads**. **Part 11** defines the OS thread properly at last: the real unit of execution the OS schedules; how one process runs many threads; why each thread needs its **own stack** but shares the process's **heap**; why thread switching is cheaper than process switching; and how this is the direct foundation for .NET's thread pool, `Task`, and `async`.

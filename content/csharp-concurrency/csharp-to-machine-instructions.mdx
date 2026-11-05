@@ -1,0 +1,101 @@
+---
+title: "From C# to machine instructions: IL, the JIT, and why .NET has them"
+date: 2026-10-12
+status: written
+minutes: 12
+order: 4
+lead: 'The CPU runs tiny machine instructions (Parts 1 to 3), but nobody writes those by hand. This part crosses from hardware to software: how C# becomes machine instructions, what IL and the just-in-time compiler are, why .NET puts that extra layer in the middle, and how that differs from a language like Go that compiles straight to a native binary.'
+---
+
+Layer 0 built the machine: memory, the CPU's parts, and the fetch-decode-execute loop that runs machine instructions. But machine instructions are not what gets written — C# gets written. This part is the bridge: how source code becomes the tiny instructions that loop runs, and why .NET does it in two stages instead of one.
+
+## The gap to cross
+
+The CPU understands exactly one thing: **machine instructions** — raw numbers encoding "add these registers," "jump to this address," and so on (Part 3). C# is nothing like that. It is human-readable text with classes, methods, and types. Something has to translate one into the other.
+
+```text
+C# source text   -->   ???   -->   machine instructions the CPU runs
+```
+
+Filling in that middle is the job of a **compiler** (and, in .NET, a runtime). The surprising part for most people is that .NET fills it in with *two* steps, not one, and the reason for the split is worth understanding because it shapes how a .NET program runs.
+
+## The one-step model: ahead-of-time compilation
+
+The simplest model is what a language like Go, C, or Rust does: compile the source **straight to native machine instructions**, ahead of time, into an executable file on disk.
+
+```text
+Go source  --( go build, ahead of time )-->  native binary on disk  -->  OS runs it directly
+```
+
+The output is a file full of machine instructions for *one specific kind of CPU and operating system*. Running it means the OS loads those ready-made instructions into memory and the CPU executes them — no further translation. This is **ahead-of-time (AOT) compilation**: all the translation happens once, before the program ever runs.
+
+It is fast to start (nothing left to translate) but the binary is tied to the target it was built for — a build for a 64-bit Windows machine is not the same file as a build for an ARM Mac.
+
+## The .NET model: two steps, IL in the middle
+
+.NET does not compile C# straight to machine instructions. It compiles to an intermediate step first:
+
+```text
+C# source  --( C# compiler )-->  IL  --( JIT, at run time )-->  machine instructions  -->  CPU
+```
+
+**Step 1, at build time: C# becomes IL.** The C# compiler does not produce machine instructions. It produces **IL** — Intermediate Language (also called CIL or MSIL). IL is a compact, CPU-independent instruction set: a halfway language, lower-level than C# but not tied to any particular processor. The compiled output on disk — a `.dll` or `.exe` — contains IL, not native machine code.
+
+**Step 2, at run time: IL becomes machine instructions.** When the program runs, the .NET runtime's **JIT** — the **just-in-time** compiler — translates the IL into native machine instructions for *the actual machine it is running on*, right then, as methods are about to execute. Those freshly produced machine instructions are what the fetch-decode-execute loop from Part 3 runs.
+
+So there are two compilers: the C# compiler (C# to IL, ahead of time) and the JIT (IL to machine code, at run time).
+
+## Why the extra layer exists
+
+Adding a whole intermediate language and a run-time compiler seems like more work, not less. It buys three things:
+
+- **One build runs on many machines.** Because the shipped file is IL, not machine code for one processor, the *same* compiled DLL can run on a 64-bit Windows server, an ARM Mac, or a Linux container — each machine's JIT turns the IL into the right native instructions for that machine. The "which CPU and OS" decision is deferred to run time instead of baked in at build time.
+- **One runtime for many languages.** C#, F#, and VB all compile to the same IL. The runtime only has to understand IL, so it supports every language that targets it without knowing anything about their syntax. "The .NET runtime runs IL" is why these languages interoperate so cleanly.
+- **The JIT can optimise for the real hardware.** Because translation happens on the machine that will actually run the code, the JIT can tailor the machine instructions to that specific processor's capabilities — something an ahead-of-time build for a generic target cannot do as precisely.
+
+The cost is a small start-up delay the first time each method runs (the JIT has to translate it), which is why .NET also offers an ahead-of-time option (covered only in passing here) for scenarios where fast start-up matters more than these benefits.
+
+## What IL looks like, briefly
+
+IL is not meant to be written by hand, but seeing that it is *real, inspectable instructions* helps make it concrete. A trivial method:
+
+```csharp
+int Add(int a, int b)
+{
+    return a + b;
+}
+```
+
+compiles to IL that, in spirit, reads like this:
+
+```text
+load argument a        (push a onto a small evaluation stack)
+load argument b        (push b)
+add                    (pop both, add, push the result)
+return                 (return the value on top)
+```
+
+That is lower-level than C# (no `+` operator as such — an explicit `add` instruction, an explicit load of each argument) but still CPU-independent: it says *what* to do, not *which processor's* add instruction to use. The JIT is what turns that `add` into the real machine instruction the ALU executes (Part 2).
+
+> **This connects back to the registers and the cycle.** The IL `add` eventually becomes a machine instruction that the control unit fetches and the ALU runs (Parts 2 and 3). The IL is a portable description; the JIT is the translator that produces the actual register-and-ALU instructions for the machine in hand. Two languages, same destination: the fetch-decode-execute loop.
+
+## The pieces, named
+
+Pulling the vocabulary together, since these names recur everywhere in .NET:
+
+```text
+C# compiler   turns C# source into IL, at build time
+IL            CPU-independent intermediate instructions (in the .dll / .exe on disk)
+CLR / runtime the .NET runtime that loads and runs IL
+JIT           the just-in-time compiler inside the runtime; IL -> machine code at run time
+```
+
+(The runtime — the CLR, Common Language Runtime — does more than host the JIT: it also manages memory and the garbage collector, which Part 8 reaches. For now its relevant job is "the thing that runs IL and JIT-compiles it.")
+
+## The one idea to hold onto
+
+> The CPU runs machine instructions, but C# is compiled in **two** stages, not one. At build time the **C# compiler** turns source into **IL** — compact, CPU-independent instructions stored in the `.dll` or `.exe`. At run time the **JIT** (just-in-time compiler) inside the .NET runtime turns that IL into **native machine instructions** for the actual machine, which the fetch-decode-execute loop then runs. The IL layer is why one build runs on many machines and many languages share one runtime — the "which CPU" decision is deferred to run time, unlike an ahead-of-time language that compiles straight to a native binary.
+
+## What comes next
+
+There is now a stream of machine instructions ready to run. **Part 5** follows what happens when a compiled program is actually started: the operating system allocates memory and lays the program out in **segments** — code, data, stack, and heap — and loads it in. Knowing what goes in each segment is the groundwork for the process (Part 6) and, after that, the call stack (Part 7), where the stack and base pointers from Part 2 finally go to work.

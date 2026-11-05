@@ -29,11 +29,16 @@ export function Diagram({
 /** A row of nodes and arrows. Becomes a column below `mid`. */
 export function DiagramRow({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex flex-col items-stretch gap-3 mid:flex-row mid:items-center">
+    // `items-stretch`, not `items-center`: centring offsets the tops of boxes
+    // whose contents differ in height, which reads as a broken grid when rows
+    // are stacked into a tree. Arrows centre their own glyph, so stretching
+    // them is harmless.
+    <div className="flex flex-col items-stretch gap-3 mid:flex-row mid:items-stretch">
       {children}
     </div>
   );
 }
+
 
 export function DiagramNode({
   title,

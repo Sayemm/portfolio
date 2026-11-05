@@ -1,0 +1,82 @@
+---
+title: "Loading a program into memory: the four segments"
+date: 2026-10-12
+status: written
+minutes: 11
+order: 5
+lead: 'When a program starts, the operating system lays it out in memory as four distinct regions — code, data, stack, and heap — each holding a different kind of thing. This part builds those four segments, what lives in each, and why they are kept separate, as the groundwork for the process and the call stack that follow.'
+---
+
+Part 4 produced a stream of machine instructions ready to run. But instructions sitting in a file do nothing — to run, the program must be **loaded into memory** (Part 1: the CPU only works on data in RAM). This part is about *how* it is laid out there: not one undifferentiated blob, but four separate regions, each with a specific job. Those four regions are the vocabulary the process (Part 6) and the call stack (Part 7) are built from.
+
+## Starting a program: the OS lays it out
+
+When a compiled program is launched, the operating system takes over: it allocates a region of memory for the program and copies the program's parts into it, arranged into **segments**. A segment is just a named area of memory reserved for one kind of content.
+
+```text
+program on disk  --( OS loads it )-->  memory, arranged in segments:
+
+   +-------------------+
+   | Code segment      |   the instructions
+   +-------------------+
+   | Data segment      |   static / global values
+   +-------------------+
+   | Heap              |   dynamically allocated objects (grows as needed)
+   +-------------------+
+   | Stack             |   function calls and their local variables
+   +-------------------+
+```
+
+Four segments, four different kinds of thing. The rest of this part is what each one holds and why the separation matters.
+
+## Code segment: the instructions
+
+The **code segment** holds the program's machine instructions — the ones the fetch-decode-execute loop runs (Part 3). When Part 3 said "the program counter points at the next instruction," the address it points at lives *here*, in the code segment.
+
+Its defining trait: it is fixed and read-only while the program runs. The instructions do not change as the program executes — only *which* instruction is being run changes, as the program counter moves through this segment. (In .NET this is the JIT-produced machine code from Part 4, placed in memory as methods are compiled.)
+
+## Data segment: static and global values
+
+The **data segment** holds values that exist for the whole life of the program and are not tied to any particular function call — static fields and global constants. They are set up when the program loads and stay put at fixed addresses until it ends.
+
+In C# terms, this is where `static` fields and string literals and similar long-lived, program-wide values conceptually live. The key contrast with the next two segments: data-segment values are *permanent for the run* and *one copy for the whole program*, whereas stack and heap contents come and go.
+
+## Stack: function calls and their locals
+
+The **stack** is the busy, constantly-changing region. Every time a method is called, a chunk of the stack is reserved for *that call* — its parameters, its local variables, and the bookkeeping needed to return. When the method finishes, that chunk is released. So the stack grows as calls nest deeper and shrinks as they return.
+
+```text
+stack while three methods are nested:
+
+   main()        <- reserved when main was called
+   DoWork()      <- reserved when main called DoWork
+   Add()         <- reserved when DoWork called Add  (top)
+```
+
+This is where the **stack pointer** and **base pointer** from Part 2 do their work — tracking the current call's chunk. The full mechanics (what exactly goes in each chunk, how the pointers move) are Part 7; the point here is just that the stack is *per-call, temporary, and ordered* — last call in is the first to finish and be removed.
+
+## Heap: dynamically allocated objects
+
+The **heap** is the region for things whose size or lifetime is not known in advance and does not follow the tidy call-in-call-out pattern of the stack. When a program creates an object at run time — something whose existence outlives the single method that made it, or whose size is decided while running — it goes on the heap.
+
+In C# terms, this is where objects created with `new` (reference types) live. The reference *to* the object may sit on the stack (inside a method's chunk), but the object itself sits on the heap. The heap grows as more is allocated, and because its contents do not simply disappear when a method returns, it needs separate management to reclaim unused space — which in .NET is the garbage collector (Part 8).
+
+> **Stack versus heap, in one contrast (full treatment in Part 8).** The stack is automatic and ordered: a method's chunk is reserved on call and released on return, no thought required. The heap is flexible but unmanaged by that simple rule: objects persist until nothing refers to them, so something has to clean up. That difference — tidy-and-automatic versus flexible-and-needs-collecting — is the whole reason both regions exist, and the reason C# splits data into value types (stack-friendly) and reference types (heap objects), covered in Part 8.
+
+## Why keep them separate at all
+
+Four segments instead of one pile of memory is a deliberate design, for a few reasons worth naming:
+
+- **Different lifetimes.** Code lives for the whole run; static data likewise; a stack chunk lives only for one call; a heap object lives until nothing references it. Grouping by lifetime lets each region be managed in the way that fits it.
+- **Different access rules.** The code segment can be marked read-only (instructions should never be overwritten), while the stack and heap must be writable. Separation makes those protections possible.
+- **Different growth patterns.** The stack grows and shrinks in a strict last-in-first-out rhythm; the heap grows and shrinks unpredictably. Keeping them apart lets each grow without colliding with the other's pattern.
+
+The payoff of this whole part is a precise answer to "where does a running program's stuff live": instructions in **code**, program-wide values in **data**, each call's locals in the **stack**, and dynamically created objects in the **heap**.
+
+## The one idea to hold onto
+
+> A program does nothing on disk; to run, the OS loads it into memory as four **segments**. **Code** holds the instructions the CPU runs. **Data** holds static and global values that last the whole program. The **stack** holds each method call's parameters and locals, reserved on call and released on return, tracked by the stack and base pointers. The **heap** holds dynamically created objects (`new` in C#) that outlive a single call and need separate cleanup. They are kept separate because they differ in lifetime, access rules, and growth.
+
+## What comes next
+
+These four segments plus a share of the CPU are, together, everything a running program needs — and that bundle has a name. **Part 6** is the **process**: why a running program is described as a "virtual computer," what the operating system creates when a program starts, why processes are isolated from one another, and the answer to how many processes one program has. After that, Part 7 zooms into the stack segment to follow a method call frame by frame.

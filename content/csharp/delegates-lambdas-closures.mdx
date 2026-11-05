@@ -1,0 +1,164 @@
+---
+title: "Delegates, lambdas, and closures"
+date: 2026-10-11
+status: written
+minutes: 11
+order: 7
+lead: 'Every arrow expression handed to Where last week was a delegate — a method stored in a variable. Func and Action are just the delegate types LINQ accepts. Naming them makes LINQ stop being magic, and makes an async continuation finally mean something concrete: a method handed forward to run later.'
+---
+
+## A delegate is a variable that holds a method
+
+The one sentence to anchor everything: **a delegate is a variable that holds a method.** Just as `int x = 5` stores a number, a delegate stores *a reference to a method* — so a method can be passed around, stored, and called later, like any other value.
+
+That is genuinely new. Until now, data went into variables and methods *acted on* data. A delegate lets a **method itself** be the data. Declaring one by hand makes the mechanism visible before the shortcuts hide it:
+
+```csharp
+// 1. Declare a delegate TYPE — "a method that takes two ints and returns an int"
+delegate int MathOp(int a, int b);
+
+// 2. Two ordinary methods matching that shape
+static int Add(int a, int b) => a + b;
+static int Multiply(int a, int b) => a * b;
+
+// 3. Store a method in a delegate variable, then call through it
+MathOp op = Add;              // assign the METHOD — no parentheses, not calling it
+Console.WriteLine(op(3, 4));  // 7
+
+op = Multiply;                // point the SAME variable at a different method
+Console.WriteLine(op(3, 4));  // 12
+```
+
+Same call site `op(3, 4)`, different behaviour, because `op` now holds a different method. Note `op = Add` with **no parentheses**: that stores the method itself. `Add` is the value; `Add(3, 4)` would be *calling* it. That distinction is the whole concept — a delegate variable *is* a method that can be reassigned. The delegate *type* `MathOp` is a contract: "any method shaped `(int, int) -> int` fits here."
+
+## Func, Action, Predicate — the delegates we have been using
+
+Declaring a custom `delegate` type for every shape would be tedious, so .NET ships three families that cover almost everything — and **these are the types all over LINQ**:
+
+- **`Func<...>`** — a method that **returns** a value. The *last* type parameter is the return type: `Func<int, int, int>` is `(int, int) -> int`; `Func<Shift, bool>` is `(Shift) -> bool`.
+- **`Action<...>`** — a method that returns **nothing** (void): `Action<string>` is `(string) -> void`.
+- **`Predicate<T>`** — a method returning `bool`: really just `Func<T, bool>` with a friendlier name.
+
+The same code with no custom type needed:
+
+```csharp
+record Shift(string Employee, double Hours);
+
+Func<int, int, int> op = Add;             // (int,int) -> int
+Console.WriteLine(op(3, 4));              // 7
+
+Action<string> log = Console.WriteLine;   // (string) -> void
+log("shift created");
+
+Func<Shift, bool> isOvertime = s => s.Hours > 8;   // look familiar?
+Console.WriteLine(isOvertime(new Shift("Rahim", 9)));   // True
+```
+
+Look at that last line: `Func<Shift, bool>` holding `s => s.Hours > 8`. **That is exactly what `Where` takes.** Every `shifts.Where(s => s.Hours > 8)` last week was handing `Where` a `Func<Shift, bool>` — a method. LINQ was never magic; it is methods that *accept other methods as arguments*.
+
+## Lambdas — the arrow was a method all along
+
+So what *is* `s => s.Hours > 8`? A **lambda** — an anonymous method written inline, no name. These two are identical:
+
+```csharp
+// named method
+static bool IsLong(Shift s) { return s.Hours > 8; }
+Func<Shift, bool> a = IsLong;
+
+// lambda — the same method, written inline
+Func<Shift, bool> b = s => s.Hours > 8;
+```
+
+Left of `=>` are the **parameters** (`s`); right of `=>` is the **body**. Type inference knows `s` is a `Shift` because the `Func<Shift, bool>` on the left says so — which is why the type never had to be written inside LINQ. Two body forms:
+
+```csharp
+Func<Shift, bool> expr = s => s.Hours > 8;     // expression body — implicit return
+Func<Shift, string> block = s =>               // block body — explicit return, multiple lines
+{
+    var tag = s.Hours > 8 ? "OT" : "normal";
+    return $"{s.Employee}: {tag}";
+};
+Action<Shift> noReturn = s => Console.WriteLine(s.Employee);   // Action — no return
+```
+
+So `s => s.Hours > 8`, stated as a type, is a **delegate instance** — a `Func<Shift, bool>`. Passing it to `Where` hands over **an object that holds a method**: not a value, not a bare method, but a method wrapped as a callable object.
+
+## Closures — capturing the variable, not the value
+
+A lambda can use variables from the surrounding scope, not just its own parameters. When it does, it "closes over" them — a **closure**:
+
+```csharp
+double threshold = 8;
+Func<Shift, bool> isOvertime = s => s.Hours > threshold;   // captures 'threshold'
+
+Console.WriteLine(isOvertime(new Shift("A", 9)));   // True  (9 > 8)
+
+threshold = 10;                                      // change it AFTER building the lambda
+Console.WriteLine(isOvertime(new Shift("A", 9)));   // False (9 > 10)
+```
+
+The surprise on the last line is the whole point: the lambda did not copy `threshold`'s *value* (8) when it was created — it captured the *variable itself*. When `threshold` became 10, the lambda saw the new value. **A closure captures the variable, not the value** — a live link to the outer variable, not a snapshot.
+
+That sets up the classic C# bug. A `for` loop counter is a **single** variable for the whole loop, so every closure captures the *same* one:
+
+```csharp
+var actions = new List<Action>();
+for (int i = 0; i < 3; i++)
+    actions.Add(() => Console.WriteLine(i));   // all three capture the SAME i
+
+foreach (var a in actions) a();   // prints 3 3 3 — the loop finished with i == 3
+```
+
+This still prints **3 3 3** today, on .NET 8 — the `for` counter was never changed, because it genuinely is one variable mutated across iterations. The fix is to copy into a fresh loop-local, so each closure captures its own:
+
+```csharp
+for (int i = 0; i < 3; i++)
+{
+    int copy = i;                                // a new variable each iteration
+    actions.Add(() => Console.WriteLine(copy));  // each closure captures its own copy
+}
+// prints 0 1 2
+```
+
+<NoteToSelf>
+The one correction that trips everyone: C# 5 fixed the **`foreach`** version (each iteration now gets a fresh variable, so capturing it prints `0 1 2`). It did **not** fix the **`for`** loop — a captured `for` counter still prints `3 3 3` on current .NET. Rule to keep: the moment a captured variable keeps changing — a loop counter, a field mutated elsewhere, a counter captured inside a `Task.Run` — a live reference is being shared, not a snapshot. In async and background work this is a real, current bug. When in doubt, capture a local copy.
+</NoteToSelf>
+
+## Behaviour as data: a tiny rules engine
+
+The delegate superpower is storing *behaviour* in a collection and running it later. A validation pipeline is a list of rules, each a `Func<Shift, string?>` returning an error message or `null`:
+
+```csharp
+var rules = new List<Func<Shift, string?>>
+{
+    s => s.Hours <= 0  ? "Hours must be positive" : null,
+    s => s.Hours > 16  ? "Shift too long (>16h)"  : null,
+    s => s.Employee is "" ? "Employee required"   : null,
+};
+
+IEnumerable<string> Validate(Shift s) =>
+    rules.Select(r => r(s)).Where(m => m is not null)!;   // run every rule, keep the failures
+```
+
+Each rule is a method stored in a list; `Validate` runs them all and collects the non-null messages. Adding a rule is adding a list element — no `if`-ladder to edit. This exact shape is how validation pipelines and request middleware are built: a list of steps, each a delegate, executed in turn.
+
+## Why this matters — delegates connect LINQ and async
+
+Two payoffs that make the whole month cohere.
+
+**LINQ, demystified.** `Where`'s real signature now reads plainly:
+
+```csharp
+public static IEnumerable<T> Where<T>(this IEnumerable<T> source, Func<T, bool> predicate)
+```
+
+`predicate` is a delegate the caller supplies; `Where` calls *that* method on each item. Every operator learned last week is a method with a `Func<>` parameter. LINQ is "methods that take methods," full stop.
+
+**Async, demystified.** Async splits a method at `await` and runs the rest as a *continuation*. A continuation **is a delegate** — the remaining code packaged as a callable and handed to the `Task` to run when the result arrives. "Run this later, when the await completes" is literally "here is a delegate, call it when done." The floor (async) was learned before the foundation (delegates); now the foundation is underneath it, and *continuation* means something concrete — the same "method as a value" idea, pointed at the future.
+
+<NoteToSelf>
+Use-cases to cash in later:
+- **A list of `Func`/`Action` is the shape of a middleware pipeline** — each step a delegate, run in order. Returns in the ASP.NET Core request-pipeline work.
+- **An async continuation is a delegate handed to a `Task`** — the concrete meaning of the word used all through the async article.
+- **Events are the next step from here** — an event is, underneath, a *list of delegates* that all get called. "A method is a value we can store and call" becomes "a method is something we can *subscribe* with." That is tomorrow.
+</NoteToSelf>

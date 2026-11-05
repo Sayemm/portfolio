@@ -1,0 +1,146 @@
+---
+title: "Stack versus heap in .NET: value types, reference types, and the GC"
+date: 2026-10-12
+status: written
+minutes: 14
+order: 8
+lead: 'The stack holds each call''s frame (Part 7), but a program''s objects do not all fit that tidy rhythm. This part completes the memory picture: which data lives on the stack and which on the heap, why value types and reference types split along that line, how a reference on the stack points to an object on the heap, and what the garbage collector does for the heap that the stack pointer does automatically for frames.'
+---
+
+Part 7 showed the stack in full: frames pushed and popped, variables found by offset, memory released by lowering a pointer. But that tidy last-in-first-out rhythm only fits data whose lifetime matches a single call. Plenty of data does not — an object that outlives the method that made it, or whose size is decided at run time. That data goes on the **heap**. This part contrasts the two regions, maps them onto C#'s value types and reference types, and explains the garbage collector that manages the heap. It closes Layer 2 — the complete picture of where a program's data lives — before Layer 3 runs many of these at once.
+
+## Why two regions, recalled
+
+The stack is fast and automatic *because* it is rigid: a frame is reserved on call and released on return, by moving one pointer (Part 7). That rigidity is also its limit. Two kinds of data break it:
+
+- Data that must **outlive the call that created it.** If a method makes something and returns it for later use, it cannot live in that method's frame — the frame vanishes on return.
+- Data whose **size or amount is decided at run time.** A frame's layout is fixed when the method is compiled; something whose size is only known while running does not fit a fixed slot.
+
+The **heap** exists for exactly these. It trades the stack's automatic cleanup for flexibility: things can be allocated in any order, live as long as needed, and be any size — but *because* they do not follow the call-in-call-out rule, releasing them cannot be "move a pointer." Something has to decide when each heap object is no longer needed. That something, in .NET, is the garbage collector.
+
+```text
+STACK                                  HEAP
+- frames, one per call                 - objects, allocated any time
+- fixed layout, known at compile time  - size/lifetime decided at run time
+- released by lowering the SP (free)    - released by the garbage collector
+- last-in-first-out, automatic          - any order, needs management
+```
+
+## Value types live on the stack; reference types live on the heap
+
+This is where C#'s two categories of type map directly onto the two regions.
+
+A **value type** (`int`, `double`, `bool`, `char`, a `struct`, an `enum`) *is* its value. When it is a method's local or parameter, it lives **directly in the stack frame** — the cell at an offset from the base pointer (Part 7) holds the actual number or struct.
+
+```csharp
+int a = 10;        // the value 10 sits directly in the frame
+bool done = true;  // the value true sits directly in the frame
+```
+
+A **reference type** (`class`, `string`, arrays, most things created with `new`) is different. The **object itself lives on the heap**, and what sits in the stack frame is a **reference** — in effect, the heap address where the object lives. The variable in the frame does not hold the object; it holds a way to *find* the object.
+
+```csharp
+var customer = new Customer();   // the Customer object is on the HEAP
+                                 // the variable `customer` (on the stack)
+                                 // holds a reference to it
+```
+
+So the same `new` that creates the object also produces a reference, and that reference is the value stored in the frame.
+
+```text
+   STACK (a method's frame)              HEAP
+   +----------------------+              +--------------------+
+   | a       = 10         |  value       |                    |
+   | done    = true       |  value       |  Customer object   |
+   | customer --------------- reference ->|  (name, id, ...)   |
+   +----------------------+              +--------------------+
+```
+
+This single picture answers a lot: why assigning one `int` to another copies the value (two independent cells), while assigning one `customer` to another copies the *reference* (two cells pointing at the *same* heap object). It is the value-versus-reference distinction, now grounded in *where each physically sits*.
+
+## A reference is just a controlled address
+
+A reference should feel familiar: Part 1 said memory is numbered cells, Part 7 said the base pointer is an address into the stack. A **reference is an address too** — specifically, the heap address of an object — but a *managed, safe* one. C# does not let arbitrary arithmetic be done on it the way a raw pointer allows; it can be followed to reach the object, compared, or set to `null`, and that is about it. The safety is what lets the runtime move objects around (it can, during collection) without breaking references — it updates them. But underneath the safety, a reference is the same idea as every pointer in this series: a cell holding the address of something elsewhere.
+
+That is also why a reference-type variable can be `null`: `null` is simply "this reference points at no object" — an address of nothing. A value type cannot normally be `null`, because it *is* the value, with nowhere to put an "empty" state.
+
+## What the garbage collector does
+
+On the stack, releasing memory is automatic and instant: the stack pointer drops and the frame is gone (Part 7). The heap has no such pointer to lower, because objects are freed in no particular order and may be referenced from many places. So .NET runs a **garbage collector (GC)** — part of the runtime (the CLR, Part 4) — whose job is to find heap objects that are no longer reachable and reclaim their space.
+
+The core idea is **reachability**. An object is still needed if it can be reached by following references starting from the live parts of the program — the stack frames, static fields, and so on (the "roots"). If nothing reachable refers to an object any more, it is garbage, and its memory can be reused.
+
+```text
+roots (stack frames, statics)
+   |
+   | references
+   v
+reachable objects   ... kept
+unreachable objects ... collected (memory reclaimed)
+```
+
+Periodically the GC walks from the roots, marks everything reachable, and frees the rest. The program does not call "delete" — it simply stops referencing an object (the variable goes out of scope, or is reassigned), and eventually the GC notices and reclaims it. This is why C# has no manual `free`: reachability plus the collector replace it.
+
+> **The cost, named honestly (a flagged simplification).** The GC is not free — collecting can briefly pause parts of the program while it works, and real .NET uses a more sophisticated scheme than "walk everything every time" (generations, so short-lived objects are collected cheaply and often, long-lived ones rarely). The reachability model above is the accurate *mental* model; the generational machinery is an optimisation on top of it, out of scope here. What matters for this path: heap memory is reclaimed automatically by a collector, not by the instant pointer-drop that frees stack frames.
+
+## If the frame holds the reference, does the object die when the frame pops?
+
+This is the natural worry once the picture above is clear: the object is on the heap, but the reference to it is in the stack frame — so when the frame pops and that reference vanishes, is the object lost? And if it is, how could any object outlive the method that made it? The resolution is the heart of reachability, and worth pinning down before moving on.
+
+The key correction: an object lives as long as **any** reachable reference points to it — not specifically the one in the frame that created it. The creating frame is not special; it is just one of possibly many places a reference can live. So there are two cases.
+
+**Case 1 — that frame held the *only* reference.** When the frame pops, nothing points to the object any more. It is now unreachable — which is exactly what makes it garbage, and the GC will reclaim it. This is correct, not a loss: an object nothing can reach is useless, so losing the last reference is precisely how an object is freed in .NET.
+
+```csharp
+void DoWork()
+{
+    var c = new Customer();   // object on heap, reference `c` in this frame
+    // use c ...
+}   // frame pops -> `c` gone -> nothing references the Customer -> it becomes garbage
+```
+
+That `Customer` was meant to die with the method; nothing else wanted it, so reclaiming it is right.
+
+**Case 2 — a reference escaped to somewhere longer-lived.** If a reference to the object was copied to a place that outlives the frame, the object survives, because it is still reachable through *that* reference. The most common way is returning it:
+
+```csharp
+Customer DoWork()
+{
+    var c = new Customer();   // object on heap, reference `c` in DoWork's frame
+    return c;                 // the reference value is COPIED back to the caller
+}
+
+var saved = DoWork();         // `saved` (caller's frame) now references the SAME object
+```
+
+When `DoWork` returns, the reference value is copied into the caller's frame (`saved`). So when `DoWork`'s frame pops and its `c` disappears, the object is still referenced by `saved` in the still-alive caller frame — still reachable, so the GC keeps it. The object outlived its creating frame because a reference to it escaped to a longer-lived place. The other escape routes are the same idea: a reference stored in a field of a live object (a list, a property), assigned to a `static` field (a root that lives for the whole program), or captured by a closure that outlives the method.
+
+A way to hold it: the object sits on the heap, and references are the strings tethering it to the living program. It survives as long as at least one string still connects it to something reachable — a frame, a static, another live object. Cut the last string and it floats free, and the GC collects it.
+
+```text
+heap object  <--- reference in DoWork's frame   (cut when that frame pops)
+             <--- reference in `saved`           (still tethered here)
+             <--- reference in a static field
+
+last string cut -> unreachable -> garbage -> collected
+any string remains -> reachable -> kept
+```
+
+This is exactly why .NET frees by **reachability** rather than "free it when the creating method returns": the runtime cannot release an object just because one frame popped, since other references might exist. It asks the real question — *can anything still reach this object?* — and keeps it if so, regardless of whose frame created it. So losing a reference never loses *needed* data; it only lets go of an object once the last way to reach it is gone.
+
+## Why this split exists at all
+
+Pulling it together, the stack/heap split and the value/reference split are two views of one design:
+
+- Things that are **small, short-lived, and fit a call's lifetime** go on the **stack** as **value types** — fast, automatic, no collection cost.
+- Things that are **larger, shared, or outlive a call** go on the **heap** as **reference types** — flexible, but managed by the GC.
+
+C# exposes the choice: a `struct` is a value type (stack-friendly), a `class` is a reference type (heap object). Choosing between them is, underneath, choosing which region's trade-offs fit the data — the exact reasoning the .NET fundamentals notes frame as "value types versus reference types," now resting on the physical memory model.
+
+## The one idea to hold onto
+
+> The **stack** holds data that fits a single call's lifetime — **value types** (`int`, `struct`, ...) live directly in the frame and vanish when it pops. The **heap** holds data that outlives a call or whose size is run-time-decided — **reference-type objects** (`class`, created with `new`) live here, and the stack frame holds only a **reference** (a managed heap address) to them. The stack frees memory instantly by lowering the stack pointer; the heap is freed by the **garbage collector**, which reclaims objects no longer **reachable** from the program's roots. Value-vs-reference is really a question of which region's trade-offs the data needs.
+
+## What comes next
+
+Layer 2 is complete: the full memory picture of a running program, stack and heap. **Part 9 opens Layer 3 — doing more than one thing.** It returns to a puzzle raised back in Part 3: the program counter points at one instruction, so how do several programs run at once? The answer is **context switching** and the **process control block** — the OS saving a process's entire register state, switching to another, and restoring the first later. That is the mechanism that turns one CPU into the appearance of many, and the foundation for threads, concurrency, and eventually async.
