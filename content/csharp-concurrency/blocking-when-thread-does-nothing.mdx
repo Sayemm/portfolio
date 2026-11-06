@@ -1,0 +1,157 @@
+---
+title: "Blocking: when a thread waits and does nothing"
+date: 2026-11-05
+status: written
+minutes: 14
+order: 13
+lead: 'Don''t block the thread is heard constantly, and Part 12 already showed it — Join made the main thread wait. This part explains blocking plainly: what it is, why a thread blocks, how the block is removed, why a blocked thread is wasteful, and the common misconception that async works by handing the task to another thread. It does not — and clearing that up is the point.'
+---
+
+Part 12 ended with a thread doing nothing: `t.Join()` made the main thread **wait** until the worker finished. That waiting state is **blocking**, and "do not block the thread" is advice heard constantly in C#. This part is what it means, built up plainly — because the whole reason the thread pool (next part) and `async` (later) exist is to avoid the waste that blocking creates.
+
+## What blocking is
+
+A **blocked** thread is one that is **stuck waiting** — it cannot continue its work until something else happens, so it sits there, alive but doing nothing. It reached a point in its code where it needs a result that is not ready yet, and it has no choice but to wait for it.
+
+The clearest way to see it is `Thread.Sleep`, which blocks the current thread for a set time:
+
+```csharp
+Console.WriteLine("before");
+Thread.Sleep(3000);               // this thread BLOCKS here for 3 seconds, doing nothing
+Console.WriteLine("after (3 seconds later)");
+```
+
+For those three seconds, the thread is frozen on that line. It is not computing anything, not moving forward — just parked, waiting for the time to pass. That is blocking: a thread that has stopped and is waiting.
+
+An important clarification right away: a blocked thread is **not** busy spinning in a loop burning CPU. It is **parked** — in the Blocked state from Part 12 — and the scheduler simply does not give it a core while it is blocked. So a blocked thread uses *no* CPU. But it is not free either: it still holds its roughly 1 MB of stack (Part 11) and, crucially, it is **unavailable** to do any other work. It is a worker standing idle, taking up space, until its wait ends.
+
+## Why a thread blocks
+
+A thread blocks when it hits an operation that **cannot finish immediately and whose result it needs to continue**. There are three common causes, all of which appeared or were hinted at already:
+
+- **Waiting for another thread** — `t.Join()` (Part 12): the caller cannot continue until `t` finishes, so it blocks.
+- **Waiting for a lock** — when two threads must not touch shared data at once (Part 11's race conditions), one waits while the other holds the lock. The waiting one blocks until the lock is free.
+- **Waiting for I/O** — reading a file, querying a database, calling a network API. The data is not there yet; the thread blocks until it arrives. This is the big one, because I/O is *slow* (Part 1).
+
+In every case the thread has reached a line it cannot get past, and the thing it is waiting on is outside its control. So rather than let it sit on a core doing nothing, the operating system moves it to the **Blocked** state and hands the core to a different thread that *can* do work (context switching, Part 9). The blocked thread steps aside until its wait is over.
+
+A small correction to a common way of phrasing this: it is not that "the program needs to do something else, so it leaves the thread." It is that *the thread itself* has nothing it can do — its next step depends on a result that has not arrived — so it must wait, and the OS uses the freed core for other threads in the meantime. The thread does not choose to leave; it is stuck, and the OS makes use of the idle core.
+
+## How the block is removed
+
+A blocked thread does not stay blocked forever — it unblocks when **the thing it was waiting for happens**. Then it moves back through the states from Part 12:
+
+```text
+Running  --(hits a wait: I/O, a lock, Join)-->  Blocked   parked, no CPU, still holds its stack
+Blocked  --(the awaited thing completes)----->  Ready     able to run again, waiting for a core
+Ready    --(scheduler gives it a core)------->  Running   resumes exactly where it paused
+```
+
+- The worker finishes, so a `Join` can return. The lock is released, so a waiting thread can take it. The disk delivers the data, so an I/O read can complete. Whatever the thread was waiting for occurs.
+- The OS then marks the thread **Ready** — it can run again.
+- The scheduler gives it a core, and it resumes **exactly where it paused**, because its saved program counter, registers, and stack pointer (Parts 9 and 11) were preserved while it was blocked. From the thread's own point of view, it never stopped — it just called a slow operation that eventually returned.
+
+So "unblocking" is simply: the awaited event happens, and the thread is allowed to run again from where it left off. Nothing in the code has to poll or check; the OS wakes the thread when its condition is met.
+
+## Why blocking is wasteful — the reason for all the advice
+
+If a blocked thread uses no CPU, why is "do not block the thread" such common advice? Because the *thread itself* is a scarce, expensive resource (Part 12), and a blocked thread **holds that resource while producing nothing**.
+
+Picture the server from Part 11: a limited number of worker threads, and many requests. Suppose each request reads from a database, and reads it *synchronously* — blocking its thread until the database answers:
+
+```text
+request 1 -> thread A -> blocks on the database read ... waiting ... waiting ...
+request 2 -> thread B -> blocks on the database read ... waiting ...
+request 3 -> thread C -> blocks on the database read ... waiting ...
+...
+```
+
+Now every thread is blocked, all waiting on the database. The CPU is **idle** — nobody is computing anything, everyone is waiting — yet **no thread is free to start a new request**. New requests pile up with nothing to run them, even though the machine has plenty of spare capacity. The threads are all alive, all occupying their megabyte of stack, all doing nothing but waiting.
+
+That is the waste. Blocking does not burn CPU, but it **ties up threads** — and threads are the thing in short supply. A program that blocks its threads on slow waits runs out of threads long before it runs out of CPU. This is the entire reason behind "do not block the thread": a blocked thread is a worker paid to stand still.
+
+Blocking on something *quick* (a lock held for microseconds) is minor. Blocking on something *slow* (a network or database call lasting milliseconds, during which the thread sits idle) is the expensive case — a thread wasted for a relatively long time while an external device does the real work.
+
+## The async misconception: it does not hand the task to another thread
+
+This is the confusion worth settling, because it is the natural guess and it is wrong. A common mental model of `async` is: "the task is given to *another* thread, which does the waiting, and the original thread is freed; when the other thread finishes, it returns the result." That is not how async I/O works, and seeing why makes async finally make sense.
+
+There are actually **two different ways to avoid blocking a thread**, and they are easy to confuse:
+
+- **Offloading to another thread** (for example `Task.Run`): CPU work is handed to a *different* thread while the original is freed. This is real, but notice — **a thread is still doing the work**, just a different one. For a long calculation, that is useful (it moves the work off, say, a UI thread). But it is not a free lunch: the work still occupies a thread the whole time. This fits *CPU-bound* work.
+
+- **Async I/O** (for example `await File.ReadAllTextAsync(...)`): this is the different and better case, and the one "do not block the thread" usually refers to. Here the original thread is freed **and no other thread takes over the waiting**. The waiting is done by the operating system and the hardware — *not by any thread*. When the data is ready, the OS signals it, and a thread (from the pool) picks up the rest of the method to finish it.
+
+```text
+blocking:   one thread starts the read, then WAITS on it            -> 1 thread tied up, idle
+offload:    hand the work to ANOTHER thread, free the first         -> still 1 thread tied up
+async I/O:  start the read, FREE the thread; no thread waits;
+            the OS/hardware does the waiting; a thread resumes later -> 0 threads tied up waiting
+```
+
+So the direct answer to "how is the original thread released if the task is not done yet?" — **the task not being done does not require a thread to sit on it.** For I/O, the actual work (fetching bytes from disk or network) is done by the device, not by a thread. So the thread can be released the moment it kicks off the operation; there is simply no thread *waiting* in the meantime. When the device finishes, the OS notices and arranges for a thread to run the remainder of the method. Nobody was blocked, because nobody needed to wait — the hardware waited.
+
+It is worth making that concrete, since it underpins everything: *who* does a file read or a database call, if not the thread? Only **executing instructions** is thread work (Parts 2 to 3). But the actual data transfer — pulling bytes off the disk or in from the network into RAM — is carried out by a separate piece of **hardware** (the disk or network controller), which moves the data into memory largely on its own using **DMA** (direct memory access), not by the CPU running a copy loop. The thread only *starts* the operation (hands the request to the OS) and *continues after* it (once the data is in memory); the slow middle is the device's work, and during it there is genuinely nothing for a thread to execute. The OS coordinates the two ends: it issues the request, and it handles the completion signal — an **interrupt** — that the device raises when the transfer is done. So "no thread waits during I/O" is not a trick; the slow part was never thread work to begin with. (The full mechanism — system calls, DMA, interrupts — is Part 18.)
+
+> **Where the full answer lives.** *How* the OS and hardware do the waiting without a thread (system calls, DMA, interrupts), how the method is paused and resumed (callbacks, `Task`, the `async` state machine), and how a pool thread picks up the continuation — that is the back half of this series, Parts 17 to 23. The point to carry now is only the corrected shape: async I/O does **not** move the work to another thread to wait; it frees the thread and lets the OS and hardware handle the wait, with **no thread blocked at all**. That is why it scales where blocking does not.
+
+## If the thread is freed, how does the method resume?
+
+The correction above raises an immediate, fair worry. A method's local variables normally live in its **stack frame** (Part 7), and that frame belongs to the thread — it vanishes when the thread moves on. So if the thread is freed at the `await` on, say, line 4, how can lines 5 to 10 ever run with the right locals? It sounds like freeing the thread would throw away the method's progress.
+
+The resolution is a precise distinction: **the thread is freed, but the method's state is not.** For an `async` method, the compiler does not keep the method's progress on the stack. It rewrites the method into a small **state-machine object that lives on the heap** (Part 8), and that object holds two things: *which point the method paused at* (line 4) and *all the locals it needs to continue*. So the moment the thread is released, the method's position and data are not on the abandoned stack — they are safe in a heap object that is still referenced and therefore kept (Part 8's reachability).
+
+```text
+normal method:  state lives in the STACK frame  -> gone when the thread leaves   (would be lost)
+async method:   state lives in a HEAP object    -> survives the thread leaving    (kept safe)
+```
+
+So when the I/O completes, the method needs *a* thread to run its remaining lines — and here a natural assumption needs correcting. It does **not** create a new thread, and it is **not necessarily the same thread** that started the read. It **borrows a free thread from the pool** (Part 14) — whichever is available: possibly the original thread if it is idle by then, but more often a *different* one. That thread loads the heap object, reads "paused at line 4, here are the locals," and runs lines 5 to 10 from exactly there. The method does not belong to any one thread; it belongs to its state object, so any pool thread can pick it up.
+
+```text
+lines 1-4 on thread A  ->  state saved to a HEAP object  ->  thread A released to the pool
+   ... the device does the I/O; no thread involved ...
+I/O done  ->  pool hands over SOME free thread (A, or B, or C)
+          ->  it loads the heap object (paused at line 5, with the locals)
+          ->  runs lines 5-10
+```
+
+This is the real efficiency: between starting the read and the data arriving, **no thread was tied to this method at all** — the original went off to serve other work — and resuming merely rents a pool thread for the final stretch. (Which thread it resumes on can be steered in some settings, such as resuming on a UI thread; that detail arrives with `async` in Part 21. In a Web API it is simply any free pool thread.) Nothing was lost, because the thread and the method's state are separate things — only the thread was released.
+
+## If the state is still kept, what is the point of freeing the thread?
+
+This is the sharpest question, and it is the one that makes async finally pay off. If both blocking and async keep *some* memory while waiting — a thread's stack in one case, a heap object in the other — then what is actually gained? The answer is that the two things kept are wildly different in cost:
+
+| While waiting | A blocked **thread** | An async **heap state object** |
+|---|---|---|
+| Memory held | about **1 MB** of stack | about **tens to a few hundred bytes** |
+| Scarce? | yes — a limited pool, expensive to create | no — an ordinary small heap object |
+| Ties up a worker? | **yes** — a whole thread does nothing else | **no** — it is just data sitting there |
+
+So the comparison is not "memory versus no memory." It is **a 1 MB thread plus a whole idle worker** (blocking) versus **a few hundred bytes and no worker** (async) — roughly a thousands-to-one difference in memory, and the thread itself handed back to do real work.
+
+That second point is the bigger one. The original concern was that a thread holds about a megabyte — true — but the greater cost is that a blocked thread is a **worker tied up doing nothing**, and workers come from a *limited pool*. Freeing the thread returns that scarce worker to the pool to serve someone else, while the method's progress waits cheaply as a small object on the heap (the heap is large and the GC handles small objects easily — heap bytes are not the bottleneck; threads are).
+
+The server math makes it concrete. Picture 10,000 requests all waiting on a database, with a pool of about 100 threads:
+
+```text
+blocking:  each waiting request keeps a 1 MB THREAD parked
+           -> only ~100 threads exist -> only ~100 requests can be in flight
+           -> request 101+ queue with no worker to run them   (starvation)
+           -> (10,000 waiting would need 10,000 threads = ~10 GB: impossible)
+
+async:     each waiting request keeps a ~few-hundred-byte HEAP OBJECT
+           -> the ~100 threads are freed and reused to start more requests
+           -> 10,000 waiting = a few MB of tiny objects + ~100 busy threads
+           -> all 10,000 in flight at once   (no starvation)
+```
+
+So freeing the thread is not "avoid keeping memory" — it is **swap a 1 MB idle worker for a few-hundred-byte idle note.** The tiny, plentiful thing (a heap object) is kept; the huge, scarce thing (a thread) is released back to do work. That trade — thousands of waiting operations costing a few megabytes of objects instead of impossible gigabytes of threads — is the entire reason async scales. (The heap state-machine object itself is built in detail in Parts 20 and 21, and it is the same pause-and-resume idea as the `yield` iterator state machine from the earlier notes.)
+
+## The one idea to hold onto
+
+> A **blocked** thread is stopped, waiting for something it needs — a `Join`, a lock, or (most importantly) a slow I/O operation. It uses no CPU, but it still holds its stack and, crucially, is **unavailable** for other work. It unblocks when the awaited thing completes: Blocked -> Ready -> Running, resuming exactly where it paused. Blocking is wasteful not because it burns CPU but because it **ties up a scarce thread** for nothing — so a server whose threads all block on I/O runs out of threads while the CPU sits idle. And the fix is not to hand the waiting to another thread (that still uses one): **async I/O frees the thread and lets the OS and hardware do the waiting, with no thread blocked**. Freeing the thread does not lose the method's progress — that is saved in a small **heap** state object (not on the vanishing stack), so any pool thread can resume it later. And it is worth doing because the two things are not the same size: a parked thread is ~1 MB and a scarce worker, while the saved state is a few hundred bytes and no worker — async keeps the tiny, cheap part and releases the huge, scarce one.
+
+## What comes next
+
+Blocking is wasteful because threads are scarce — which is sharpest when threads come from a limited, shared **pool**. **Part 14 is the thread pool**: the set of reusable worker threads .NET keeps ready, handing one out per piece of work and taking it back when done. With the pool in view, "a blocked thread is wasted" becomes the concrete failure called **thread-pool starvation** — the exact problem a busy Web API hits, and the one `async` is built to solve.

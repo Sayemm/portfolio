@@ -1,0 +1,142 @@
+---
+title: "Creating threads in C#, and why raw threads are rare"
+date: 2026-11-05
+status: written
+minutes: 13
+order: 12
+lead: 'Everything so far was the concept of a thread; this part is the C# that creates one. The Thread type, how to start a thread and pass it work, what thread states mean, and then the question the cost of a thread raises: if each one is expensive, is making one per task a good idea? The answer is no, which opens the thread pool.'
+---
+
+Layer 3 built the OS thread in full — a path of execution, its own stack, a shared heap, scheduled by the kernel. This part is where that concept becomes C# code: the `Thread` type, running work on it, and the states a thread moves through. It is deliberately short on API detail and long on one conclusion, because the point of meeting raw threads is to understand *why they are almost never used directly* — which is exactly what makes the thread pool (Part 13) worth having.
+
+## Creating a thread with the Thread type
+
+A thread in C# is a real OS thread (Part 11), exposed through `System.Threading.Thread`. Creating one means giving it a method to run, then starting it:
+
+```csharp
+using System.Threading;
+
+void DoWork()
+{
+    Console.WriteLine($"work running on thread {Environment.CurrentManagedThreadId}");
+}
+
+var t = new Thread(DoWork);   // create a thread, hand it the method to run
+t.Start();                    // start it: the new thread begins executing DoWork
+```
+
+Two things happen at `Start()`. The OS creates a new thread with its **own stack** (Part 11 — about 1 MB reserved), and that thread begins running `DoWork` *independently* of the thread that started it. The starting thread does not wait — it moves straight to its next line while the new thread runs `DoWork` in parallel (or interleaved, depending on cores, Part 10).
+
+`Environment.CurrentManagedThreadId` prints the id of whichever thread is currently executing — a useful tool for the whole rest of the series, because it makes "which thread is this running on?" visible. Running the snippet, the work prints a *different* thread id than the main thread.
+
+## The two threads run independently — a quick demonstration
+
+The independence is worth seeing. If the main thread starts a worker and then does its own work, both run at once:
+
+```csharp
+var t = new Thread(() =>
+{
+    for (int i = 0; i < 3; i++)
+        Console.WriteLine($"  worker: {i}  (thread {Environment.CurrentManagedThreadId})");
+});
+
+t.Start();
+
+for (int i = 0; i < 3; i++)
+    Console.WriteLine($"main: {i}  (thread {Environment.CurrentManagedThreadId})");
+```
+
+The two thread ids differ, and the two loops interleave — concrete proof that `main` and the worker are separate paths of execution running together (Part 11's whole point, now on screen). The revealing detail is that **the order changes from run to run**. The same program, run twice, can print:
+
+```text
+run 1                          run 2
+main: 0   (thread 1)           main: 0   (thread 1)
+  worker: 0 (thread 4)         main: 1   (thread 1)
+  worker: 1 (thread 4)           worker: 0 (thread 4)
+  worker: 2 (thread 4)         main: 2   (thread 1)
+main: 1   (thread 1)             worker: 1 (thread 4)
+main: 2   (thread 1)             worker: 2 (thread 4)
+```
+
+Two things are worth drawing out of this, because they are the heart of how threads behave.
+
+**The order is decided by the scheduler, not by the code.** Nothing in the program says "finish the worker, then do main." `t.Start()` does **not** make `main` wait — it sets the worker running and `main` immediately keeps going, so the two race along together. Which line prints when is then up to the OS scheduler (Part 9), and it decides slightly differently each run. In run 1 it happened to let the worker run its whole loop before returning to `main`; in run 2 it interleaved them. Neither is a rule — both are just what the scheduler produced that time. This is why concurrent output is **non-deterministic**: run it ten times and several different orderings appear.
+
+**But each thread's own lines stay in order.** Notice that `worker` always prints `0, 1, 2` and `main` always prints `0, 1, 2` — never `0, 2, 1`. That is Part 11's one-instruction-at-a-time rule: *within a single thread*, instructions run in sequence. What is unpredictable is only how the two threads' lines are **interleaved with each other**, not the order inside either thread. So a thread is always orderly on its own; concurrency only scrambles how multiple threads' steps are woven together.
+
+## Waiting for a thread to finish: Join
+
+Sometimes the starting thread must wait for the worker to complete before continuing — a real dependency (Part 11: dependencies are the program's job to enforce). `Join` does that:
+
+```csharp
+var t = new Thread(DoWork);
+t.Start();
+t.Join();                 // the starting thread BLOCKS here until t finishes
+Console.WriteLine("worker done, continuing");
+```
+
+`t.Join()` makes the calling thread wait until `t` has finished. Adding it to the demonstration above forces an order: the worker now prints `0, 1, 2` in full, and only then does `main` print `0, 1, 2` — no more interleaving. It is tempting to read that as "`main` did not run until the worker was done," but that reading hides an important point, and it is worth getting right.
+
+**The main thread ran the whole time — it is what runs the program.** It is the main thread that created the worker, called `t.Start()`, and called `t.Join()`; none of those lines could execute if the main thread were not running. What `Join` does is not stop the main thread from running — it makes the main thread **pause at that line** until the worker finishes, then continue:
+
+```text
+main thread:  create worker, t.Start()   -> worker begins running
+main thread:  t.Join()                    -> main PAUSES here (blocked), waiting for the worker
+  worker:     0, 1, 2                      -> worker runs to completion
+main thread:  (worker done) Join returns  -> main resumes
+main thread:  0, 1, 2                      -> main runs its own loop
+```
+
+So the output "worker, then main" is not the main thread failing to run — it is the main thread **running, pausing at `Join`, and resuming** after the worker is done. The distinction that makes this click: **a blocked thread is not a thread that never ran — it is a thread that ran, reached a waiting point, and is paused there, still alive.** The main thread was always present; `Join` only made it wait.
+
+One mechanical nuance, so the mental picture is exact: it is `Start()` that sets the worker running (the worker may even begin before `main` reaches `Join`), and `Join()` that makes `main` wait for it. `Join` does not "send" `main` into the worker — the worker was already started; `Join` simply parks `main` until that worker is finished. The net effect is the orderly "worker then main" output, but the mechanism is two separate things: `Start` runs the worker, `Join` blocks the caller.
+
+This is the first clear look at **blocking** — a thread stopped, doing nothing, waiting for a condition (here, the worker finishing). Part 14 examines this state closely, because a thread that is merely *waiting* is a thread doing no useful work, which is exactly the waste `async` later learns to avoid.
+
+## When a thread finishes, and when the program exits
+
+A fair question once threads are being created: when all this is over, what clears the threads and their memory? Nothing has to be freed by hand — finishing does it, at two levels.
+
+**A worker thread finishing releases its own stack.** When the worker's method returns, that thread's work is done; its state becomes *Stopped*, and the OS reclaims the roughly 1 MB of stack it reserved (Part 11) and removes it as a schedulable thread. Ending the method *is* freeing the thread — there is no separate cleanup call.
+
+**The program exiting releases everything.** When the main thread finishes and the program ends, the whole **process** is torn down (Part 6). Because each process has its own isolated address space (virtual memory, Part 6), the OS reclaims *all* of its memory in one stroke — every segment, the whole heap, every thread's stack — by simply unmapping that address space. Whatever the process still held is gone at once; even a program that leaked memory is fully cleaned up on exit, because the OS drops the entire address space regardless.
+
+So the two levels of cleanup are automatic: during the run, the garbage collector reclaims individual unreachable heap objects (Part 8); at exit, the OS reclaims *everything the process owned* by dropping its address space. A thread frees its stack by finishing; a process frees all of its memory by ending.
+
+## Thread states: what a thread is doing at any moment
+
+A thread is not always running. At any instant it is in one of a few states, and these states are the vocabulary for everything ahead (blocking, the pool, async):
+
+```text
+Unstarted  created but Start() not called yet
+Running    currently executing on a core
+Ready      able to run, waiting for the scheduler to give it a core
+Blocked    cannot run yet - waiting for something (a Join, a lock, I/O)
+Stopped    finished
+```
+
+The important trio is **Running**, **Ready**, and **Blocked**. Only one thread per core is *Running* at a time (Part 9). Many threads may be *Ready* — able to run, just waiting their turn on a core. And a *Blocked* thread is the one that matters most later: it is alive and occupying its stack, but **cannot do work** because it is waiting on something. A `Join`, a lock, or an I/O operation all put a thread into Blocked. Part 14 is entirely about this state, because a blocked thread that is just *waiting* is a thread doing nothing useful — the waste that async exists to avoid.
+
+## Why raw threads are rare: the cost
+
+Now the real lesson of this part. Creating threads with `new Thread(...)` works, but application code almost never does it, for reasons that all trace back to **a thread being expensive** (Part 11):
+
+- **Memory.** Each thread reserves its own stack — about 1 MB in .NET. A thousand threads is roughly a gigabyte of stack, most of it idle. Threads do not scale by the thousand.
+- **Creation and teardown cost.** Making an OS thread and destroying it is real work for the kernel. For a short task, the setup can cost more than the task itself.
+- **Switching overhead.** More threads than cores means more context switching (Part 9), and each switch is pure overhead.
+
+So consider a server handling thousands of short requests (Part 11's example). Creating a fresh `Thread` per request would mean constantly building and destroying threads, each reserving a megabyte of stack — enormous waste for work that lasts milliseconds. Making one thread per task is the wrong model whenever tasks are many and short.
+
+> **The problem this sets up.** Threads are necessary — they are how a program does many things at once — but they are too costly to create one-per-task. What is needed is a way to get the benefit of many threads without the cost of constantly creating and destroying them: a fixed set of threads, created once, **reused** for task after task. That is exactly the **thread pool**, and it is why raw `Thread` is rare in real code. Reaching for `new Thread(...)` is reserved for the few cases that need a dedicated, long-lived, specially-configured thread; everything else uses the pool.
+
+## The .NET angle
+
+In .NET, the direct `Thread` type is the lowest-level threading tool and the one used least in everyday code. Above it sit the abstractions the rest of this series covers — the thread pool (Part 13), and `Task` (Part 20) and `async` (Part 21) on top of that — which exist precisely so that threads can be used economically and declaratively instead of created and managed by hand. Knowing `Thread` exists and what it costs is the foundation; the higher-level tools are what real applications actually use.
+
+## The one idea to hold onto
+
+> A thread is created in C# with `new Thread(method)` and started with `Start()`; it runs the method on its own stack, independently of the caller, and `Join()` makes the caller wait (blocking) for it to finish. A thread is always in a state — **Running**, **Ready**, or **Blocked** being the ones that matter — and a *Blocked* thread is alive but doing nothing, the waste async targets. Raw threads are rarely used directly because each is **expensive** (about 1 MB of stack, plus creation and switching cost), so creating one per short task does not scale — which is exactly the problem the thread pool solves.
+
+## What comes next
+
+The cost of raw threads points straight at the fix. **Part 13 is the thread pool**: a set of worker threads the runtime creates once and reuses, handing one out to run a piece of work and taking it back when done, so short tasks do not each pay the full price of a thread. It is the model nearly all real .NET concurrency — including, soon, how a Web API runs its requests — is built on.

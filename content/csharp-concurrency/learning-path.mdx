@@ -1,78 +1,86 @@
 ---
-title: "Learning path: concurrency and async in C#, from the machine up"
-date: 2026-09-10
+title: "Learning path: how C# runs, from the machine up to async"
+date: 2026-10-12
 status: written
-minutes: 12
+minutes: 13
 order: 0
-lead: 'The full bottom-to-top path to understanding async and await in C# — starting at the CPU, its registers, and memory, through the call stack, processes, context switching, and threads, and only then reaching the thread pool, Task, and async I/O. No part uses a term before an earlier part has built it.'
+lead: 'The full bottom-to-top path to understanding async and await in C# — starting at the CPU, its registers, and memory, through the call stack, processes, context switching, and threads, then the thread pool, Task, and async I/O, and ending with a tiny real Web API that handles many requests at once. No part uses a term before an earlier part has built it.'
 ---
 
-This is the ordered path to understanding `async`/`await` in C#, built from the bottom. Async only stops feeling like magic once the layers beneath it are solid: what a CPU actually does, how memory and the call stack work, what a process and a thread really are, and how the operating system runs many of them on a few cores. Each layer below is a separate article; this index is the map.
+This is the ordered path to understanding `async`/`await` in C#, built from the bottom. Async only stops feeling like magic once the layers beneath it are solid: what a CPU actually does, how memory and the call stack work, what a process and a thread really are, how the operating system runs many of them on a few cores, and finally how a .NET web server turns incoming requests into threads. Each layer below is a separate article; this index is the map.
 
 Two rules hold across the whole path. **No forward references** — no part relies on a term an earlier part has not defined. And **no permanent black boxes** — every "the CPU just does X" or "the OS just does Y" gets opened at least once, and any simplification is flagged as one.
 
-The material spans four layers: the machine, the running program, doing more than one thing, and the C# machinery on top.
+The path runs through five layers: the machine, the running program, how a call works, doing more than one thing, and the C# concurrency machinery — the last of which includes a small, runnable Web API built from scratch so the whole thing lands in real code.
 
 ## Layer 0 — The machine
 
 Before any code, the hardware that runs it.
 
-**Part 1 — The CPU, memory, and storage.** What the three pieces are and how they relate: the CPU executes, RAM holds what is currently running, storage keeps things when powered off. Memory as a line of addressable cells. Bit width (8 / 16 / 32 / 64) and what "a 64-bit machine" means for a memory cell and a register.
+**Part 1 — The CPU, memory, and storage.** The three pieces: the CPU executes, RAM holds what is running now, storage keeps things when powered off. Memory as a line of addressable cells, and what bit width (32 / 64) means for a cell, a register, and how much memory can be addressed.
 
-**Part 2 — Inside the CPU: control unit, ALU, and registers.** The two working parts of the processing unit — the control unit (fetches and decodes) and the ALU (does arithmetic and logic). The register set as the CPU's tiny, instant scratchpad, and the ones that matter: the program counter (points at the next instruction in memory), the instruction register (holds the instruction being decoded), the stack pointer and base pointer (track the current stack frame), and the general-purpose registers.
+**Part 2 — Inside the CPU: the control unit, the ALU, and the registers.** The control unit (fetches and directs) and the ALU (calculates), and the registers — the CPU's tiny internal slots: the program counter (next instruction), the instruction register (current one), the stack and base pointers (the running function's frame), and the general-purpose registers.
 
-**Part 3 — The fetch-decode-execute cycle.** How the CPU runs a single instruction: the control unit fetches the instruction the program counter points to, loads it into the instruction register, decodes it, orders the ALU to act, stores the result, and advances the program counter to the next instruction. The whole machine is this loop, run billions of times a second on tiny steps.
+**Part 3 — The fetch-decode-execute cycle.** The one loop a CPU runs forever: fetch the instruction the program counter points at, decode it, execute it via the ALU and registers, advance the program counter. How loops, ifs, and calls are just the program counter being set to a chosen address.
 
 ## Layer 1 — From source code to a running program
 
 How C# becomes something the machine above can run.
 
-**Part 4 — From C# to machine instructions.** The compile-and-run pipeline in .NET terms: C# is compiled to IL, the runtime's JIT turns IL into machine instructions for the CPU, and those instructions are what the fetch-decode-execute loop runs. Where this differs from an ahead-of-time language like Go (which compiles straight to a native binary on disk), and why .NET has an extra runtime layer.
+**Part 4 — From C# to machine instructions: IL and the JIT.** The two-stage .NET pipeline — C# compiled to IL at build time, then the JIT turning IL into machine instructions at run time, per method — and why that extra layer exists, versus a language that compiles straight to a native binary.
 
-**Part 5 — Loading a program into memory: the four segments.** What happens when a program starts: the operating system allocates memory and lays the program out in segments — code (the instructions), data (static and global values), the stack (function calls and locals), and the heap (dynamically allocated objects). What lives in each.
+**Part 5 — Loading a program into memory: the four segments.** What the OS lays out when a program starts — code, data, stack, and heap — and what lives in each.
 
-**Part 6 — The process: a virtual computer.** A process as everything a running program needs to behave like its own small computer: its four memory segments plus a share of the CPU. What the operating system creates on launch, why processes are isolated from each other, and how many processes one program has (normally one).
+**Part 6 — The process: a running program as its own virtual computer.** A process as the four segments plus a CPU share and resources; virtual memory giving each process a private address space (the mechanical reason processes are isolated); the kernel; and how many processes one program has.
 
 ## Layer 2 — How a function call actually works
 
-The call stack, in real detail — the part most explanations skip.
+The call stack, in real detail.
 
-**Part 7 — The call stack and stack frames.** How calling a method works at the machine level: a new stack frame is pushed containing the return address, the saved base pointer, the parameters, and the local variables; the stack pointer and base pointer move to frame it; variables are reached as offsets from the base pointer; and returning pops the frame and restores the previous base pointer and stack pointer. Why the stack grows and shrinks with calls, and what a stack overflow is.
+**Part 7 — The call stack and stack frames.** How a call pushes a frame of return address, saved base pointer, parameters, and locals; how the stack and base pointers move; how a variable is found by its offset from the base pointer; and what a stack overflow is.
 
-**Part 8 — Stack versus heap in .NET.** Where a program's data actually lives, mapped to C#: value types and method locals on the stack, reference-type objects on the managed heap with a reference on the stack. Why the stack is fast and automatic while the heap needs the garbage collector. (This connects directly to the value-types-versus-reference-types idea from the .NET fundamentals notes.)
+**Part 8 — Stack versus heap in .NET.** Value types in the frame, reference-type objects on the heap with a reference in the frame; references as managed addresses; the garbage collector and reachability — including why a heap object survives, or is collected, when the frame that made it pops.
 
 ## Layer 3 — Doing more than one thing
 
 How one machine runs many things, and what a thread really is.
 
-**Part 9 — Context switching and the process control block.** The puzzle: the program counter points at one instruction, so how do several programs run at once? The answer: the operating system runs one for a slice of time, saves its full state (all register values — program counter, stack and base pointers, general-purpose registers, and more) into a process control block, loads the next program's saved state, and continues it. Switching between them fast enough to look simultaneous.
+**Part 9 — Context switching and the process control block.** The puzzle from Part 3 — one program counter, yet many programs — answered: the OS runs each for a slice, saves its register state to a process control block, loads another's, and continues it. The cost per switch, and why this is concurrency.
 
-**Part 10 — Concurrency versus parallelism.** The distinction the switching above creates: concurrency is *handling* many things by taking turns on one core (context switching); parallelism is *doing* many things at once on multiple cores. Cores and logical processors (hyperthreading — and the warning that Intel calls a logical processor a "thread," which is not the operating system's kind of thread). When switching is needed and when true parallelism replaces it, and the cost a context switch adds.
+**Part 10 — Concurrency versus parallelism.** Handling many things by interleaving on a core versus doing many at once on multiple cores; cores and logical processors; and the warning that "thread" means a hardware logical processor to a CPU maker but a software unit of execution to the OS — the one this path means.
 
-**Part 11 — Threads: the real unit of execution.** A thread as the actual path of execution the operating system schedules — the thing that "runs the process." A process's default thread, and how one process can create many. Each thread has its **own stack** (so different threads can be inside different functions at once) but **shares the process's heap and data** (so threads can share objects easily, unlike separate processes). Thread context switching is cheaper than process switching, and the kernel tracks and schedules threads. The .NET detail: a thread's default stack is about 1 MB (versus roughly 8 MB on Linux for a native thread), which is why threads are not free.
+**Part 11 — Threads: the real unit of execution.** The OS thread in full: a path of execution run one instruction at a time, with the program counter as a bookmark; one process running many threads, each with its own stack but a shared heap; what that shared heap means for a server (per-request instances versus shared static state, and race conditions); why thread switching is cheaper than process switching; that the kernel schedules **threads**, not processes; that dependencies are the program's job, not the scheduler's; what threads actually buy (responsiveness, parallelism, not wasting waits); and their cost.
 
-## Layer 4 — The C# concurrency machinery
+## Layer 4 — The C# concurrency machinery, and a real Web API
 
-Only now, the parts most tutorials start with — resting on everything above.
+Now the parts most tutorials start with — resting on everything above — and a small runnable Web API, grown from scratch, that makes the request-handling story concrete in code.
 
-**Part 12 — Creating threads in C#, and why raw threads are rare.** The `Thread` class and thread state (ready / running / blocked). Starting a thread, and why application code almost never creates threads directly anymore — because each one is expensive (Part 11) and unmanaged.
+**Part 12 — Creating threads in C# (`Thread`), and why raw threads are rare.** The `Thread` type and thread state, and why application code almost never creates threads directly — because each one is expensive.
 
-**Part 13 — The thread pool.** The fix for expensive threads: a managed pool of reusable worker threads that the runtime hands out and takes back, so short pieces of work do not each pay the cost of creating and destroying a thread.
+**Part 13 — The thread pool.** The fix for expensive threads: a managed pool of reusable worker threads the runtime hands out and takes back, so short pieces of work do not each pay the full cost of a thread.
 
-**Part 14 — Blocking, in terms of thread state.** What "a thread is waiting" actually means: the thread is in a blocked state, holding its stack and its pool slot but doing no work, unable to continue past a synchronous call until it completes. Why a blocked pool thread is wasted capacity, especially on a server handling many requests.
+**Part 14 — Blocking, in terms of thread state.** What "a thread is waiting" actually means: blocked, holding its stack and its pool slot but doing no work. Why a blocked pool thread is wasted capacity, especially on a server.
 
-**Part 15 — CPU-bound versus I/O-bound work.** The two shapes of work: CPU-bound (the processor is the bottleneck — more cores or better algorithms help) and I/O-bound (the program is waiting on something external — disk, network, database — and the CPU is idle for that operation). Why the right tool differs for each, and why async targets the I/O-bound case.
+**Part 15 — A Web API from scratch, part 1: what the project actually is (code).** A tiny `dotnet new web` project, line by line: `CreateBuilder`, `Build`, `MapGet`, and `app.Run()` — including why the **main thread parks** at `app.Run()` and does not serve requests. We run one GET endpoint and log which thread handles it, seeing it is a pool thread (Parts 13 to 14), not the main thread.
 
-**Part 16 — The OS and hardware boundary for I/O.** The answer to "if the CPU is not reading the file, who is?" How code asks the operating system to do I/O (a system call), how the disk or network controller transfers the data into memory largely on its own using DMA (direct memory access), and how the hardware signals completion back with an interrupt. The CPU starts and finishes the operation but does not sit copying every byte.
+**Part 16 — A Web API from scratch, part 2: the request pipeline and middleware (code).** How one request travels in: Kestrel accepts the connection, builds an `HttpContext`, and passes it through the **middleware pipeline** (the `app.Use...` chain) before reaching the endpoint. What middleware is — a chain of "do something, then call next" — written one layer at a time and watched run.
 
-**Part 17 — Callbacks: "call me back when it is done."** The plain idea underneath async, before the syntax: instead of waiting for a result, hand over a piece of code to run once the result is ready. Why this lets a thread move on instead of blocking.
+**Part 17 — CPU-bound versus I/O-bound work.** The two shapes of work: the CPU as the bottleneck, versus waiting on something external (disk, network, database) with the CPU idle. Why async targets the I/O-bound case — exactly what a Web API's database and network calls are.
 
-**Part 18 — Task: a promise of a future result.** A `Task` as a handle to work that will finish later and its eventual result — explicitly *not* a thread. How a `Task` relates to the thread pool, and how it differs from a raw `Thread`.
+**Part 18 — The OS and hardware boundary for I/O.** The answer to "if the CPU is not reading the file, who is?" — the system call, the disk or network controller transferring data with DMA, and the interrupt that signals completion. The CPU starts and finishes the operation but does not sit copying every byte.
 
-**Part 19 — async and await.** How `await` releases the current thread back to the pool at the point of an unfinished operation, instead of blocking it, and resumes the rest of the method later. The compiler-generated state machine that makes this possible — the same "pause here and resume later" machinery seen in the `yield` iterator notes, applied to asynchronous work.
+**Part 19 — Callbacks: "call me back when it is done."** The plain idea underneath async, before the syntax: hand over a piece of code to run once a result is ready, so a thread can move on instead of blocking.
 
-**Part 20 — Why async I/O needs no extra thread.** The full payoff, with every piece finally in place: at an `await` on I/O, the thread is freed (Part 14), the operating system and DMA carry out the transfer (Part 16) while no thread waits, an interrupt signals completion (Part 16), and a pooled thread (Part 13) picks up the continuation via the state machine (Part 19). Async does not make I/O faster and does not require a thread to sit and wait — it frees the thread during the wait. This is the exact statement that started the whole path — "the CPU has nothing to do while the disk works" — now fully unpacked and corrected.
+**Part 20 — `Task`: a promise of a future result.** A `Task` as a handle to work that finishes later — explicitly not a thread — and how it relates to the thread pool.
+
+**Part 21 — `async` and `await`.** How `await` releases the current thread back to the pool at an unfinished operation instead of blocking it, and resumes the method later — via a compiler-generated state machine, the same "pause and resume" machinery seen in the `yield` iterator notes.
+
+**Part 22 — A Web API from scratch, part 3: handling many requests with async (code).** The payoff in code: make the endpoint `async` with a simulated I/O wait, fire many concurrent requests, and watch the difference — a blocking version starves the thread pool and queues requests, while the `async` version frees threads during the wait and serves them all. Thread-pool starvation and its cure, seen directly.
+
+**Part 23 — Why async I/O needs no extra thread.** The full close, every piece in place: at an `await` on I/O the thread is freed (Part 14), the OS and DMA carry out the transfer (Part 18) while no thread waits, an interrupt signals completion (Part 18), and a pooled thread (Part 13) resumes the continuation via the state machine (Part 21). Async does not make I/O faster and needs no thread sitting idle — it frees the thread during the wait. The statement that started the whole path — "the CPU has nothing to do while the disk works" — fully unpacked, now including the Web API request lifecycle end to end.
 
 ## How to use this path
 
-Straight through, bottom to top, is the intended order — each part is short and leans only on the ones before it. The earlier machine-level parts (1–3, 7) are the ones usually missing when async feels confusing, so they are worth not skipping even when the temptation is to jump to Part 19. The Go notes that seeded this path map cleanly onto it: registers and the fetch cycle are Parts 1–3, stack frames are Part 7, the process control block and context switching are Part 9, concurrency versus parallelism is Part 10, and threads with their separate stacks are Part 11 — all re-expressed in C#/.NET terms here, and carried forward into the async machinery that Go handles differently but reasons about the same way.
+Straight through, bottom to top, is the intended order — each part is short and leans only on the ones before it. The machine-level parts (1 to 3, 7) are the ones usually missing when async feels confusing, so they are worth not skipping even when the temptation is to jump ahead. The Go-style machine notes that seeded this path map onto it directly: registers and the fetch cycle are Parts 1 to 3, stack frames are Part 7, the process control block and context switching are Part 9, concurrency versus parallelism is Part 10, and threads with their separate stacks are Part 11 — all re-expressed in C#/.NET terms, then carried up into the thread pool, `Task`, `async`, and a real Web API that turns requests into threads.
+
+The three code-first Web API parts (15, 16, 22) build and grow **one tiny project** — a single GET endpoint — so the request-handling story is not described but *run*: how a request arrives, passes through middleware, executes on a pool thread, and how `async` lets a small set of threads serve many requests at once. That is the concrete destination the whole path climbs toward.

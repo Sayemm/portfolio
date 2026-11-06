@@ -23,6 +23,26 @@ a thread =  program counter  (where it is in the code)
 
 When Part 6 said "a process includes a share of CPU and its own program counter while it runs," that running-ness was really a thread. **The process is the container (memory + resources); the thread is the active runner inside it.** A process does not execute — its threads do.
 
+## A thread is a sequence, run one step at a time
+
+A common first assumption is that a thread's instructions all happen *together*, as one simultaneous block. They do not. A thread is a **sequence** of instructions, and a core runs them **one at a time, in order** — the fetch-decode-execute loop from Part 3. The thread is the whole sequence; the core walks it step by step.
+
+This is exactly why a thread needs its **own program counter**. A core does not necessarily run a thread's instructions all in one stretch — it may run a few, switch away to another thread, and come back later (context switching, later in this part). On return, it must know *which instruction was next*, and that is what the thread's saved program counter remembers.
+
+```text
+Thread T: instructions 1 2 3 4 5 6 7 8 9 10
+
+core runs T:   1, 2, 3      -> T's PC now points at 4
+switch away:   save T's PC = 4   (and its registers and stack pointer)
+... core runs other threads ...
+switch back:   load T's PC = 4 into the core's one physical PC register
+core runs T:   4, 5, 6      -> T's PC now points at 7
+```
+
+So the program counter is a **bookmark**: it marks where the thread stopped so it can resume exactly there. And it is not alone — a thread also saves and restores its **registers** (its in-flight values, Part 2) and its **stack pointer** (which frame it is in, Part 7). Together these are the thread's **execution context** — its own complete "where I am and what I am holding."
+
+The useful intuition, then, is that a thread carries its own little execution state — like a runner with their own position and notes. But with one crucial boundary: a thread owns its **execution context** (program counter, registers, stack), yet it still **shares the process's memory** — one heap, one code and data segment. A *process* is the thing with its own isolated memory (the "virtual computer" of Part 6); a *thread* is a runner inside it with its own place in the code, not its own memory.
+
 ## One process, many threads
 
 A process starts with **one** thread — the main thread, which begins running `Main` (Part 5). But a process can create **more** threads, and this is the key move of the whole part: those extra threads run *inside the same process*, sharing its memory, each executing its own path through the code at the same time.
@@ -48,6 +68,32 @@ Threads earn their place in two recognisable situations, both from real programs
 **One program doing several things at once.** A music player is one process that must play audio, update the elapsed-time display, respond to clicks, and manage a playlist — all seemingly simultaneously. Different threads handle different jobs: one keeps audio flowing, another updates the clock, another watches for input. Each is a separate path of execution through the same program's code, so the display can update *while* audio plays, with no job blocking the others.
 
 In both cases the pattern is the same: **one process, many threads, each a separate runner through the shared code and data.**
+
+## What threads actually buy (and what they do not)
+
+Seeing that a core runs instructions one at a time raises a fair doubt: if the work is not done all at once — if two threads merely take turns on a core — what is gained? On a single core, for pure CPU work, the honest answer is **nothing in raw speed**. Interleaving ten instructions of one thread with ten of another finishes no sooner than doing all of one then all of the other, and switching even adds a little overhead (Part 9). Threads are not a trick for making one core do more total work.
+
+Their benefit is three other things.
+
+**1. Responsiveness — jobs make progress together instead of one-then-the-other.** Even with no speedup, interleaving turns "finish one completely, then start the next" into "all make progress at once." Picture a program with a long calculation and a ticking clock. On *one* thread, the code runs top to bottom: the calculation runs start to finish, and the clock **freezes** the whole time, because that single thread is busy calculating, not updating. On *two* threads, the OS interleaves them, so the clock keeps ticking *while* the calculation runs underneath. Nothing finished faster, but nothing froze — and this works even on a single core.
+
+```text
+one thread:   [....long calculation....] then update clock   (clock frozen meanwhile)
+two threads:  calc, tick, calc, tick, calc, tick ...         (clock stays alive)
+```
+
+This is why a user interface stays responsive during heavy work, and why a server can begin handling a second request without finishing the first.
+
+**2. Parallelism — on multiple cores, it really is faster.** The single-core assumption was the catch. Real machines have several cores (Part 10), and each runs a thread genuinely at the same instant. Independent threads placed on different cores run simultaneously, so splittable CPU work finishes faster — two cores roughly halving the time.
+
+```text
+one core:    thread A then thread B     ->  10s + 10s = 20s
+two cores:   thread A   ||   thread B   ->  10s total (truly at once)
+```
+
+**3. Not wasting time spent waiting.** Much of what programs do is *wait* — on a disk, a database, a network call (Part 15). A thread stuck waiting does no work (Part 1: I/O is slow compared to the CPU). With other threads, the rest of the program keeps going while that one waits: while one request's thread waits on its database call, another thread serves a different request. The waiting of one does not stall the others. (Part 19's `async` sharpens this further, getting the benefit without even tying up a thread during the wait — but the baseline thread benefit is already this.)
+
+So the point of threads is not "run many instructions at the same instant on one core." It is to **keep independent work from blocking each other** — responsiveness, and not wasting time on waits — and to **use multiple cores when they exist** for real parallel speedup. The stopwatch-and-calculation case is the first benefit: the two take turns so neither freezes the other — not faster, but alive and responsive, which is often exactly what is wanted.
 
 ## The crucial split: shared heap, separate stacks
 
@@ -144,9 +190,55 @@ thread switch:   save/restore registers only; same address space             (ch
 
 Less to swap means a faster switch. This is a core reason a single program does many things with *threads* rather than many *processes*: besides the easy shared-memory communication, threads are simply cheaper to interleave.
 
-## Who tracks and schedules threads: the kernel
+## What the kernel actually schedules: threads, not processes
 
-The operating system kernel (Part 6) tracks threads much as it tracks processes — it keeps per-thread execution state and decides which thread runs on which core or logical processor, and when to switch. A useful detail from lower-level notes: a process mostly tracks its *own* memory (code, data, stack, heap) and its main thread; the kernel is what keeps the full registry of all the threads and schedules them. So threads are scheduled entities the kernel manages, placed onto the hardware execution slots of Part 10.
+A natural picture of scheduling is "the OS picks process A, runs it, switches among A's threads, then moves to process B and switches among its threads." That is not how it works, and correcting it removes a lot of confusion.
+
+**The scheduler works on threads directly.** It does not "enter a process and stay there." It keeps one pool of all the *runnable threads in the whole system* — from every process — and on each core it picks the next *thread* to run. The thread it picks next can belong to any process.
+
+```text
+all runnable threads in the system:
+   A.t1, A.t2   (process A)
+   B.t1         (process B)
+   C.t1, C.t2   (process C)
+
+one core picks one thread at a time, in any order, e.g.:
+   A.t1 -> B.t1 -> A.t2 -> C.t1 -> A.t1 -> C.t2 -> ...
+```
+
+So there is no separate "process switch" step. **Every switch is a thread switch.** What people call a "process switch" is simply a thread switch where the *next thread happens to live in a different process* — and because a different process means a different address space (Part 6), that case has extra state to swap. So the cheap-versus-expensive split from the previous section is really:
+
+```text
+next thread in the SAME process (A.t1 -> A.t2):
+   swap thread state only (program counter, registers, stack pointer)   cheap
+next thread in a DIFFERENT process (A.t2 -> B.t1):
+   swap thread state + switch the address space                        expensive
+```
+
+This also answers "does it need the control block again when it goes to B?" Yes — each **thread** has its own saved execution state (a per-thread structure, the thread's version of Part 9's save/restore), and each **process** has its process-level state (the PCB: address space mapping, open files). On a same-process switch, only the thread state is swapped. On a cross-process switch, the thread state *and* the destination process's PCB (its address space) are loaded. The kernel keeps the full registry of all threads and all processes and picks freely among the threads; a process mostly tracks only its own memory and its main thread.
+
+And on a multi-core machine (Part 10), *each core* does this independently and at the same time — core 1 might run `A.t1` while core 2 runs `B.t1`. The thing scheduled onto a core is always a **thread**; "running process A" just means one or more of A's threads currently have cores.
+
+So the corrected model: the kernel never runs "a process" as a unit — it interleaves **threads** from all processes freely, and the only thing that makes one switch costlier than another is whether the next thread crosses into a different process's address space.
+
+## Independent to schedule, dependent only where the code says so
+
+A different question follows: if the kernel runs threads in any order, does the program need thread 1 to finish before thread 2? Here two ideas must be kept apart.
+
+- **Scheduling order is the kernel's business, and it imposes none.** The kernel may run a process's threads in any order, interleaved, or truly in parallel. It never requires `t1` before `t2`. From its side, threads are independent units it runs whenever.
+- **Logical dependency is the program's business.** Whether `t2` actually *needs* something from `t1` is decided by how the code is written — and if it does, the *code* must make `t2` wait, because the kernel will not.
+
+Three cases cover it:
+
+```text
+no dependency        -> let the threads run in any order / in parallel   (the point of threads)
+t2 needs t1's result -> the CODE must make t2 WAIT for t1                 (await, WhenAll, ...)
+threads share data   -> the CODE must PROTECT the shared data            (a lock, a thread-safe type)
+```
+
+So threads being independent is not automatic and not imposed — it is a **property of how the program is written**. Good concurrent code keeps threads as independent as possible so they can run freely; where a real dependency exists, the code adds an explicit wait; where threads share mutable data, the code adds protection. The kernel just runs whatever is runnable — all coordination is the program's responsibility. (How C# code *expresses* "wait for this result" or "these can go in parallel" is what `Task`, `await`, and `WhenAll` are for, reached in Parts 17 to 19.)
+
+> **How a .NET Web API actually assigns requests to threads** — which thread a given request runs on, how the server pulls threads for incoming requests, and why handlers are written `async` — is framework-level machinery built on top of everything here. It gets its own treatment around the thread pool (Part 13) and blocking (Part 14), rather than being unpacked now; the foundation to carry there is only this: the OS schedules threads, the program coordinates them.
 
 ## The .NET angle, and the cost of a thread
 
