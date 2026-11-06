@@ -148,6 +148,96 @@ async:     each waiting request keeps a ~few-hundred-byte HEAP OBJECT
 
 So freeing the thread is not "avoid keeping memory" — it is **swap a 1 MB idle worker for a few-hundred-byte idle note.** The tiny, plentiful thing (a heap object) is kept; the huge, scarce thing (a thread) is released back to do work. That trade — thousands of waiting operations costing a few megabytes of objects instead of impossible gigabytes of threads — is the entire reason async scales. (The heap state-machine object itself is built in detail in Parts 20 and 21, and it is the same pause-and-resume idea as the `yield` iterator state machine from the earlier notes.)
 
+## Freed is not the same as finished: waiting up the call chain
+
+A subtle case completes the picture. Suppose one piece of code calls another that does async I/O — thread 1 calls work that eventually `await`s, and that inner work frees its thread when it hits the `await`. Does the *caller* now get to carry on, even though the result is not ready yet?
+
+The result is indeed **not** ready at that moment — the inner work only started the I/O and freed its thread; the answer does not exist yet. So the caller cannot "continue with the result." What happens next depends entirely on **how the caller waits**, and there are two opposite ways.
+
+**The right way: the caller `await`s too, and is freed as well.** If the caller uses `await`, it does not sit and wait — it is suspended exactly like the inner work:
+
+```csharp
+// caller:
+var result = await DoWorkAsync();   // DoWorkAsync awaits I/O inside
+UseResult(result);                  // runs LATER, only once the result is ready
+```
+
+The caller reaches `await`, has no result yet, so **it is freed** too (its state saved to a heap object, as above). Now *neither* is parked — both are suspended. When the underlying I/O completes, a pool thread finishes the inner work to produce the result, and then a pool thread runs the caller's continuation (`UseResult`). So the caller does **not** run `UseResult` early — it is suspended until the result genuinely exists — but while suspended it holds **no thread**.
+
+```text
+caller:  await DoWorkAsync()   -> caller FREED (suspended, state on heap)
+  inner: await I/O             -> inner FREED (suspended, state on heap)
+     ... the device does the I/O; ZERO threads tied up ...
+  I/O done -> a pool thread finishes the inner work -> result ready
+  result ready -> a pool thread runs the caller's continuation (UseResult)
+```
+
+This is why `await` **propagates up the chain**: if the inner work awaits, and the caller awaits the inner work, and *its* caller awaits in turn, the whole stack is suspended and *no* thread is left waiting anywhere.
+
+**The wrong way: the caller blocks on the result, and stays stuck.** If instead the caller waits by **blocking** — `.Result`, `.Wait()`, or `Join` — then the worry becomes real:
+
+```csharp
+// caller:
+var result = DoWorkAsync().Result;   // caller BLOCKS here until the result is ready
+UseResult(result);
+```
+
+Here the caller says "park me until the whole thing is done." The inner work still frees its thread at its `await`, but the **caller's thread stays blocked the entire time**, holding a thread and doing nothing. So one thread was freed and another was wasted — strictly worse than not using async at all. Calling `.Result` or `.Wait()` on async work is the **blocking-on-async** anti-pattern: it reintroduces exactly the thread-pool starvation async was meant to remove, and in some contexts can even deadlock.
+
+The distinction to keep: **freed is not the same as finished.** When the inner work frees its thread, the result is not ready — that is true in both cases. The only question is what the caller does about not having the result yet:
+
+```text
+caller awaits the inner work   -> caller suspended (freed), resumes when the result is ready  -> 0 threads waiting
+caller blocks on the inner work -> caller parked the whole time, waiting                        -> 1 thread wasted
+```
+
+So the caller never gets the result "early." With `await`, it is suspended and handed the result later through its continuation, tying up no thread meanwhile. With `.Result`, it holds a thread and waits. This is the reason for the guidance **"async all the way up"**: the moment any layer blocks on the result instead of awaiting it, that layer's thread is stuck, the suspension chain is broken, and a thread is wasted — defeating the whole point. The mechanics of how `await` suspends and resumes a whole chain are built in Part 21; the point here is only that *freeing a thread lower down does not let a caller proceed without the result* — the caller must itself `await` to avoid blocking.
+
+## A chain of awaits is sequential — so where does the concurrency come from?
+
+The call-chain case raises a deeper doubt. If one piece of code awaits another, which awaits another — `A` awaits `B` awaits `C` — then that whole chain is just *waiting*, in order, top to bottom. No new threads are created. So it can feel as though async must be "fake" concurrency: everything connected, hanging together, one thing at a time. Resolving this is what makes async finally make sense.
+
+The uncomfortable first half is true: **a single chain where each step is awaited is sequential, not parallel.** `await` means "pause here until this finishes, then continue," so `A` then `B` then `C` run in order, one after another. Async by itself creates **no threads** and no parallelism *within a chain*. Its only effect is the one from earlier in this part: during each step's wait, the **thread is freed**, so the sequence does not block a thread while waiting. A single async chain is one logical sequence — that intuition is correct.
+
+So independence was never meant to come from *within* a chain. It comes from having **many separate chains**, each started on its own. A bigger system — a web server is the clearest example — is not one chain but **one chain per request**, and requests arrive independently:
+
+```text
+request 1 -> chain 1:  A1 -> await B1 -> await C1     (one sequence)
+request 2 -> chain 2:  A2 -> await B2 -> await C2     (a SEPARATE sequence)
+request 3 -> chain 3:  A3 -> await B3 -> await C3     (another SEPARATE sequence)
+```
+
+Chains 1, 2, and 3 are independent — not because `await` made them so, but because they are **three separate starting points** the server kicked off separately. Each is its own "A waits for B waits for C." The independence comes from there being several chains, not from anything inside one.
+
+And here is the mechanism that ties it to blocking. `await` is what lets a *few* threads be shared across *many* chains, because a chain sitting at an `await` holds no thread. Picture a pool of just **two** threads and three requests:
+
+```text
+thread X runs chain 1 -> hits await B1 (I/O starts) -> chain 1 WAITING -> thread X FREED
+thread Y runs chain 2 -> hits await B2 (I/O starts) -> chain 2 WAITING -> thread Y FREED
+both threads free again -> thread X runs chain 3 -> hits await B3 -> chain 3 WAITING -> thread X FREED
+chain 1's I/O completes -> a free thread picks up chain 1's continuation -> ... and so on
+```
+
+Two threads served three independent chains, because each chain *released its thread* at its `await`, letting that thread go advance a *different* chain. The chains progress independently and interleaved, sharing a tiny set of threads — because at any instant most chains are parked at an `await`, needing no thread at all.
+
+The contrast with blocking is the whole point. With blocking and the same two threads:
+
+```text
+thread X runs chain 1 -> BLOCKS on B1's result -> thread X STUCK the whole time
+thread Y runs chain 2 -> BLOCKS on B2's result -> thread Y STUCK
+request 3 arrives -> no free thread -> chain 3 cannot even start, it queues
+```
+
+Blocking makes the two threads *stuck* inside chains 1 and 2, so chain 3 cannot run — even though everyone is merely waiting on I/O and the CPU is idle. The chains are not effectively independent, because each monopolises a thread for its whole duration.
+
+```text
+one async chain:   sequential, but frees the thread at each await   (not hung, not parallel)
+many async chains: independent (separate starts), interleaved on a few reused pool threads
+blocking:          each chain hogs a thread -> only as many chains as threads can progress
+```
+
+So the independent workers in a big system are not carved out of one chain — they are **separate chains to begin with** (separate requests), and async lets them *share a small, reused set of threads* instead of each needing its own. A few threads serve many requests not by running one dedicated thread per request in parallel, but by many request-chains interleaving, each releasing its thread at every `await`. (True CPU *parallelism* — several chains computing at the same instant on different cores — is a separate, explicit choice, such as `Task.Run` or `Parallel`; `await` alone does not create it.) The pool of shared threads is Part 14, and seeing a few threads serve many concurrent requests is the Web API parts, 15 and 22.
+
 ## The one idea to hold onto
 
 > A **blocked** thread is stopped, waiting for something it needs — a `Join`, a lock, or (most importantly) a slow I/O operation. It uses no CPU, but it still holds its stack and, crucially, is **unavailable** for other work. It unblocks when the awaited thing completes: Blocked -> Ready -> Running, resuming exactly where it paused. Blocking is wasteful not because it burns CPU but because it **ties up a scarce thread** for nothing — so a server whose threads all block on I/O runs out of threads while the CPU sits idle. And the fix is not to hand the waiting to another thread (that still uses one): **async I/O frees the thread and lets the OS and hardware do the waiting, with no thread blocked**. Freeing the thread does not lose the method's progress — that is saved in a small **heap** state object (not on the vanishing stack), so any pool thread can resume it later. And it is worth doing because the two things are not the same size: a parked thread is ~1 MB and a scarce worker, while the saved state is a few hundred bytes and no worker — async keeps the tiny, cheap part and releases the huge, scarce one.
